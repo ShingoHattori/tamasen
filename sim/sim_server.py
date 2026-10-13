@@ -521,7 +521,10 @@ class Sim:
                  ("z", 30, [0, 0, 0.03]), ("z", -30, [-0.03, 0, 0]), ("xy", 20, [0.02, 0.02, 0]), ("yz", 20, [0, 0, -0.02]),
                  ("xz", -20, [0.02, -0.02, 0.02]), ("xyz", 17, [-0.02, 0.02, 0.0]),
                  # evaluation poses: different combinations, never used for fitting
-                 ("xy", -22, [-0.02, 0, 0.02]), ("yz", -25, [0.03, 0.02, 0]), ("xz", 22, [0, -0.03, -0.02]), ("z", 15, [0.02, 0.03, 0.01])]
+                 ("xy", -22, [-0.02, 0, 0.02]), ("yz", -25, [0.03, 0.02, 0]), ("xz", 22, [0, -0.03, -0.02]), ("z", 15, [0.02, 0.03, 0.01]),
+                 # extra calibration poses (joint zero offsets need more samples)
+                 ("x", 15, [0, 0.03, 0.02]), ("x", -15, [-0.02, 0, 0.02]), ("y", 15, [0.02, -0.02, 0]), ("y", -15, [-0.02, 0.02, 0.02]),
+                 ("z", 20, [0.03, 0, -0.02]), ("z", -20, [0, -0.03, 0.02]), ("xy", -15, [0.03, 0.03, 0]), ("yz", 15, [-0.03, 0, 0])]
         out = []
         chosen = [(sp, "calib") for sp in specs[:n_calib]] + [(sp, "eval") for sp in specs[10:10 + n_eval]] + \
                  [(sp, "calib") for sp in specs[14:]]
@@ -641,6 +644,7 @@ class Sim:
             }
 
 
+LIMIT_TOL = 0.03              # rad
 CALIB_MAX_JOINT_DEG = 60      # calibration poses must stay near the current pose (camera stand etc.)
 VMAX = 0.25                  # rad/s — the same profile is executed by rebot/arm_state.py
 FLOOR_CLEARANCE = 0.015      # m, every arm / jaw geom along the simulated motion
@@ -660,7 +664,7 @@ def profile(q_from, q_to, dt=0.02):
 
 
 def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
-    t, qp = profile(q_from, q_to)
+    lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
     d = mujoco.MjData(m)
     d.qpos[ids.arm_qadr] = q_from
     d.qpos[ids.block_q:ids.block_q + 7] = [10, 10, 1, 1, 0, 0, 0]
@@ -669,11 +673,16 @@ def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
     base = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base_link")   # stands on the floor by design
     arm_geoms = [g for g in range(m.ngeom) if m.geom_bodyid[g] in ids.arm_bodies and m.geom_bodyid[g] != base
                  and m.geom_contype[g] | m.geom_conaffinity[g]]
-    lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
     reasons, sim_q, track, min_clear, worst = [], [], 0.0, math.inf, None
     min_obst, worst_obst = math.inf, None
-    if np.any(q_to < lo - 1e-3) or np.any(q_to > hi + 1e-3):
+    start_obst = None             # clearance at the start: a path that begins inside the (inflated) box may leave it
+    # The real arm rests slightly past some model limits (joint2 reads +0.5 deg at the folded rest; the
+    # hand-eye fit found a ~2 deg zero offset there). Within LIMIT_TOL the target is clamped to the
+    # limit; beyond it the target is refused.
+    if np.any(q_to < lo - LIMIT_TOL) or np.any(q_to > hi + LIMIT_TOL):
         reasons.append("目標が関節制限の外")
+    q_to = np.clip(q_to, lo, hi)
+    t, qp = profile(q_from, q_to)
     steps = int(round((t[1] - t[0]) / m.opt.timestep)) if len(t) > 1 else 1
     for k in range(len(t) + 25):                       # +0.5 s settle
         d.ctrl[ids.act_arm] = qp[min(k, len(t) - 1)]
@@ -688,6 +697,8 @@ def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
                 min_clear, worst = dist, mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g])
             for og in ids.obstacle_geoms:            # obstacles are already inflated by margin (+ uncertainty)
                 dist = mujoco.mj_geomDistance(m, d, g, og, 0.05, None)
+                if k == 0:
+                    start_obst = dist if start_obst is None else min(start_obst, dist)
                 if dist < min_obst:
                     min_obst, worst_obst = dist, mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, og)
         for c in d.contact[:d.ncon]:
@@ -700,8 +711,10 @@ def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
             break
     if min_clear < FLOOR_CLEARANCE:
         reasons.append(f"床との距離 {min_clear * 1000:.1f} mm < {FLOOR_CLEARANCE * 1000:.0f} mm（{worst}）")
-    if min_obst < 0.0:
-        reasons.append(f"障害物 {worst_obst}（余裕込みの箱）に入る（{min_obst * 1000:.1f} mm）")
+    allowed = min(0.0, (start_obst if start_obst is not None else 0.0)) - 0.001
+    if min_obst < allowed:
+        reasons.append(f"障害物 {worst_obst}（余裕込みの箱）に入る（{min_obst * 1000:.1f} mm"
+                       + (f"、始点 {start_obst * 1000:.1f} mm より深い" if start_obst is not None and start_obst < 0 else "") + "）")
     if track > SIM_TRACK_MAX:
         reasons.append(f"シミュレーション上の追従誤差 {track:.3f} rad > {SIM_TRACK_MAX}")
     return {"ok": not reasons, "reasons": reasons, "times": t.tolist(), "q_plan": qp.tolist(),

@@ -66,7 +66,10 @@ ENGAGE_GRACE_S = 0.5
 # Motor-internal POS_VEL gains that differ from the SDK yaml (written at engage). joint6 (light wrist
 # roll) hunted ~0.0008 rad with torque cycling 0 -> 0.1 Nm under a constant command (2026-10-13): the
 # motor's own position integral; drop it there.
-PV_OVERRIDE = {"joint6": {"pos_ki": 0.0}}        # after enabling, status 0x1 must be reported within this time
+PV_OVERRIDE = {"joint6": {"pos_ki": 0.0}}
+# joint6 still hunted ~0.02 rad in POS_VEL with pos_ki = 0 (velocity loop vs wrist friction). It is held
+# in MIT mode instead: torque = kp (q_cmd - q) - kd q_dot, no integrator. kp / kd from the SDK yaml.
+MIT_JOINTS = {"joint6"}        # after enabling, status 0x1 must be reported within this time
 FAULT_POLICY = {
     "ページ切断（生存確認なし）": "移動中なら停止し、その場で保持（トルクは維持）。保持中はそのまま保持。",
     "サービス終了要求（SIGTERM）": "有効中は 1 回目を拒否し記録。5 s 以内の 2 回目で終了 — その場合モーターは最後の指令を保持したまま有効で残る"
@@ -387,7 +390,7 @@ class ArmService:
     def _hold(self, bus, q, why):
         """Hold where the arm IS now (never return to an older hold target)."""
         here = {n: q[n] for n in ARM}
-        bus.send_pos_vel(here, VMAX)
+        self._send(bus, here, VMAX)
         self.control.update(state="holding", motion=None, message=why, hold_q=here)
 
     def control_step(self, bus, q: dict) -> None:
@@ -418,7 +421,7 @@ class ArmService:
             if lost > CAN_LOSS_S:
                 self._fault(f"フィードバックなし {lost:.1f} s（CAN 断 / 電源断の可能性）", keep_target=True)
             if c.get("last_cmd"):
-                bus.send_pos_vel(c["last_cmd"], VMAX)       # keep holding the last commanded point
+                self._send(bus, c["last_cmd"], VMAX)        # keep holding the last commanded point
             return
         self.lost_since = None
         bad = {n: self.statuses.get(n) for n in ARM if self.statuses.get(n) != 0x1}
@@ -479,11 +482,20 @@ class ArmService:
                 self.audit("fault: " + why, "service")
         # Faults latch: they are cleared only by the user ("ack_fault") once the cause is gone, or by release.
         c["last_cmd"] = dict(zip(ARM, q_cmd))
-        bus.send_pos_vel(c["last_cmd"], VMAX * 1.5)
+        self._send(bus, c["last_cmd"], VMAX * 1.5)
         if c["state"] == "moving" and t >= mv["T"] and lag_now < LAG_FREE * 2:
             end = dict(zip(ARM, np.array(mv["q_plan"][-1])))
             c.update(state="holding", motion=None, hold_q=end,
                      message=f"移動完了（最大偏差 {fb['max_err']:.3f} rad / 手先 {fb['max_tcp_dev'] * 1000:.0f} mm）。保持中もフィードバック継続")
+
+    def _send(self, bus, qd: dict, vlim: float) -> None:
+        """POS_VEL targets, except MIT_JOINTS which get a spring-damper command to the same target."""
+        bus.send_pos_vel({n: v for n, v in qd.items() if n not in MIT_JOINTS}, vlim)
+        by = {j["name"]: j for j in self.joints}
+        for n in MIT_JOINTS:
+            if n in qd:
+                mit = by[n]["mit"]
+                bus.send_mit(n, qd[n], float(mit.get("kp", 18.0)), float(mit.get("kd", 2.0)))
 
     def _fault(self, why: str, keep_target: bool) -> None:
         """Stop any motion; hold the planned point of this instant (or the last command)."""
@@ -542,10 +554,12 @@ class ArmService:
             if not all(n in q for n in ARM):
                 c["message"] = "関節角が読めないため有効化しない"
                 return
-            bus.prepare_pos_vel(ARM)                       # while still disabled
+            bus.prepare_pos_vel([n for n in ARM if n not in MIT_JOINTS])     # while still disabled
+            for n in MIT_JOINTS:
+                bus.prepare_mit(n)
             hold = {n: q[n] for n in ARM}
             bus.enable(ARM)                                # the six arm motors only
-            bus.send_pos_vel(hold, VMAX)
+            self._send(bus, hold, VMAX)
             c.update(state="holding", engaged_at=time.strftime("%H:%M:%S"), engaged_mono=time.monotonic(),
                      q_engage=hold, hold_q=hold, fault=None, last_cmd=hold,
                      fb={"I": [0.0] * 6, "max_err": 0.0, "max_tcp_dev": 0.0},
