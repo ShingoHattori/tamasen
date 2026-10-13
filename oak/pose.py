@@ -175,6 +175,11 @@ def load_config(path: Path) -> Config:
             spec.grip = Value(T, gst if T is not None else "unset")
             if not spec.grip.usable:
                 spec.missing.append("ID 1 → 把持中心の変換 T_m1_grip は未校正")
+        elif spec.role == "grip_jig":
+            v = m.get("jig_to_grip_mm", [])
+            st = _status(m, "jig_to_grip_status", "jig", spec)
+            ok = len(v) == 3 and not any(_missing(x) for x in v)
+            spec.grip = Value(rigid(np.eye(3), np.array(v) * MM) if ok else None, st if ok else "unset")
         elif spec.role == "world_reference":
             th = m.get("card_thickness_mm")
             spec.card_thickness = Value(None if _missing(th) else float(th) * MM,

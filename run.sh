@@ -6,7 +6,9 @@
 #   ./run.sh status
 #   ./run.sh log   vision|arm|sim
 #
-# All three bind to 127.0.0.1 only. View from your own machine through an SSH forward:
+# vision (8090) serves the LAN 192.168.32.0/24 (allow-list in VISION_ARGS); arm (8091) and sim (8092)
+# bind to 127.0.0.1 only and are reached through the vision page. Open http://192.168.32.20:8090/
+# from a machine on that subnet, or use an SSH forward:
 #   ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   then open http://127.0.0.1:8090/
 # (the page proxies the arm service on :8091 and the simulator on :8092, so one forward is enough)
 #
@@ -21,7 +23,7 @@ mkdir -p "$RUN"
 declare -A DIR=([vision]="$ROOT/oak" [arm]="$ROOT/rebot" [sim]="$ROOT/sim")
 declare -A PY=([vision]="$ROOT/oak/.venv/bin/python" [arm]="$ROOT/rebot/reBotArm_control_py/.venv/bin/python" [sim]="$ROOT/sim/.venv/bin/python")
 declare -A SCRIPT=([vision]="vision.py" [arm]="arm_state.py" [sim]="sim_server.py")
-declare -A ARGS=([vision]="${VISION_ARGS:---device 18443}" [arm]="${ARM_ARGS:---port /dev/ttyACM0}" [sim]="${SIM_ARGS:-}")
+declare -A ARGS=([vision]="${VISION_ARGS:---device 18443 --host 0.0.0.0 --allow-from 127.0.0.1/32,192.168.32.0/24}" [arm]="${ARM_ARGS:---port /dev/ttyACM0}" [sim]="${SIM_ARGS:-}")
 declare -A PORT=([vision]=8090 [arm]=8091 [sim]=8092)
 
 alive() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
@@ -40,8 +42,15 @@ stop() {
   local s=$1
   if ! alive "$s"; then echo "$s: not running"; rm -f "$RUN/$s.pid"; return; fi
   local pid; pid=$(cat "$RUN/$s.pid")
+  if [ "$s" = arm ] && [ "${FORCE:-0}" != 1 ]; then
+    st=$(curl -s --max-time 2 http://127.0.0.1:8091/state.json | python3 -c "import json,sys; print(json.load(sys.stdin).get('control',{}).get('state','read_only'))" 2>/dev/null)
+    if [ -n "$st" ] && [ "$st" != read_only ]; then
+      echo "arm: motors are ENABLED ($st). Turn torque off from the page first (or FORCE=1 to leave them enabled)."; return 1
+    fi
+  fi
   kill -TERM "$pid"            # SIGTERM = the same clean shutdown as Ctrl-C (releases the OAK / serial port)
   for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+  if kill -0 "$pid" 2>/dev/null && [ "$s" = arm ] && [ "${FORCE:-0}" = 1 ]; then kill -TERM "$pid"; sleep 1; fi
   if kill -0 "$pid" 2>/dev/null; then echo "$s: did not exit, sending SIGKILL"; kill -KILL "$pid"; fi
   rm -f "$RUN/$s.pid"; echo "$s: stopped"
 }

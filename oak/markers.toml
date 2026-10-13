@@ -100,3 +100,16 @@ size_status = "measured"
 card_thickness_mm = nan
 card_thickness_status = "unset"
 physically_fixed = false
+
+# ---------------------------------------------------------------------------------------------
+# 把持中心の確認用治具（任意）。DICT_4X4_50 の ID 4 を印刷し、薄い板に貼って両顎で中央に挟む。
+# 治具マーカー座標から把持中心（両顎の中央・パッドの中ほど）への並進を、治具を挟んだ状態で実測して書く。
+#   例: 板の厚みの半分だけ板の裏側（-z）、マーカー中心から顎の先端方向へ a mm → [0, -a, -t/2]
+# ID 1 と ID 4 を同時に静止観測すると T_m1_grip = T_m1_jig · T_jig_grip が求まる（vision.py の「把持中心を記録」）。
+# ---------------------------------------------------------------------------------------------
+[marker.4]
+role = "grip_jig"
+size_mm = 20.0
+size_status = "unset"          # 印刷して黒枠を測ったら measured
+jig_to_grip_mm = [nan, nan, nan]
+jig_to_grip_status = "unset"

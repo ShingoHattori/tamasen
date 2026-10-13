@@ -91,6 +91,17 @@ class Sim:
         mujoco.mj_forward(self.m, self.d)
 
     # ------------------------------------------------------------------ placement
+    def handeye(self):
+        f = HERE.parent / "oak" / "calib" / "handeye_active.json"
+        if f.exists():
+            try:
+                h = json.loads(f.read_text())
+                if h.get("ok") and h.get("status") == "calibrated":
+                    return h
+            except Exception:
+                return None
+        return None
+
     def T_base_world(self):
         p = self.settings["placement"]
         if p["status"] == "calibrated":
@@ -107,7 +118,7 @@ class Sim:
             return None, "認識サーバーに接続できない"
         if time.time() - vs.get("t", 0) > 0.5:
             return None, f"観測が古い（{time.time() - vs.get('t', 0):.1f} s 前）"
-        if not vs["world"]["valid"]:
+        if not vs["world"]["valid"] and self.handeye() is None:
             return None, "ID 2 world が無効: " + vs["world"].get("reason", "")
         side = {str(mk["id"]): mk["side_px"] for mk in vs["markers"]}
         cands = [(k, b) for k, b in vs["block"].items() if b["T_world_obj"] and b["status"] in ("ok", "pair")]
@@ -119,6 +130,11 @@ class Sim:
             if not cands:
                 return None, "ブロックの観測がない（ID 0 / ID 3 が見えていない、または取り付け未登録）"
         k, b = max(cands, key=lambda kb: side.get(kb[0], 0))      # the larger marker in the image
+        he = self.handeye()
+        if he is not None:     # camera <-> base calibrated: map the camera-frame pose directly
+            T = np.array(he["T_base_cam"]) @ np.array(b["T_cam_obj"])
+            return (T, "observed_calibrated", f"ID {k} から（{b['status']}）、校正 {he.get('session')}", uncertain,
+                    np.array(b["T_world_obj"]) if b["T_world_obj"] else None), None
         T, basis = self.T_base_world()
         return (T @ np.array(b["T_world_obj"]), basis, f"ID {k} から（{b['status']}）", uncertain, np.array(b["T_world_obj"])), None
 
@@ -189,7 +205,8 @@ class Sim:
                     self.set_block(T)
                     self.block_visible, self.block_basis = True, basis
                     self.block_uncertain = uncertain
-                    self.block_obs = {"T_world_obj": T_world_obj.tolist(), "T_base_obj": T.tolist(), "which": which}
+                    self.block_obs = {"T_world_obj": None if T_world_obj is None else T_world_obj.tolist(),
+                                      "T_base_obj": T.tolist(), "which": which}
                     info["block"] = f"{BASIS_LABEL[basis]}、{which}" + ("。観測が曖昧なため表示のみ（計画・試行には使わない）" if uncertain else "")
             self.m.geom_rgba[self.ids.block_geom] = [1.0, 0.5, 0.1, 0.45] if self.block_uncertain else [0.95, 0.85, 0.15, 1]
             mujoco.mj_forward(self.m, self.d)        # kinematics only, no physics in sync mode
@@ -428,7 +445,15 @@ class Sim:
             return {"ok": False, "message": "実機の関節角が読めない: " + str(arm.get("error", "応答なし"))}
         by = {j["name"]: j["pos"] for j in arm["joints"]}
         q_from = np.array([by[n] for n in scene.ARM_JOINTS])
-        if target == "engage_pose":
+        if target.startswith("calib:"):
+            cp = getattr(self, "calib_poses", None)
+            if not cp:
+                return {"ok": False, "message": "校正姿勢が未生成"}
+            p = cp["poses"][int(target.split(":")[1])]
+            if not p["ok"]:
+                return {"ok": False, "message": "この校正姿勢は静的チェック不合格: " + "; ".join(p["reasons"])}
+            q_to, label = np.array(p["q"]), f"校正姿勢 {p['i']}（{p['role']}）{p['label']}"
+        elif target == "engage_pose":
             qe = (arm.get("control") or {}).get("q_engage")
             if not qe:
                 return {"ok": False, "message": "有効化時の姿勢が記録されていない"}
@@ -446,7 +471,10 @@ class Sim:
         import uuid
         pid = uuid.uuid4().hex[:12]
         rec = dict(res, id=pid, label=label, checked_at=time.time(), q_from=q_from.tolist(),
-                   message=("シミュレーションで問題なし（床との距離・自己衝突・関節制限・追従）。ブロック・カメラスタンドとの干渉は未確認"
+                   message=("シミュレーションで問題なし（床との距離・登録済み障害物・自己衝突・関節制限・追従）。"
+                            + ("未登録の障害物: " + ", ".join(o["name"] for o in scene.obstacle_report(self.settings) if not o["in_scene"]) + "。" 
+                               if any(not o["in_scene"] for o in scene.obstacle_report(self.settings)) else "")
+                            + "実ブロックは camera↔base 未校正のため未確認"
                             if res["ok"] else "実行不可: " + "; ".join(res["reasons"])))
         with self.lock:
             self.paths = {k: v for k, v in getattr(self, "paths", {}).items() if time.time() - v["checked_at"] < 600}
@@ -456,10 +484,93 @@ class Sim:
             self.preview = {"traj": res["sim_q"], "dt": res["sim_dt"], "t0": time.monotonic()}
         return {k: v for k, v in rec.items() if k not in ("sim_q",)}
 
+    def _grip_ok(self) -> bool:
+        import tomllib
+        g = tomllib.loads((HERE.parent / "oak" / "markers.toml").read_text()).get("marker", {}).get("1", {}).get("grip", {})
+        return g.get("status") in ("measured", "calibrated")
+
+    # ------------------------------------------------------------------ calibration poses
+    def make_calib_poses(self, n_calib: int = 10, n_eval: int = 4) -> dict:
+        """Static poses for the eye-to-hand calibration, around the current real pose.
+
+        Rotations of end_link about its own x, y and z axes (single and combined, 17-30 deg) plus a
+        few cm of translation, so that relative motions excite several rotation axes. Every pose is
+        checked statically (IK, limits, floor / registered obstacles, self-collision); the path to it
+        is simulated separately before it may be executed. If the arm is folded at rest, the centre
+        is the rest orientation lifted by 10 cm. Whether ID 1 stays visible is only known when the
+        sample is captured.
+        """
+        arm = fetch(self.args.arm_url + "/state.json")
+        if not arm.get("ok"):
+            return {"ok": False, "message": "実機の関節角が読めない"}
+        q0 = np.array([j["pos"] for j in arm["joints"][:6]])
+        m, ids = self.m, self.ids
+        d = mujoco.MjData(m)
+        d.qpos[ids.arm_qadr] = q0
+        mujoco.mj_kinematics(m, d)
+        R0 = d.xmat[ids.end_body].reshape(3, 3).copy()
+        p0 = d.xpos[ids.end_body].copy()
+        folded = q0[1] > -0.25 and q0[2] > -0.25
+        if folded:
+            p0 = p0 + np.array([0, 0, 0.10])
+        site_off = np.array([-0.025, 0, 0])
+        a = math.radians
+        specs = [("x", 25, [0, 0, 0]), ("x", -25, [0.03, 0, 0]), ("y", 25, [0, 0.03, 0]), ("y", -25, [0, -0.03, 0]),
+                 ("z", 30, [0, 0, 0.03]), ("z", -30, [-0.03, 0, 0]), ("xy", 20, [0.02, 0.02, 0]), ("yz", 20, [0, 0, -0.02]),
+                 ("xz", -20, [0.02, -0.02, 0.02]), ("xyz", 17, [-0.02, 0.02, 0.0]),
+                 # evaluation poses: different combinations, never used for fitting
+                 ("xy", -22, [-0.02, 0, 0.02]), ("yz", -25, [0.03, 0.02, 0]), ("xz", 22, [0, -0.03, -0.02]), ("z", 15, [0.02, 0.03, 0.01])]
+        out = []
+        for k, (axes, deg, dt) in enumerate(specs[:n_calib] + specs[10:10 + n_eval]):
+            role = "calib" if k < n_calib else "eval"
+            R = R0.copy()
+            for ax in axes:
+                R = R @ planner_rot(ax, a(deg))
+            p_end = p0 + np.array(dt)
+            p_site = p_end + R @ site_off
+            best = None
+            for seed in (q0, np.array(q0) + [0, -0.5, -0.6, 0, 0, 0]):
+                q, pe, re = planner.solve_ik(m, d, ids, p_site, R, np.asarray(seed, float))
+                if best is None or pe + 0.05 * re < best[1] + 0.05 * best[2]:
+                    best = (q, pe, re)
+            q, pe, re = best
+            reasons = []
+            if pe > planner.IK_POS_TOL or re > planner.IK_ROT_TOL:
+                reasons.append(f"IK 解なし（{pe * 1000:.1f} mm / {math.degrees(re):.1f}°）")
+            k_ = planner.static_contacts(m, d, ids, q, self.gap.gap0, block_away=True)
+            if k_["floor"]:
+                reasons.append("床・障害物と干渉")
+            if [x for x in k_["self"] if x[0] > planner.SELF_PEN_TOL]:
+                reasons.append("自己衝突")
+            big = float(np.max(np.abs(np.degrees(q - q0) * ([1, 1, 1, 1, 1, 1]))))
+            if big > CALIB_MAX_JOINT_DEG:
+                reasons.append(f"関節変化が大きい（最大 {big:.0f}° > {CALIB_MAX_JOINT_DEG}°）")
+            out.append({"i": k, "role": role, "label": f"{axes} {deg:+d}° / {np.round(np.array(dt) * 100, 1).tolist()} cm",
+                        "q": q.tolist(), "ok": not reasons, "reasons": reasons})
+        with self.lock:
+            self.calib_poses = {"q0": q0.tolist(), "folded_centre_lifted": folded, "poses": out, "t": time.time()}
+        n_ok = sum(p["ok"] for p in out)
+        return {"ok": n_ok > 0, "message": f"校正姿勢 {len(out)} 個を生成（静的チェック合格 {n_ok}）。"
+                                           "各姿勢へは経路シミュレーション → 実機実行（依頼者）→ サンプル記録の順"}
+
+    def preview_calib(self) -> dict:
+        cp = getattr(self, "calib_poses", None)
+        if not cp:
+            return {"message": "校正姿勢がない"}
+        traj, q = [], np.array(cp["q0"])
+        for p in [p for p in cp["poses"] if p["ok"]]:
+            r = simulate_profile(self.m, self.ids, q, np.array(p["q"]), self.gap.gap0)
+            traj += r["sim_q"]
+            q = np.array(p["q"])
+        self.preview = {"traj": traj, "dt": 0.02, "t0": time.monotonic()}
+        return {"message": f"全 {sum(p['ok'] for p in cp['poses'])} 姿勢の巡回をツインで再生中（{len(traj) * 0.02:.0f} s）"}
+
     def real_grasp_blockers(self) -> list[str]:
         b = []
-        if self.settings["placement"]["status"] != "calibrated":
+        if self.settings["placement"]["status"] != "calibrated" and self.handeye() is None:
             b.append("カメラ⇔アーム台座が未校正")
+        if not self._grip_ok():
+            b.append("ID 1 → 把持中心（実際の顎の中心）が未確認（markers.toml [marker.1.grip]）")
         if not self.plan or self.plan["basis"] != "observed_calibrated":
             b.append("把持計画が校正済みの実物配置に基づいていない")
         if self.settings["jaw"]["gripper_map_status"] not in ("measured", "calibrated"):
@@ -514,6 +625,9 @@ class Sim:
                 "contacts": contacts,
                 "last_path": getattr(self, "last_path", None) and {k: v for k, v in self.last_path.items() if k not in ("sim_q", "q_plan", "times")},
                 "real_grasp_blockers": self.real_grasp_blockers(),
+                "obstacles": scene.obstacle_report(self.settings),
+                "calib_poses": getattr(self, "calib_poses", None),
+                "handeye_active": None if self.handeye() is None else {k: self.handeye().get(k) for k in ("session", "adopted_at", "holdout")},
                 "notes": [
                     "公開モデル Seeed-Projects/Borot-Arm_Mujoco @ 3f3e98d（rebotarm_b601_colored.xml）を読み込み、"
                     "床・ブロック・リンクの凸包衝突・アクチュエータを追加（scene.py）。",
@@ -524,6 +638,7 @@ class Sim:
             }
 
 
+CALIB_MAX_JOINT_DEG = 60      # calibration poses must stay near the current pose (camera stand etc.)
 VMAX = 0.25                  # rad/s — the same profile is executed by rebot/arm_state.py
 FLOOR_CLEARANCE = 0.015      # m, every arm / jaw geom along the simulated motion
 SIM_TRACK_MAX = 0.05         # rad, the simulated arm must follow the profile this closely
@@ -553,6 +668,7 @@ def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
                  and m.geom_contype[g] | m.geom_conaffinity[g]]
     lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
     reasons, sim_q, track, min_clear, worst = [], [], 0.0, math.inf, None
+    min_obst, worst_obst = math.inf, None
     if np.any(q_to < lo - 1e-3) or np.any(q_to > hi + 1e-3):
         reasons.append("目標が関節制限の外")
     steps = int(round((t[1] - t[0]) / m.opt.timestep)) if len(t) > 1 else 1
@@ -567,6 +683,10 @@ def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
             dist = mujoco.mj_geomDistance(m, d, g, ids.floor_geom, 0.05, None)
             if dist < min_clear:
                 min_clear, worst = dist, mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g])
+            for og in ids.obstacle_geoms:            # obstacles are already inflated by margin (+ uncertainty)
+                dist = mujoco.mj_geomDistance(m, d, g, og, 0.05, None)
+                if dist < min_obst:
+                    min_obst, worst_obst = dist, mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, og)
         for c in d.contact[:d.ncon]:
             b1, b2 = m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2]
             if b1 in ids.arm_bodies and b2 in ids.arm_bodies and -c.dist > planner.SELF_PEN_TOL:
@@ -577,12 +697,22 @@ def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
             break
     if min_clear < FLOOR_CLEARANCE:
         reasons.append(f"床との距離 {min_clear * 1000:.1f} mm < {FLOOR_CLEARANCE * 1000:.0f} mm（{worst}）")
+    if min_obst < 0.0:
+        reasons.append(f"障害物 {worst_obst}（余裕込みの箱）に入る（{min_obst * 1000:.1f} mm）")
     if track > SIM_TRACK_MAX:
         reasons.append(f"シミュレーション上の追従誤差 {track:.3f} rad > {SIM_TRACK_MAX}")
     return {"ok": not reasons, "reasons": reasons, "times": t.tolist(), "q_plan": qp.tolist(),
             "duration_s": float(t[-1]), "max_step_rad": float(np.max(np.abs(q_to - q_from))),
             "min_floor_clearance_m": float(min_clear), "sim_track_max_rad": track,
+            "min_obstacle_clearance_m": None if not math.isfinite(min_obst) else float(min_obst),
+            "obstacles_checked": [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) for g in ids.obstacle_geoms],
             "sim_q": sim_q, "sim_dt": 0.02, "vmax": VMAX}
+
+
+def planner_rot(axis: str, a: float) -> np.ndarray:
+    c, s_ = math.cos(a), math.sin(a)
+    return {"x": np.array([[1, 0, 0], [0, c, -s_], [0, s_, c]]), "y": np.array([[c, 0, s_], [0, 1, 0], [-s_, 0, c]]),
+            "z": np.array([[c, -s_, 0], [s_, c, 0], [0, 0, 1]])}[axis]
 
 
 def d_time(sim):
@@ -620,6 +750,7 @@ class RenderLoop:
                 if geom in ("collision", "both"):
                     opt.geomgroup[3] = 1
                     opt.geomgroup[4] = 1
+                opt.geomgroup[5] = 1                       # obstacles always visible
                 opt.sitegroup[:] = 0
                 opt.sitegroup[1] = 1
                 opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = self.sim.mode == "trial"
@@ -780,6 +911,10 @@ def main() -> int:
                     return self._json({"message": "シミュレートした経路がない"})
                 sim.preview = {"traj": lp["sim_q"], "dt": lp["sim_dt"], "t0": time.monotonic()}
                 return self._json({"message": "経路のシミュレーションを再生中"})
+            if path == "/api/calib_poses":
+                return self._json(sim.make_calib_poses())
+            if path == "/api/preview_calib":
+                return self._json(sim.preview_calib())
             if path == "/api/view":
                 for k in ("azimuth", "elevation", "distance"):
                     if k in body:

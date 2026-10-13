@@ -54,6 +54,36 @@ def load_settings(path: Path = HERE / "scene.toml") -> dict:
     return s
 
 
+def _bad(v) -> bool:
+    return v is None or (isinstance(v, float) and math.isnan(v))
+
+
+def usable_obstacles(s: dict) -> list[dict]:
+    """Obstacles that enter the scene, each with the margin it is inflated by."""
+    out = []
+    for ob in s.get("obstacle", []):
+        if ob.get("status") not in ("sample", "measured", "calibrated"):
+            continue
+        if any(_bad(v) for v in list(ob["position_m"]) + list(ob["size_m"])):
+            continue
+        inflate = ob.get("margin_m", 0.0) + (ob.get("uncertainty_m", 0.0) if ob["status"] == "sample" else 0.0)
+        out.append(dict(ob, inflate_m=inflate))
+    return out
+
+
+def obstacle_report(s: dict) -> list[dict]:
+    rows = []
+    used = {o["name"]: o for o in usable_obstacles(s)}
+    for ob in s.get("obstacle", []):
+        u = used.get(ob["name"])
+        rows.append({"name": ob["name"], "note": ob.get("note", ""), "status": ob.get("status", "unset"),
+                     "in_scene": u is not None, "inflate_m": None if u is None else u["inflate_m"],
+                     "label": ("未登録（経路チェックに入っていない）" if u is None else
+                               f"登録済み（{ob['status']}、各方向 +{u['inflate_m'] * 1000:.0f} mm で確認）"
+                               + ("。概略値で校正済みではない" if ob["status"] == "sample" else ""))})
+    return rows
+
+
 def physics_params(s: dict) -> dict[str, Param]:
     b, j, a = s["block"], s["jaw"], s["actuators"]
     return {
@@ -114,6 +144,15 @@ def build_xml(s: dict) -> str:
     # grip site midway along the pads (end_link x: pads span about -0.065..0, fingertips at 0)
     end = next(b for b in root.iter("body") if b.get("name") == "end_link")
     ET.SubElement(end, "site", name="grip", pos="-0.025 0 0", size="0.006", rgba="0 1 0 1", group="1")
+
+    # static obstacles (group 5): registered boxes only; unset ones are listed, never guessed
+    for ob in usable_obstacles(s):
+        half = np.array(ob["size_m"]) / 2 + ob["inflate_m"]
+        b = ET.SubElement(wb, "body", name=f"obst_{ob['name']}", pos=" ".join(map(str, ob["position_m"])),
+                          euler=f"0 0 {ob.get('yaw_rad', 0.0)}")
+        ET.SubElement(b, "geom", name=f"obst_{ob['name']}", type="box", size=" ".join(f"{v:.4f}" for v in half),
+                      contype="1", conaffinity="1", group="5",
+                      rgba="0.9 0.2 0.2 0.35" if ob["status"] == "sample" else "0.9 0.5 0.2 0.35")
 
     # block
     bs = np.array(s["block"]["size_m"]) / 2
@@ -192,6 +231,8 @@ class Ids:
         bodies = lambda prefix: {i for i in range(m.nbody) if mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, i).startswith(prefix)}
         self.finger_left = bodies("finger_left")
         self.finger_right = bodies("finger_right")
+        self.obstacle_geoms = [g for g in range(m.ngeom)
+                               if (mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith("obst_")]
         self.arm_bodies = {mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, n) for n in LINK_BODIES + ["end_link"]} \
             | self.finger_left | self.finger_right
 

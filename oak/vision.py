@@ -180,6 +180,7 @@ class Vision:
         self.observer = pose.Observer()
         self.world = world.WorldRef(world_path)
         self.lock = threading.Lock()      # guards world commands vs the processing thread
+        self.capture: dict | None = None  # hand-eye sample being collected (frames of ID 1 corners)
         self.reload()
 
     def reload(self) -> None:
@@ -260,6 +261,20 @@ class Vision:
             "thresholds": {"max_reproj_px": pose.MAX_REPROJ_PX, "ambiguous_ratio": pose.AMBIGUOUS_RATIO,
                            "flip_deg": pose.FLIP_DEG, "min_side_px": pose.MIN_SIDE_PX},
         }
+        if self.capture is not None:
+            o1 = next((o for o in obs if o.id == 1), None)
+            cap = self.capture
+            cap["frames"] += 1
+            if o1 is not None and o1.status != "rejected":
+                cap["corners"].append(o1.corners.copy())
+                cap["status"].append(o1.status)
+            for o in obs:
+                if o.status != "rejected":
+                    cap.setdefault("by_id", {}).setdefault(o.id, []).append(o.corners.copy())
+            if T_cam_world is not None:
+                cap["world"].append(T_cam_world)
+            if cap["frames"] >= cap["n"]:
+                cap["done"].set()
         return img, state
 
 
@@ -316,7 +331,11 @@ def main() -> int:
     ap.add_argument("--intrinsics", type=Path, help="user calibration JSON (default: factory EEPROM)")
     ap.add_argument("--replay", type=Path, help="recording directory to process instead of the camera")
     ap.add_argument("--loop", action="store_true", help="loop the replay")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to serve the LAN (then --allow-from applies)")
+    ap.add_argument("--allow-from", default="127.0.0.1/32",
+                    help="comma-separated CIDRs allowed to open the page, e.g. 127.0.0.1/32,192.168.32.0/24")
+    ap.add_argument("--arm-control-from", default=None,
+                    help="CIDRs allowed to POST arm commands (default: same as --allow-from)")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--stream-width", type=int, default=960, help="browser stream width (px)")
     ap.add_argument("--quality", type=int, default=75)
@@ -336,6 +355,127 @@ def main() -> int:
     intr: dict = {}
     meta: dict = {}
     notes: list[str] = []
+
+    calib_root = HERE / "calib" / "handeye"
+
+    def arm_state():
+        try:
+            with urllib.request.urlopen(args.arm_url + "/state.json", timeout=1) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def handeye_api(cmd: str, body: dict) -> dict:
+        """Sample capture / solve / adopt for the eye-to-hand calibration. Never moves the arm."""
+        import handeye
+        session = body.get("session") or time.strftime("%Y%m%d")
+        d = calib_root / session
+        if cmd == "sessions":
+            out = []
+            for sd in sorted(calib_root.iterdir()) if calib_root.exists() else []:
+                n = len((sd / "samples.jsonl").read_text().splitlines()) if (sd / "samples.jsonl").exists() else 0
+                r = json.loads((sd / "result.json").read_text()) if (sd / "result.json").exists() else None
+                out.append({"session": sd.name, "samples": n, "result": None if r is None else
+                            {k: r.get(k) for k in ("ok", "message", "n_calib", "n_eval", "diversity", "sd", "weighted_rms")}
+                            | {"holdout": {k: v for k, v in r.get("holdout", {}).items() if k != "rows"},
+                               "fit": {k: v for k, v in r.get("fit", {}).items() if k != "rows"}}})
+            active = HERE / "calib" / "handeye_active.json"
+            return {"sessions": out, "active": json.loads(active.read_text()) if active.exists() else None}
+        if cmd == "capture":
+            a0 = arm_state()
+            if not a0.get("ok") or not a0.get("fk"):
+                return {"ok": False, "message": "関節角が読めない: " + str(a0.get("error", "ok でない"))}
+            if vision.capture is not None:
+                return {"ok": False, "message": "記録中"}
+            n = int(body.get("frames", 20))
+            cap = {"n": n, "frames": 0, "corners": [], "status": [], "world": [], "done": threading.Event()}
+            vision.capture = cap
+            ok = cap["done"].wait(n / 10 + 5)
+            vision.capture = None
+            a1 = arm_state()
+            if not ok:
+                return {"ok": False, "message": "フレームが届かない"}
+            q0 = np.array([j["pos"] for j in a0["joints"][:6]]); q1 = np.array([j["pos"] for j in a1["joints"][:6]])
+            vel = max(abs(j["vel"] or 0) for j in a1["joints"][:6])
+            if np.max(np.abs(q1 - q0)) > 0.002 or vel > 0.02:
+                return {"ok": False, "message": f"記録中に関節が動いた（{np.max(np.abs(q1 - q0)):.4f} rad、速度 {vel:.3f}）。静止させて再記録"}
+            if len(cap["corners"]) < 0.8 * n:
+                return {"ok": False, "message": f"ID 1 の検出が {len(cap['corners'])}/{n} フレームしかない"}
+            C = np.array(cap["corners"])
+            cm = C.mean(0)
+            cstd = float(np.sqrt(np.mean(np.sum((C - cm) ** 2, axis=2))))
+            spec = vision.cfg.markers[1]
+            sols = pose.solve_marker(cm, spec.size_m, np.array(intr["K"]), np.array(intr["dist_coeffs"]))
+            d.mkdir(parents=True, exist_ok=True)
+            f = d / "samples.jsonl"
+            idx = len(f.read_text().splitlines()) if f.exists() else 0
+            role = body.get("role") or ("eval" if idx % 4 == 3 else "calib")
+            rec = {"id": idx, "role": role, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "label": body.get("label", ""),
+                   "q": q1.tolist(), "T_base_ee": np.vstack([np.column_stack([np.array(a1["fk"]["R"]), a1["fk"]["p"]]), [0, 0, 0, 1]]).tolist(),
+                   "fk_model": a1.get("fk_model"), "corners_px": cm.tolist(), "corner_std_px": cstd,
+                   "n_frames": len(cap["corners"]), "status_counts": {k: cap["status"].count(k) for k in set(cap["status"])},
+                   "status": max(set(cap["status"]), key=cap["status"].count),
+                   "T_cam_m1": sols[0][1].tolist(), "T_cam_m1_alt": sols[1][1].tolist() if len(sols) > 1 else None,
+                   "marker_size_m": spec.size_m, "K": intr["K"], "dist": intr["dist_coeffs"], "image_size": intr["image"],
+                   "T_cam_world": None if not cap["world"] else np.mean(cap["world"], axis=0).tolist()}
+            with f.open("a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+            return {"ok": True, "message": f"サンプル {idx}（{role}）を記録: ID 1 {len(cap['corners'])} フレーム、角点の揺れ {cstd:.3f} px",
+                    "id": idx}
+        if cmd == "grip":
+            # ID 1 and the jig marker (ID 4) seen together, static: T_m1_jig, and with the measured
+            # jig->grip offset, a candidate T_m1_grip. Written to calib/grip/, not into markers.toml.
+            spec1, spec4 = vision.cfg.markers.get(1), vision.cfg.markers.get(4)
+            if spec4 is None or spec4.size_m is None:
+                return {"ok": False, "message": "ID 4（治具マーカー）の一辺が未入力（markers.toml [marker.4]）"}
+            n = int(body.get("frames", 30))
+            cap = {"n": n, "frames": 0, "corners": [], "status": [], "world": [], "done": threading.Event()}
+            vision.capture = cap
+            cap["done"].wait(n / 10 + 5)
+            vision.capture = None
+            by = cap.get("by_id", {})
+            if len(by.get(1, [])) < 0.8 * n or len(by.get(4, [])) < 0.8 * n:
+                return {"ok": False, "message": f"ID 1 / ID 4 の同時検出が不足（{len(by.get(1, []))}, {len(by.get(4, []))} / {n}）"}
+            K_, D_ = np.array(intr["K"]), np.array(intr["dist_coeffs"])
+            res = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "frames": n}
+            Ts = {}
+            for mid, spec in ((1, spec1), (4, spec4)):
+                C = np.array(by[mid])
+                cm = C.mean(0)
+                sols = pose.solve_marker(cm, spec.size_m, K_, D_)
+                Ts[mid] = sols[0][1]
+                res[f"id{mid}"] = {"corner_std_px": float(np.sqrt(np.mean(np.sum((C - cm) ** 2, axis=2)))),
+                                   "ambiguity": float(sols[0][0] / sols[1][0]) if len(sols) > 1 and sols[1][0] > 0 else 0.0,
+                                   "side_px": float(np.min(np.linalg.norm(cm - np.roll(cm, 1, 0), axis=1)))}
+            T_m1_jig = pose.invert(Ts[1]) @ Ts[4]
+            res["T_m1_jig"] = T_m1_jig.tolist()
+            if spec4.grip is not None and spec4.grip.usable:
+                res["T_m1_grip"] = (T_m1_jig @ spec4.grip.value).tolist()
+                res["T_m1_grip_status"] = f"治具 + 実測オフセット（{spec4.grip.status}）。markers.toml [marker.1.grip] へは確認後に手で記入"
+            else:
+                res["T_m1_grip"] = None
+                res["T_m1_grip_status"] = "治具→把持中心のオフセットが未入力のため T_m1_jig のみ"
+            g = HERE / "calib" / "grip"
+            g.mkdir(parents=True, exist_ok=True)
+            out = g / (time.strftime("%Y%m%d-%H%M%S") + ".json")
+            out.write_text(json.dumps(res, indent=1, ensure_ascii=False))
+            t = T_m1_jig[:3, 3] * 1000
+            return {"ok": True, "message": f"記録: ID1→治具 ({t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}) mm。{res['T_m1_grip_status']}（{out.name}）"}
+        if cmd == "solve":
+            if not (d / "samples.jsonl").exists():
+                return {"ok": False, "message": "サンプルがない"}
+            res = handeye.solve(handeye.load_samples(d))
+            (d / "result.json").write_text(json.dumps(res, indent=1, ensure_ascii=False))
+            return {"ok": res.get("ok", False), "message": res.get("message"), "session": session}
+        if cmd == "adopt":
+            r = json.loads((d / "result.json").read_text()) if (d / "result.json").exists() else None
+            if not r or not r.get("ok"):
+                return {"ok": False, "message": "評価に合格した結果がないため採用しない"}
+            act = dict(r, session=session, adopted_at=time.strftime("%Y-%m-%d %H:%M:%S"), status="calibrated",
+                       note="eye-to-hand: T_cam_base と T_ee_m1。たわみ・関節零点誤差は残差に含まれる。把持中心は別校正。")
+            (HERE / "calib" / "handeye_active.json").write_text(json.dumps(act, indent=1, ensure_ascii=False))
+            return {"ok": True, "message": f"採用した（{session}）。シミュレーターは観測ブロックを校正済み配置で置く"}
+        return {"ok": False, "message": f"unknown {cmd}"}
 
     if args.replay:
         src = recorder.ReplaySource(args.replay, loop=args.loop)
@@ -436,11 +576,30 @@ def main() -> int:
         except (BrokenPipeError, ConnectionResetError):
             return
 
+    import ipaddress
+    allow = [ipaddress.ip_network(c.strip()) for c in args.allow_from.split(",") if c.strip()]
+    arm_allow = ([ipaddress.ip_network(c.strip()) for c in args.arm_control_from.split(",") if c.strip()]
+                 if args.arm_control_from else allow)
+
+    def allowed(addr: str, nets) -> bool:
+        a = ipaddress.ip_address(addr)
+        return any(a in n for n in nets)
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, *a):
             pass
+
+        def handle_one_request(self):
+            # Every request, page or API, must come from an allowed address.
+            if not allowed(self.client_address[0], allow):
+                self.raw_requestline = self.rfile.readline(65537)
+                self.close_connection = True
+                if self.raw_requestline and self.parse_request():
+                    self.send_error(403, "not in --allow-from")
+                return
+            return super().handle_one_request()
 
         def _send(self, body: bytes, ctype: str, code: int = 200) -> None:
             self.send_response(code)
@@ -457,9 +616,13 @@ def main() -> int:
             path = self.path.split("?")[0]
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n) if n else b""
+            if path.startswith("/arm/") and not allowed(self.client_address[0], arm_allow):
+                return self._json({"ok": False, "message": f"{self.client_address[0]} からの実機操作は許可されていない（--arm-control-from）"}, 403)
             for prefix, base in (("/arm/", args.arm_url), ("/sim/", args.sim_url)):
                 if path.startswith(prefix):
                     return proxy(self, base, path[len(prefix) - 1:], "POST", body or b"{}")
+            if path.startswith("/api/handeye/"):
+                return self._json(handeye_api(path.rsplit("/", 1)[-1], json.loads(body or b"{}")))
             if path == "/api/snapshot":
                 _, st, raw, ann = shared.get()
                 if raw is None:
@@ -503,6 +666,8 @@ def main() -> int:
                 return self._send(f.read_bytes(), ctype)
             if path == "/state.json":
                 return self._send(shared.get()[0], "application/json")
+            if path == "/api/handeye/sessions":
+                return self._json(handeye_api("sessions", {}))
             if path == "/api/files":
                 out = []
                 for kind in ("snapshots", "recordings"):

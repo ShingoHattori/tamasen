@@ -55,6 +55,17 @@ KP, KI = 0.5, 1.0           # outer feedback loop on (plan - measured)
 I_MAX, CORR_MAX = 0.15, 0.20   # rad, limits of the integral and of the total correction
 CORRIDOR_RAD = 0.08         # rad, per-joint deviation from the simulated plan that stops the motion
 CORRIDOR_M = 0.020          # m, end_link deviation (FK) that stops the motion
+CAN_LOSS_S = 0.3            # s without fresh feedback while engaged = CAN / bus fault
+ENGAGE_GRACE_S = 0.5        # after enabling, status 0x1 must be reported within this time
+FAULT_POLICY = {
+    "ページ切断（生存確認なし）": "移動中なら停止し、その場で保持（トルクは維持）。保持中はそのまま保持。",
+    "サービス終了要求（SIGTERM）": "有効中は 1 回目を拒否し記録。5 s 以内の 2 回目で終了 — その場合モーターは最後の指令を保持したまま有効で残る"
+                                 "（CAN タイムアウトが 0 以外なら、その時間後にモーター側で無効化＝アームが落ちる）。先にページで「トルクを切る」こと。",
+    "CAN 断（フィードバックなし）": f"{CAN_LOSS_S} s で異常。移動を中止し、計画上の現在点を保持目標に固定して送り続ける（復帰しても経路は再開しない）。",
+    "モーター異常コード / 予期しない無効化": "異常。移動を中止し、他の関節は計画上の現在点で保持。無効化された関節は支えがない — 手で支えてトルクを切る。",
+    "計画経路からの逸脱": "異常。計画上の現在点で保持（実測位置へ目標を移さない）。新しい移動は異常解消まで拒否。",
+    "トルク解除": "依頼者の操作（RELEASE 入力）でのみ。サービスが自動でトルクを切ることはない。",
+}
 START_TOL = 0.05            # rad, path start must match the measured pose
 HEARTBEAT_S = 0.6           # page must post a heartbeat this often while engaged
 PATH_MAX_AGE_S = 120
@@ -96,6 +107,19 @@ class Bus:
             self._ctrl.poll_feedback_once()      # receive only
             time.sleep(0.001)
         return {n: m.get_state() for n, m in self._m.items()}
+
+    def read_params(self) -> dict:
+        """Register READS only (0x7FF [id, 0x33, rid]): CAN timeout (rid 9) and control mode (rid 10)."""
+        out = {}
+        for n, m in self._m.items():
+            row = {}
+            for rid, key in ((9, "can_timeout"), (10, "ctrl_mode")):
+                try:
+                    row[key] = int(m.get_register_u32(rid, 300))
+                except Exception as e:
+                    row[key] = f"ERR {e}"
+            out[n] = row
+        return out
 
     def _check(self):
         if not self.allow_motion:
@@ -159,6 +183,10 @@ class FakeBus:
             self.q.update(q0)
         self.target, self.vlim, self.enabled, self.t = dict(self.q), 0.0, set(), time.monotonic()
         self.log = []
+        self.inject = {"no_feedback": False, "status": {}}     # test hooks (fake only)
+
+    def read_params(self):
+        return {n: {"can_timeout": 0, "ctrl_mode": 2, "fake": True} for n in self.q}
 
     def _advance(self):
         dt, self.t = time.monotonic() - self.t, time.monotonic()
@@ -168,10 +196,12 @@ class FakeBus:
 
     def poll(self, settle_s=0.0):
         self._advance()
+        if self.inject["no_feedback"]:
+            return {}
         out = {}
         for n, v in self.q.items():
             s = FakeState(v + np.random.normal(0, 1e-5))
-            s.status_code = 1 if n in self.enabled else 0
+            s.status_code = self.inject["status"].get(n, 1 if n in self.enabled else 0)
             out[n] = s
         return out
 
@@ -246,6 +276,11 @@ class ArmService:
                         "motion": None, "last_heartbeat": 0.0}
         self.log_path = HERE.parent / "run" / ("arm_commands_fake.log" if args.fake else "arm_commands.log")
         self.log_path.parent.mkdir(exist_ok=True)
+        self.motor_params = {}
+        self.bus = None
+        self.exit_requests = []
+        self.statuses = {}
+        self.lost_since = None
         self.notes = [
             "読み取り専用の間に送信するのは Damiao のフィードバック要求（0x7FF, 0xCC）だけ。",
             "経過 s = 値が最後に変化してからの時間（motorbridge のキャッシュに受信時刻がないため、変化で鮮度を推定）。",
@@ -278,6 +313,8 @@ class ArmService:
                     try:
                         bus = (FakeBus(self.joints, self.args.allow_motion, {"joint1": -1.7, "joint2": 0.0}, self.args.fake_sag)
                                if self.args.fake else Bus(self.args.port, self.joints, self.args.allow_motion))
+                        self.bus = bus
+                        self.motor_params = bus.read_params()
                     except Exception as e:
                         self.publish({"mode": "fake" if self.args.fake else "serial", "port": self.args.port, "ok": False,
                                       "joints": [], "error": f"{self.args.port} を開けない: {e}"})
@@ -314,6 +351,7 @@ class ArmService:
             if age < STALE_S:
                 q[j["name"]] = s.pos
         ok = all(r["age_s"] is not None and r["age_s"] < STALE_S for r in rows)
+        self.statuses = {r["name"]: r.get("status_code") for r in rows}
         c = self.control
         self.publish({"mode": ("fake" if self.args.fake else "serial") + ("+motion" if self.args.allow_motion else " read-only"),
                       "motion_allowed": self.args.allow_motion, "port": self.args.port, "ok": ok, "t": now, "joints": rows,
@@ -321,7 +359,13 @@ class ArmService:
                       "control": {k: v for k, v in c.items() if k not in ("last_heartbeat",)} | {
                           "heartbeat_age_s": (time.monotonic() - c["last_heartbeat"]) if c["last_heartbeat"] else None},
                       "limits": {"vmax_rad_s": VMAX, "corridor_rad": CORRIDOR_RAD, "corridor_m": CORRIDOR_M,
-                                 "heartbeat_s": HEARTBEAT_S, "kp": KP, "ki": KI},
+                                 "heartbeat_s": HEARTBEAT_S, "kp": KP, "ki": KI, "can_loss_s": CAN_LOSS_S},
+                      "motor_params": self.motor_params,
+                      "compensation": {
+                          "joint_feedback": "関節角（エンコーダ）の追従補正: 有効中は常時。モーター軸の角度を計画に合わせるだけ。",
+                          "visual_tcp_correction": "視覚（ID 1）による手先誤差補正: 未実装（camera↔base と 手先リンク↔ID 1 の校正後に検討）。",
+                          "deflection": "リンク・減速機・取り付けのたわみ: 補償していない（関節角が計画どおりでも手先はずれ得る）。"},
+                      "faults_policy": FAULT_POLICY,
                       "notes": self.notes})
         return q if ok else {}
 
@@ -357,15 +401,30 @@ class ArmService:
         if c["state"] not in ("holding", "moving"):
             return
         if not all(n in q for n in ARM):
-            c["message"] = "関節角が読めない（応答なし / 古い）。状態を確認すること"
+            self.lost_since = self.lost_since or time.monotonic()
+            lost = time.monotonic() - self.lost_since
+            if lost > CAN_LOSS_S:
+                self._fault(f"フィードバックなし {lost:.1f} s（CAN 断 / 電源断の可能性）", keep_target=True)
+            if c.get("last_cmd"):
+                bus.send_pos_vel(c["last_cmd"], VMAX)       # keep holding the last commanded point
             return
+        self.lost_since = None
+        bad = {n: self.statuses.get(n) for n in ARM if self.statuses.get(n) != 0x1}
+        c["cause_now"] = bool(bad)
+        if bad and time.monotonic() - c.get("engaged_mono", 0) > ENGAGE_GRACE_S:
+            desc = ", ".join(f"{n}: {DAMIAO_STATUS.get(v, hex(v) if v is not None else '?')}" for n, v in bad.items())
+            self._fault(f"モーター状態の異常（{desc}）。無効化された関節は支えがない", keep_target=True)
         dt = 1.0 / CTRL_HZ
         qm = np.array([q[n] for n in ARM])
         if c["state"] == "moving":
             mv = c["motion"]
             hb = time.monotonic() - c["last_heartbeat"]
             if hb > HEARTBEAT_S:
-                return self._hold(bus, q, f"ページからの生存確認が {hb:.1f} s 途絶えたため停止（その場で保持）")
+                qs = self._plan_at(mv, time.monotonic() - mv["t0"])
+                c.update(state="holding", motion=None, hold_q=dict(zip(ARM, qs)),
+                         message=f"ページからの生存確認が {hb:.1f} s 途絶えたため停止（計画上の現在点で保持）")
+                self.audit("stopped: heartbeat lost", "service")
+                return
             t = time.monotonic() - mv["t0"]
             qp = self._plan_at(mv, t)
             mv["progress"] = min(1.0, t / mv["T"])
@@ -389,14 +448,36 @@ class ArmService:
                 c.update(state="holding", motion=None, hold_q=dict(zip(ARM, qp)),
                          fault=why, message="停止（異常）: " + why + "。計画上の位置を保持目標に固定。停止・トルク切りで対処")
                 self.audit("fault: " + why, "service")
-        elif c.get("fault") and c["state"] == "holding":
-            c["message"] = "異常は解消（保持目標に戻った）: " + c["fault"]
-            c["fault"] = None
-        bus.send_pos_vel(dict(zip(ARM, q_cmd)), VMAX * 1.5)
+        # Faults latch: they are cleared only by the user ("ack_fault") once the cause is gone, or by release.
+        c["last_cmd"] = dict(zip(ARM, q_cmd))
+        bus.send_pos_vel(c["last_cmd"], VMAX * 1.5)
         if c["state"] == "moving" and t >= mv["T"] + 0.5:
             end = dict(zip(ARM, np.array(mv["q_plan"][-1])))
             c.update(state="holding", motion=None, hold_q=end,
                      message=f"移動完了（最大偏差 {fb['max_err']:.3f} rad / 手先 {fb['max_tcp_dev'] * 1000:.0f} mm）。保持中もフィードバック継続")
+
+    def _fault(self, why: str, keep_target: bool) -> None:
+        """Stop any motion; hold the planned point of this instant (or the last command)."""
+        c = self.control
+        if c.get("fault") == why:
+            return
+        if c["state"] == "moving":
+            qp = self._plan_at(c["motion"], time.monotonic() - c["motion"]["t0"])
+            c.update(hold_q=dict(zip(ARM, qp)))
+        c.update(state="holding", motion=None, fault=why, message="停止（異常）: " + why)
+        self.audit("fault: " + why, "service")
+
+    def request_exit(self) -> bool:
+        """SIGTERM policy: refuse the first request while engaged; a second one within 5 s exits."""
+        now = time.monotonic()
+        self.exit_requests = [t for t in self.exit_requests if now - t < 5.0] + [now]
+        if self.control["state"] == "read_only" or len(self.exit_requests) >= 2:
+            if self.control["state"] != "read_only":
+                self.audit("exit forced while engaged: motors left enabled with the last command", "service")
+            return True
+        self.control["message"] = "有効中のため終了要求を拒否した。ページで「トルクを切る」か、5 s 以内に再度 SIGTERM"
+        self.audit("exit refused while engaged", "service")
+        return False
 
     def _tcp_dev(self, qp, qm):
         a = self.fk(dict(zip(ARM, qp)))
@@ -427,7 +508,8 @@ class ArmService:
             hold = {n: q[n] for n in ARM}
             bus.enable(ARM)                                # the six arm motors only
             bus.send_pos_vel(hold, VMAX)
-            c.update(state="holding", engaged_at=time.strftime("%H:%M:%S"), q_engage=hold, hold_q=hold,
+            c.update(state="holding", engaged_at=time.strftime("%H:%M:%S"), engaged_mono=time.monotonic(),
+                     q_engage=hold, hold_q=hold, fault=None, last_cmd=hold,
                      fb={"I": [0.0] * 6, "max_err": 0.0, "max_tcp_dev": 0.0},
                      message="有効化した（現在位置で保持）。グリッパーは無効のまま")
             c["last_heartbeat"] = time.monotonic()
@@ -458,6 +540,18 @@ class ArmService:
             c.update(state="moving", message=f"移動中: {path['label']}",
                      motion={"label": path["label"], "path_id": path["id"], "times": path["times"],
                              "q_plan": path["q_plan"], "T": float(path["times"][-1]), "t0": time.monotonic(), "progress": 0.0})
+        elif cmd == "ack_fault":
+            if not c.get("fault"):
+                c["message"] = "異常はない"
+            elif not all(n in q for n in ARM) or c.get("cause_now"):
+                c["message"] = "原因が続いているため解除しない: " + c["fault"]
+            else:
+                e = max(abs(q[n] - c["hold_q"][n]) for n in ARM) if c.get("hold_q") else 0.0
+                if e > CORRIDOR_RAD:
+                    c["message"] = f"保持目標から {e:.3f} rad 離れているため解除しない（トルクを切って姿勢を確認）"
+                else:
+                    self.audit("fault acknowledged: " + c["fault"], "user")
+                    c.update(fault=None, message="異常を確認・解除した（保持中）")
         elif cmd == "grasp":
             c["message"] = "実機での把持実行は拒否: " + "; ".join(kw.get("blockers") or ["条件未確認"])
 
@@ -496,6 +590,8 @@ class ArmService:
                     return self._json(svc.submit("engage", src))
                 if path == "/api/stop":
                     return self._json(svc.submit("stop", src))
+                if path == "/api/ack_fault":
+                    return self._json(svc.submit("ack_fault", src))
                 if path == "/api/release":
                     if body.get("confirm") != "RELEASE":
                         return self._json({"ok": False, "message": "確認文字列 RELEASE が必要"})
@@ -511,6 +607,9 @@ class ArmService:
                     if time.time() - p["checked_at"] > PATH_MAX_AGE_S:
                         return self._json({"ok": False, "message": "経路の確認から時間が経ちすぎた。確認し直す"})
                     return self._json(svc.submit("execute", src, path=p))
+                if path == "/api/test/inject" and svc.args.fake:
+                    svc.bus.inject.update(body)
+                    return self._json({"ok": True, "inject": svc.bus.inject})
                 if path == "/api/grasp":
                     g = fetch_json(f"{svc.args.sim_url}/api/real_grasp_check") or {}
                     return self._json(svc.submit("grasp", src, blockers=g.get("blockers", ["シミュレーターに接続できない"])))
@@ -549,7 +648,7 @@ def main() -> int:
     mode = ("FAKE motors" if args.fake else args.port) + (" | MOTION ALLOWED from the web page" if args.allow_motion else " | read-only")
     print(f"arm_state on http://{args.host}:{args.http_port}/state.json — {mode}", flush=True)
     svc.audit(f"service start: {mode}", "service")
-    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
+    signal.signal(signal.SIGTERM, lambda *_: svc.request_exit() and threading.Thread(target=server.shutdown).start())
     try:
         if args.seconds:
             threading.Timer(args.seconds, server.shutdown).start()

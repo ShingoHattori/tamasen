@@ -226,7 +226,12 @@ async function pollArm() {
         <td>${j.torq == null ? "—" : f(j.torq, 3)}</td><td>${j.status ?? "—"}</td><td class="${j.age_s != null && j.age_s < 0.5 ? "ok" : "bad"}">${f(j.age_s, 2)}</td></tr>`);
       $("arm").innerHTML = `<div>${esc(a.mode)} — ${esc(a.port)}、${a.ok ? '<span class="ok">応答あり</span>' : '<span class="bad">応答なし / 古い</span>'}</div>
         <table><tr><th>関節</th><th>角度 °</th><th>速度 rad/s</th><th>トルク Nm</th><th>状態コード</th><th>経過 s</th></tr>${rows.join("")}</table>
-        <div class="dim">${(a.notes || []).map(esc).join("<br>")}</div>`;
+        <div class="dim">${(a.notes || []).map(esc).join("<br>")}</div>
+        <h2>補正の区別</h2><div>${a.compensation ? Object.values(a.compensation).map(esc).join("<br>") : ""}</div>
+        <h2>モーター設定（起動時に読み取り）</h2><div class="dim">${a.motor_params ? Object.entries(a.motor_params).map(([n, p]) =>
+          `${n}: CAN タイムアウト ${esc(p.can_timeout)}、制御モード ${esc(p.ctrl_mode)}`).join("<br>") : "—"}
+          <br>CAN タイムアウト 0 = 無効（指令が途絶えてもモーターは無効化しない）、0 以外 = その時間で無効化（アームが落ちる）。制御モード 1 MIT / 2 位置速度 / 3 速度</div>
+        <h2>異常時の動作</h2><div class="dim">${a.faults_policy ? Object.entries(a.faults_policy).map(([k, v]) => `<b>${esc(k)}</b>: ${esc(v)}`).join("<br>") : ""}</div>`;
     }
     renderCtl(a.available === false ? null : a);
   } catch (e) { $("arm").textContent = String(e); }
@@ -258,6 +263,7 @@ setInterval(() => {               // dead-man: only while this page is visible a
 }, 200);
 $("engage").onclick = () => { const t = prompt("実機の 6 関節を有効化し、現在位置で保持します。アーム周辺に人・物がないことを確認して MOVE と入力"); if (t) post("/arm/api/engage", { confirm: t }); };
 $("stopArm").onclick = () => post("/arm/api/stop");
+$("ackFault").onclick = () => { if (confirm("異常の原因を確認し、取り除きましたか？（原因が続いている場合は解除されません）")) post("/arm/api/ack_fault"); };
 $("release").onclick = () => { const t = prompt("トルクを切ると J2/J3 が自重で落ちます。アームを手で支えてから RELEASE と入力"); if (t) post("/arm/api/release", { confirm: t }); };
 document.querySelectorAll("[data-path]").forEach(b => b.onclick = async () => {
   checkedPath = await post("/sim/api/check_path", { target: b.dataset.path });
@@ -298,6 +304,7 @@ $("reset").onclick = () => post("/sim/api/reset");
 simStream();
 
 function renderSim(s) {
+  if (s.available !== false) renderPoses(s.calib_poses);
   if (s.available === false) { $("sim").innerHTML = `<span class="warn">${esc(s.error)}</span><br><span class="dim">sim/sim_server.py が起動していない。</span>`; return; }
   $("simMode").innerHTML = `<b>${s.mode === "sync" ? "現実同期" : "シミュレーション試行"}</b> ${s.mode === "sync" ? "（物理演算なし。観測と関節角を反映するだけ）" : "（ライブ観測による上書きを停止中）"}`;
   $("simPlace").innerHTML = `${esc(s.placement.label)} ${s.placement.calibrated ? '<span class="tag cal">校正済み</span>' : '<span class="tag prov">未校正・模擬</span>'}`;
@@ -316,6 +323,7 @@ function renderSim(s) {
       <br><span class="dim">${esc(s.fk_vs_vision || "")}</span></div>
     <h2>把持候補</h2>${plan ? planTable(plan) : '<span class="dim">未計算</span>'}
     <h2>試行</h2>${tr ? trialView(tr) : '<span class="dim">未実施</span>'}
+    <h2>障害物</h2>${(s.obstacles || []).map(o => `${esc(o.name)}: <span class="${o.in_scene ? "ok" : "warn"}">${esc(o.label)}</span> <span class="dim">${esc(o.note)}</span>`).join("<br>") || "—"}
     <h2>実機での把持実行の前提</h2>${s.real_grasp_blockers.length ? `<ul>${s.real_grasp_blockers.map(b => `<li class="warn">${esc(b)}</li>`).join("")}</ul>` : '<span class="ok">満たしている</span>'}
     <h2>物理パラメータ</h2>${physTable(s.physics)}
     <h2>接触</h2><div>${(s.contacts || []).map(esc).join("<br>") || '<span class="dim">なし</span>'}</div>`;
@@ -352,3 +360,44 @@ async function loadFiles() {
     `<a href="/files/${x.kind}/${x.name}/${n}" target="_blank">${n}</a>`).join(" ")}</div>`).join("") || '<span class="dim">なし</span>';
 }
 loadFiles();
+
+// ------------------------------------------------------------------ eye-to-hand calibration
+const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+$("heSession").value = today;
+$("genPoses").onclick = () => post("/sim/api/calib_poses");
+$("previewPoses").onclick = () => post("/sim/api/preview_calib");
+$("heSolve").onclick = async () => { await post("/api/handeye/solve", { session: $("heSession").value }); loadHE(); };
+$("heAdopt").onclick = async () => { if (confirm("この校正結果を採用し、シミュレーターの配置を校正済みにします。よろしいですか？")) { await post("/api/handeye/adopt", { session: $("heSession").value }); loadHE(); } };
+$("gripCap").onclick = () => post("/api/handeye/grip", { frames: 30 });
+let lastPoses = null;
+function renderPoses(cp) {
+  if (!cp) { $("calibPoses").innerHTML = '<span class="dim">未生成</span>'; return; }
+  if (lastPoses === cp.t) return; lastPoses = cp.t;
+  $("calibPoses").innerHTML = `<table><tr><th>#</th><th class="l">用途</th><th class="l">姿勢（end_link の回転 / 並進）</th><th class="l">静的チェック</th><th></th></tr>` +
+    cp.poses.map(p => `<tr><td>${p.i}</td><td class="l">${p.role === "eval" ? '<span class="info">評価用</span>' : "校正用"}</td><td class="l">${esc(p.label)}</td>
+      <td class="l ${p.ok ? "ok" : "bad"}">${p.ok ? "ok" : esc(p.reasons.join("; "))}</td>
+      <td>${p.ok ? `<button data-calsim="${p.i}">経路をシミュレート</button><button data-calcap="${p.i}" data-role="${p.role}" data-label="${esc(p.label)}">サンプル記録</button>` : ""}</td></tr>`).join("") + "</table>" +
+    `<div class="dim">${cp.folded_centre_lifted ? "現在の姿勢が畳まれていたため、同じ向きで 10 cm 持ち上げた姿勢を中心にした。" : ""}実行は上の実機パネル（依頼者の操作）。ID 1 が見えるかは記録時に判定する。</div>`;
+  document.querySelectorAll("[data-calsim]").forEach(b => b.onclick = async () => {
+    checkedPath = await post("/sim/api/check_path", { target: "calib:" + b.dataset.calsim });
+    $("pathres").innerHTML = (checkedPath.ok ? `<span class="ok">${esc(checkedPath.label)}: ${esc(checkedPath.message)}</span>` : `<span class="bad">${esc(checkedPath.message || "")}</span>`);
+  });
+  document.querySelectorAll("[data-calcap]").forEach(b => b.onclick = async () => {
+    await post("/api/handeye/capture", { session: $("heSession").value, role: b.dataset.role, label: "pose " + b.dataset.calcap + " " + b.dataset.label });
+    loadHE();
+  });
+}
+async function loadHE() {
+  try {
+    const r = await (await fetch("/api/handeye/sessions")).json();
+    const cur = r.sessions.find(x => x.session === $("heSession").value);
+    const res = cur && cur.result;
+    $("heResult").innerHTML = `サンプル ${cur ? cur.samples : 0} 個` + (res ? `<br>結果: <b class="${res.ok ? "ok" : "bad"}">${esc(res.message || "")}</b>
+      （校正 ${res.n_calib}、評価 ${res.n_eval}）<br>回転の多様性: ${esc(res.diversity ? res.diversity.message : "")}
+      ${res.holdout && res.holdout.n ? `<br>評価用姿勢: 再投影 平均 ${f(res.holdout.reproj_px_mean)} / 最大 ${f(res.holdout.reproj_px_max)} px、位置 中央値 ${f(res.holdout.pos_err_mm_median, 1)} mm（画像面内 ${f(res.holdout.lateral_err_mm_median, 1)} mm）、
+        回転 中央値 ${f(res.holdout.rot_err_deg_median)}°（参考: 単一マーカー姿勢のノイズを含む）` : ""}
+      ${res.sd ? `<br>推定の標準偏差: camera↔base 並進 ${res.sd.cam_base_t_mm.map(v => f(v, 1)).join("/")} mm、回転 ${res.sd.cam_base_rot_deg.map(v => f(v, 2)).join("/")}°；end_link↔ID 1 並進 ${res.sd.ee_m1_t_mm.map(v => f(v, 1)).join("/")} mm` : ""}` : "") +
+      `<br>採用中: ${r.active ? `${esc(r.active.session)}（${esc(r.active.adopted_at)}）` : '<span class="warn">なし（camera↔base 未校正）</span>'}`;
+  } catch (e) { $("heResult").textContent = String(e); }
+}
+loadHE(); setInterval(loadHE, 5000);

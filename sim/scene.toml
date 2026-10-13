@@ -57,3 +57,32 @@ yaw_rad = 0.3
 # 関節角が読めないときの模擬姿勢
 [mock_joints]
 q_rad = [0.0, -0.9, -1.4, 0.0, 0.0, 0.0]
+
+# ---------------------------------------------------------------------------------------------
+# 障害物（経路チェックとシミュレーションに入る静的な箱）。台座座標 base で登録する。
+#   position_m: 箱の中心、size_m: 全幅（x, y, z）、yaw_rad: z 軸回りの回転
+#   status: "unset" = 未登録（シーンに入れない。画面に「未登録」と出る）
+#           "sample" = 目測・概略（uncertainty_m を各方向に上乗せした箱で確認する。校正済みとは扱わない）
+#           "measured" = 巻尺などで実測（margin_m だけ上乗せ）
+#   ID 2 world 座標で測った物は、camera↔base 校正（[placement] calibrated）までは base に変換できないので、
+#   base で測り直すか校正後に登録する。
+# ---------------------------------------------------------------------------------------------
+[[obstacle]]
+name = "camera_stand"
+note = "OAK のスタンド（映像の下端）。脚・支柱を囲む箱で登録する"
+status = "unset"
+position_m = [nan, nan, nan]
+size_m = [nan, nan, nan]
+yaw_rad = 0.0
+margin_m = 0.02
+uncertainty_m = 0.05
+
+[[obstacle]]
+name = "power_supply"
+note = "台座の手前側（映像の左下）の電源ボックス"
+status = "unset"
+position_m = [nan, nan, nan]
+size_m = [nan, nan, nan]
+yaw_rad = 0.0
+margin_m = 0.02
+uncertainty_m = 0.05
