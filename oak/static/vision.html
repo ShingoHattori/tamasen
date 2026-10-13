@@ -87,9 +87,10 @@
    <button id="heSolve">解く</button><button id="heAdopt">評価合格の結果を採用</button></div>
   <div id="calibPoses"></div><div id="heResult"></div>
   <h2>把持中心（ID 1 → 実際の顎の中心）— camera↔base とは別の校正</h2>
-  <div class="dim">ID 4（20 mm、marker/aruco_4x4_50_id4_20mm_600dpi.png）を貼った薄い板を両顎の中央で挟み、治具→把持中心のオフセットを実測して markers.toml [marker.4] に記入してから記録する。
-   結果は oak/calib/grip/ に保存され、確認後に [marker.1.grip] へ手で記入する（自動では書き換えない）。</div>
-  <div><button id="gripCap">把持中心を記録（ID 1 + ID 4 を同時観測）</button></div>
+  <div class="dim">治具 = 印刷シートの ID 3（40 mm）を貼った薄い板。両顎を閉じて挟み（板面 = 両顎の中央面）、治具→把持中心のずれを実測して markers.toml [grip_jig] に記入してから記録する。
+   治具モード中は ID 3 を治具として扱いブロック推定に使わない — ブロックは画角外へ。結果は oak/calib/grip/ に保存し、確認後に [marker.1.grip] へ手で記入する（自動では書き換えない）。</div>
+  <div><button id="jigOn">治具モード ON</button><button id="jigOff">治具モード OFF</button><span id="jigState"></span>
+   <button id="gripCap">把持中心を記録（ID 1 + 治具を同時観測）</button></div>
  </section>
  <section><h2>アーム関節</h2><div id="arm"></div>
   <div id="armctl" style="display:none;border-top:1px solid #444;margin-top:8px;padding-top:6px">

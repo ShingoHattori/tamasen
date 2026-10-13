@@ -181,6 +181,7 @@ class Vision:
         self.world = world.WorldRef(world_path)
         self.lock = threading.Lock()      # guards world commands vs the processing thread
         self.capture: dict | None = None  # hand-eye sample being collected (frames of ID 1 corners)
+        self.jig_mode = False             # grip-centre jig: the jig id is NOT a block marker while on
         self.reload()
 
     def reload(self) -> None:
@@ -209,7 +210,7 @@ class Vision:
             pass
 
     def process(self, color, t: float, K, dist, meta: dict):
-        cfg = self.cfg
+        cfg = self.cfg.with_jig() if self.jig_mode else self.cfg
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(color, cv2.COLOR_BGR2GRAY))
         obs = self.observer.observe(corners, ids, t, cfg, K, dist)
         with self.lock:
@@ -258,6 +259,8 @@ class Vision:
             "config_error": self.cfg_error, "config": cfg.json(), "missing": pose.missing_report(cfg),
             "markers": markers, "not_seen_age_s": not_seen, "world": ws, "block": block,
             "compare_0_3": cmp,
+            "jig_mode": {"on": self.jig_mode, "id": None if cfg.grip_jig is None else cfg.grip_jig.id,
+                         "size_m": None if cfg.grip_jig is None else cfg.grip_jig.size_m},
             "thresholds": {"max_reproj_px": pose.MAX_REPROJ_PX, "ambiguous_ratio": pose.AMBIGUOUS_RATIO,
                            "flip_deg": pose.FLIP_DEG, "min_side_px": pose.MIN_SIDE_PX},
         }
@@ -422,24 +425,32 @@ def main() -> int:
                 fh.write(json.dumps(rec) + "\n")
             return {"ok": True, "message": f"サンプル {idx}（{role}）を記録: ID 1 {len(cap['corners'])} フレーム、角点の揺れ {cstd:.3f} px",
                     "id": idx}
+        if cmd == "jig_mode":
+            vision.jig_mode = bool(body.get("on"))
+            return {"ok": True, "message": ("治具モード ON: ID {} を治具（{:.0f} mm）として扱い、ブロック推定に使わない。ブロックは画角外へ"
+                                            .format(vision.cfg.grip_jig.id, vision.cfg.grip_jig.size_m * 1000) if vision.jig_mode
+                                            else "治具モード OFF: ID 3 はブロックのマーカーに戻った")}
         if cmd == "grip":
             # ID 1 and the jig marker (ID 4) seen together, static: T_m1_jig, and with the measured
             # jig->grip offset, a candidate T_m1_grip. Written to calib/grip/, not into markers.toml.
-            spec1, spec4 = vision.cfg.markers.get(1), vision.cfg.markers.get(4)
+            spec1, spec4 = vision.cfg.markers.get(1), vision.cfg.grip_jig
             if spec4 is None or spec4.size_m is None:
-                return {"ok": False, "message": "ID 4（治具マーカー）の一辺が未入力（markers.toml [marker.4]）"}
+                return {"ok": False, "message": "治具マーカーの設定がない（markers.toml [grip_jig]）"}
+            if not vision.jig_mode:
+                return {"ok": False, "message": f"治具モードを ON にしてから記録する（ID {spec4.id} を治具として扱う。ブロックは画角外へ）"}
+            jid = spec4.id
             n = int(body.get("frames", 30))
             cap = {"n": n, "frames": 0, "corners": [], "status": [], "world": [], "done": threading.Event()}
             vision.capture = cap
             cap["done"].wait(n / 10 + 5)
             vision.capture = None
             by = cap.get("by_id", {})
-            if len(by.get(1, [])) < 0.8 * n or len(by.get(4, [])) < 0.8 * n:
-                return {"ok": False, "message": f"ID 1 / ID 4 の同時検出が不足（{len(by.get(1, []))}, {len(by.get(4, []))} / {n}）"}
+            if len(by.get(1, [])) < 0.8 * n or len(by.get(jid, [])) < 0.8 * n:
+                return {"ok": False, "message": f"ID 1 / 治具 ID {jid} の同時検出が不足（{len(by.get(1, []))}, {len(by.get(jid, []))} / {n}）。重複（ブロックの ID {jid} も写っている）も不採用になる"}
             K_, D_ = np.array(intr["K"]), np.array(intr["dist_coeffs"])
             res = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "frames": n}
             Ts = {}
-            for mid, spec in ((1, spec1), (4, spec4)):
+            for mid, spec in ((1, spec1), (jid, spec4)):
                 C = np.array(by[mid])
                 cm = C.mean(0)
                 sols = pose.solve_marker(cm, spec.size_m, K_, D_)
@@ -447,7 +458,8 @@ def main() -> int:
                 res[f"id{mid}"] = {"corner_std_px": float(np.sqrt(np.mean(np.sum((C - cm) ** 2, axis=2)))),
                                    "ambiguity": float(sols[0][0] / sols[1][0]) if len(sols) > 1 and sols[1][0] > 0 else 0.0,
                                    "side_px": float(np.min(np.linalg.norm(cm - np.roll(cm, 1, 0), axis=1)))}
-            T_m1_jig = pose.invert(Ts[1]) @ Ts[4]
+            T_m1_jig = pose.invert(Ts[1]) @ Ts[jid]
+            res["jig"] = {"id": jid, "size": spec4.size.json()}
             res["T_m1_jig"] = T_m1_jig.tolist()
             if spec4.grip is not None and spec4.grip.usable:
                 res["T_m1_grip"] = (T_m1_jig @ spec4.grip.value).tolist()

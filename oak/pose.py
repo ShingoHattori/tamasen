@@ -123,6 +123,16 @@ class Config:
     markers: dict[int, MarkerSpec]
     mtime: float
     raw: dict
+    grip_jig: "MarkerSpec | None" = None
+
+    def with_jig(self) -> "Config":
+        """Copy in which the jig id is the grip jig (not a block marker): used in jig mode only."""
+        import copy
+        c = copy.copy(self)
+        c.markers = dict(self.markers)
+        if self.grip_jig is not None:
+            c.markers[self.grip_jig.id] = self.grip_jig
+        return c
 
     def json(self) -> dict:
         out = {"dictionary": self.dictionary, "block_size": self.block_size.json(), "markers": {}}
@@ -175,11 +185,6 @@ def load_config(path: Path) -> Config:
             spec.grip = Value(T, gst if T is not None else "unset")
             if not spec.grip.usable:
                 spec.missing.append("ID 1 → 把持中心の変換 T_m1_grip は未校正")
-        elif spec.role == "grip_jig":
-            v = m.get("jig_to_grip_mm", [])
-            st = _status(m, "jig_to_grip_status", "jig", spec)
-            ok = len(v) == 3 and not any(_missing(x) for x in v)
-            spec.grip = Value(rigid(np.eye(3), np.array(v) * MM) if ok else None, st if ok else "unset")
         elif spec.role == "world_reference":
             th = m.get("card_thickness_mm")
             spec.card_thickness = Value(None if _missing(th) else float(th) * MM,
@@ -191,7 +196,17 @@ def load_config(path: Path) -> Config:
                 spec.missing.append("基準カードは物理的に未固定（physically_fixed = false）")
         markers[mid] = spec
     dname = raw.get("dictionary", "DICT_4X4_50")
-    return Config(dname, block_size, markers, path.stat().st_mtime, raw)
+    cfg = Config(dname, block_size, markers, path.stat().st_mtime, raw)
+    j = raw.get("grip_jig")
+    if j:
+        spec = MarkerSpec(int(j["id"]), "grip_jig", Value(None if _missing(j.get("size_mm")) else float(j["size_mm"]) * MM,
+                                                         _status(j, "size_status", "size")))
+        v = j.get("jig_to_grip_mm", [])
+        ok = len(v) == 3 and not any(_missing(x) for x in v)
+        spec.grip = Value(rigid(np.eye(3), np.array(v) * MM) if ok else None,
+                          _status(j, "jig_to_grip_status", "jig") if ok else "unset")
+        cfg.grip_jig = spec
+    return cfg
 
 
 def block_mount(face: str, corner: str, x_axis: str, size: float, dx: float, dy: float,

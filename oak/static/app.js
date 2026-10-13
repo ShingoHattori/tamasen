@@ -209,6 +209,7 @@ async function pollState() {
   try {
     const s = await (await fetch("/state.json", { cache: "no-store" })).json();
     if (s.markers) {
+      $("jigState").innerHTML = s.jig_mode && s.jig_mode.on ? ` <b class="warn">治具モード中（ID ${s.jig_mode.id} = 治具 ${mm(s.jig_mode.size_m, 0)} mm、ブロック推定なし）</b> ` : " 治具モード OFF ";
       renderHeader(s); renderMarkers(s); renderBlock(s); renderGrip(s); renderWorld(s); renderMissing(s); renderIntr(s); update3d(s);
     }
   } catch (e) { $("src").textContent = "state.json 取得失敗: " + e; }
@@ -369,6 +370,8 @@ $("previewPoses").onclick = () => post("/sim/api/preview_calib");
 $("heSolve").onclick = async () => { await post("/api/handeye/solve", { session: $("heSession").value }); loadHE(); };
 $("heAdopt").onclick = async () => { if (confirm("この校正結果を採用し、シミュレーターの配置を校正済みにします。よろしいですか？")) { await post("/api/handeye/adopt", { session: $("heSession").value }); loadHE(); } };
 $("gripCap").onclick = () => post("/api/handeye/grip", { frames: 30 });
+$("jigOn").onclick = () => post("/api/handeye/jig_mode", { on: true });
+$("jigOff").onclick = () => post("/api/handeye/jig_mode", { on: false });
 let lastPoses = null;
 function renderPoses(cp) {
   if (!cp) { $("calibPoses").innerHTML = '<span class="dim">未生成</span>'; return; }
