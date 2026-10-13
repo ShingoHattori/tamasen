@@ -1,0 +1,59 @@
+# MuJoCo シーン設定（sim_server.py が読む）。単位: m・kg・N・rad（キー名に単位を明記）。
+# 値の状態 *_status: "unset" 未入力 | "sample" 仮定・サンプル値 | "measured" 実測済み | "calibrated" 校正済み
+# ブロック寸法は oak/markers.toml の [block] を使う（ここでは二重に持たない）。
+#
+# 座標系: sim の world = アーム台座 base_link（z 上向き、z=0 = 台座底面 = 床面）。
+# 変換の向き: T_a_b は b 座標の点を a 座標へ移す。
+
+[model]
+# 公開モデル: Seeed-Projects/Borot-Arm_Mujoco @ 3f3e98d0682fcc382d5607f92890f44918d097d9 (2026-08-28)
+#   reBotArm_ros2_DM/src/rebotarm_mujoco/models/rebotarm_b601_colored.xml（CERN-OHL-W-2.0）
+mjcf = "models/borot/rebotarm_b601_colored.xml"
+
+[block]
+mass_kg = 0.10
+mass_status = "sample"            # 未計量
+friction = [0.8, 0.02, 0.002]     # 滑り・ねじり・転がり
+friction_status = "sample"
+
+[jaw]
+# 物理的な把持に使う顎 = モデルの指の衝突メッシュ（front/mid/rear の凸分割）。表示用メッシュとは別。
+friction = [1.5, 0.04, 0.01]      # 公開モデルの値
+friction_status = "sample"
+force_limit_n = 20.0              # 片側の顎の最大押し付け力（シミュレーション上の仮定）
+force_limit_status = "sample"
+# 最大開口（両顎の内側の隙間）。公開モデルは指 1 本 0〜0.05 m（隙間 約 0〜100 mm）。
+# 旧版・資料には「実機 0〜57 mm」の記述もあり、実機では未確認。
+max_gap_m = 0.100
+max_gap_status = "sample"
+clearance_m = 0.010               # 把持前に必要な余裕（必要開口 = 物体幅 + clearance）
+# 実機グリッパーのモーター角 → 隙間の換算（Borot hardware_manager.py の式、実機未確認）:
+#   gap = clip(motor_rad / gripper_rad_full_open * max_gap_m, 0, max_gap_m)
+gripper_rad_full_open = -5.0
+gripper_map_status = "sample"
+
+[actuators]
+# 試行モードで関節を追従させる位置制御（シミュレーション内だけ。実機の制御パラメータではない）
+kp = [300.0, 300.0, 300.0, 80.0, 80.0, 40.0]
+kv = [20.0, 20.0, 20.0, 5.0, 5.0, 2.0]
+force_limit_nm = [27.0, 27.0, 27.0, 7.0, 7.0, 7.0]   # DM4340P / DM4310 のピーク値の目安
+status = "sample"
+
+# 台座と ID 2 world の関係 T_base_world（カメラと台座の位置合わせ）。未校正。
+# 観測したブロックを sim に置くときだけ使う。status が calibrated でない限り「仮配置」と表示する。
+[placement]
+status = "unset"
+translation_m = [nan, nan, nan]
+rotation_rpy_rad = [nan, nan, nan]
+# 未校正の間に観測ブロックを試しに置くための仮の配置（目測ですらない、表示用の仮定）
+sample_translation_m = [0.30, 0.0, 0.0]
+sample_rotation_rpy_rad = [0.0, 0.0, 0.0]
+
+# 模擬配置: 観測を使わずに台座座標で直接置くブロック（シミュレーション試行用）
+[mock_block]
+position_m = [0.30, 0.05, 0.0155]     # 中心。z = 31 mm / 2（67x78 面を下にして床に置く）
+yaw_rad = 0.3
+
+# 関節角が読めないときの模擬姿勢
+[mock_joints]
+q_rad = [0.0, -0.9, -1.4, 0.0, 0.0, 0.0]

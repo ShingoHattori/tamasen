@@ -63,9 +63,9 @@
   <h2>未確定・未校正の項目</h2><div id="missing"></div>
   <h2>カメラ内部パラメータ</h2><div id="intr"></div></section>
 
- <section class="full"><h2>シミュレーション（MuJoCo）</h2>
+ <section class="full"><h2>デジタルツイン / シミュレーション（MuJoCo）</h2>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-   <div><img class="media" id="simimg" alt="MuJoCo (未起動)">
+   <div><img class="media" id="simimg" alt="MuJoCo (未起動)" draggable="false" style="cursor:grab">
     <div class="dim">MuJoCo のオフスクリーン描画（サーバー側 EGL）。視点:
      <button data-cam="overview">全体</button><button data-cam="gripper">グリッパー</button><button data-cam="side">側面</button>
      表示: <button data-geom="visual">表示用形状</button><button data-geom="collision">衝突形状</button><button data-geom="both">両方</button></div></div>
@@ -80,7 +80,20 @@
   </div>
  </section>
 
- <section><h2>アーム関節（読み取り専用）</h2><div id="arm"></div></section>
+ <section><h2>アーム関節</h2><div id="arm"></div>
+  <div id="armctl" style="display:none;border-top:1px solid #444;margin-top:8px;padding-top:6px">
+   <h2 class="bad">実機操作（あなたが操作する。Claude は操作しない）</h2>
+   <div class="warn">カメラスタンド（映像の下端）とブロックはシミュレーターの干渉確認に入っていない（台座⇔カメラ未校正）。経路を目視で確認してから実行すること。
+    このページを閉じる・別タブにすると生存確認が止まり、移動中なら停止する。</div>
+   <div><button id="engage">有効化（現在位置で保持）</button><button id="stopArm" style="background:#7a1f1f;font-weight:bold">停止</button>
+    <button id="release">トルクを切る</button></div>
+   <div>1. 経路をシミュレート（現在の実機の関節角から）: <button data-path="pre">接近前の姿勢へ</button><button data-path="grasp">把持姿勢へ</button>
+    <button data-path="lift">持ち上げ姿勢へ</button><button data-path="engage_pose">有効化時の姿勢へ戻る</button>
+    <button id="previewPath">シミュレーション結果をツインで再生</button></div>
+   <div id="pathres" class="dim"></div>
+   <div>2. <button id="execPath" disabled>シミュレーションで妥当だった経路を実機で実行</button><button id="graspReal">把持を実機で実行</button></div>
+   <div id="ctlstate"></div>
+  </div></section>
  <section><h2>保存したファイル</h2><div id="files"></div></section>
 </main>
 <script type="module" src="/static/app.js"></script>

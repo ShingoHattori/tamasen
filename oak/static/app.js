@@ -228,10 +228,51 @@ async function pollArm() {
         <table><tr><th>関節</th><th>角度 °</th><th>速度 rad/s</th><th>トルク Nm</th><th>状態コード</th><th>経過 s</th></tr>${rows.join("")}</table>
         <div class="dim">${(a.notes || []).map(esc).join("<br>")}</div>`;
     }
+    renderCtl(a.available === false ? null : a);
   } catch (e) { $("arm").textContent = String(e); }
   setTimeout(pollArm, 500);
 }
 pollArm();
+
+// ------------------------------------------------------------------ real-arm control (user only)
+let armState = null, checkedPath = null;
+function renderCtl(a) {
+  armState = a;
+  const show = a && a.motion_allowed;
+  $("armctl").style.display = show ? "" : "none";
+  if (!show) return;
+  const c = a.control || {};
+  $("ctlstate").innerHTML = `状態: <b class="${c.state === "read_only" ? "ok" : "bad"}">${{ read_only: "無効（トルクなし）", holding: "有効・保持中", moving: "移動中" }[c.state] || c.state}</b>
+    ${c.motion ? ` ${esc(c.motion.label)} ${Math.round((c.motion.progress || 0) * 100)} %` : ""}<br>${esc(c.message || "")}
+    ${c.fault ? `<br><b class="bad">異常: ${esc(c.fault)}</b>` : ""}
+    ${c.fb ? `<br>計画との偏差（フィードバック補正後）: 現在 ${f(c.fb.err_max_now, 3)} rad / 手先 ${mm(c.fb.tcp_dev, 1)} mm、
+      最大 ${f(c.fb.max_err, 3)} rad / ${mm(c.fb.max_tcp_dev, 1)} mm、補正の積分項 ${(c.fb.I || []).map(v => f(v, 3)).join(", ")} rad` : ""}
+    <br><span class="dim">速度上限 ${a.limits.vmax_rad_s} rad/s。有効中（移動・保持とも）は常に 計画−実測 の PI 補正（Kp ${a.limits.kp}, Ki ${a.limits.ki}）。
+      偏差 ${a.limits.corridor_rad} rad / 手先 ${mm(a.limits.corridor_m, 0)} mm を超えたら停止。生存確認 ${a.limits.heartbeat_s} s</span>`;
+  const fresh = checkedPath && checkedPath.ok && (Date.now() / 1000 - checkedPath.checked_at) < 120;
+  $("execPath").disabled = !(fresh && c.state === "holding" && !c.fault);
+}
+setInterval(() => {               // dead-man: only while this page is visible and the arm is engaged
+  if (armState && armState.motion_allowed && armState.control && armState.control.state !== "read_only" && document.visibilityState === "visible")
+    fetch("/arm/api/heartbeat", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+}, 200);
+$("engage").onclick = () => { const t = prompt("実機の 6 関節を有効化し、現在位置で保持します。アーム周辺に人・物がないことを確認して MOVE と入力"); if (t) post("/arm/api/engage", { confirm: t }); };
+$("stopArm").onclick = () => post("/arm/api/stop");
+$("release").onclick = () => { const t = prompt("トルクを切ると J2/J3 が自重で落ちます。アームを手で支えてから RELEASE と入力"); if (t) post("/arm/api/release", { confirm: t }); };
+document.querySelectorAll("[data-path]").forEach(b => b.onclick = async () => {
+  checkedPath = await post("/sim/api/check_path", { target: b.dataset.path });
+  const p = checkedPath;
+  $("pathres").innerHTML = (p.ok ? `<span class="ok">${esc(p.label)}: ${esc(p.message)}</span>` : `<span class="bad">${esc(p.label || "")} ${esc(p.message || "")}</span>`) +
+    (p.duration_s ? `<br>所要 ${f(p.duration_s, 1)} s、最大関節変化 ${deg(p.max_step_rad, 1)}°、床との最小距離 ${mm(p.min_floor_clearance_m, 0)} mm${p.min_floor_clearance_m >= 0.05 ? " 以上" : ""}、
+      シミュレーション上の追従誤差 ${f(p.sim_track_max_rad, 3)} rad。実行できるのはこの確認から 120 s 以内、始点が現在の姿勢と一致する場合だけ` : "");
+});
+$("execPath").onclick = () => {
+  if (!checkedPath) return;
+  if (confirm(`実機で「${checkedPath.label}」を実行します（最大関節変化 ${deg(checkedPath.max_step_rad, 1)}°）。経路上にカメラスタンドや物がないことを目視で確認しましたか？`))
+    post("/arm/api/execute", { path_id: checkedPath.id });
+};
+$("graspReal").onclick = () => post("/arm/api/grasp");
+$("previewPath").onclick = () => post("/sim/api/preview");
 
 // ------------------------------------------------------------------ simulator
 let simCam = "overview", simGeom = "visual";
@@ -241,6 +282,17 @@ document.querySelectorAll("[data-geom]").forEach(b => b.onclick = () => { simGeo
 document.querySelectorAll("[data-mode]").forEach(b => b.onclick = () => post("/sim/api/mode", { mode: b.dataset.mode }));
 document.querySelectorAll("[data-place]").forEach(b => b.onclick = () => post("/sim/api/placement", { source: b.dataset.place }));
 $("plan").onclick = () => post("/sim/api/plan");
+{ // drag to orbit the MuJoCo view
+  const img = $("simimg"); let drag = null, view = { azimuth: 135, elevation: -30, distance: 1.0 };
+  img.onmousedown = (e) => { drag = { x: e.clientX, y: e.clientY, az: view.azimuth, el: view.elevation }; e.preventDefault(); };
+  window.addEventListener("mouseup", () => drag = null);
+  window.addEventListener("mousemove", (e) => {
+    if (!drag) return;
+    view.azimuth = drag.az - (e.clientX - drag.x) * 0.4; view.elevation = Math.max(-89, Math.min(10, drag.el - (e.clientY - drag.y) * 0.3));
+    post("/sim/api/view", view);
+  });
+  img.onwheel = (e) => { view.distance = Math.max(0.2, Math.min(3, view.distance * (e.deltaY > 0 ? 1.1 : 0.9))); post("/sim/api/view", view); e.preventDefault(); };
+}
 $("trial").onclick = () => post("/sim/api/trial");
 $("reset").onclick = () => post("/sim/api/reset");
 simStream();
@@ -264,6 +316,7 @@ function renderSim(s) {
       <br><span class="dim">${esc(s.fk_vs_vision || "")}</span></div>
     <h2>把持候補</h2>${plan ? planTable(plan) : '<span class="dim">未計算</span>'}
     <h2>試行</h2>${tr ? trialView(tr) : '<span class="dim">未実施</span>'}
+    <h2>実機での把持実行の前提</h2>${s.real_grasp_blockers.length ? `<ul>${s.real_grasp_blockers.map(b => `<li class="warn">${esc(b)}</li>`).join("")}</ul>` : '<span class="ok">満たしている</span>'}
     <h2>物理パラメータ</h2>${physTable(s.physics)}
     <h2>接触</h2><div>${(s.contacts || []).map(esc).join("<br>") || '<span class="dim">なし</span>'}</div>`;
 }

@@ -410,12 +410,15 @@ def main() -> int:
     static = HERE / "static"
 
     def proxy(handler, base: str, path: str, method: str, body: bytes | None) -> None:
+        stream = path.split("?")[0].endswith(".mjpg")
         try:
-            req = urllib.request.Request(base + path, data=body, method=method,
-                                         headers={"Content-Type": "application/json"} if body else {})
-            with urllib.request.urlopen(req, timeout=3 if not path.endswith(".mjpg") else 10) as r:
+            hdr = {"X-Origin-Page": "vision-web-ui", "X-Forwarded-For": handler.client_address[0]}
+            if body:
+                hdr["Content-Type"] = "application/json"
+            req = urllib.request.Request(base + path, data=body, method=method, headers=hdr)
+            with urllib.request.urlopen(req, timeout=10 if stream else 3) as r:
                 ctype = r.headers.get("Content-Type", "application/octet-stream")
-                if path.endswith(".mjpg"):
+                if stream:
                     handler.send_response(200)
                     handler.send_header("Content-Type", ctype)
                     handler.send_header("Cache-Control", "no-store")

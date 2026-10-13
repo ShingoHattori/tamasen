@@ -261,6 +261,28 @@ binned 2104×1560 sensor mode and then scales and crops. On the OAK-D-Lite this 
 real chain; `vision.py` uses it and shows both values on its page. Cross-check: stereo depth at a
 marker divided by the PnP distance should be ≈ 1.
 
+### 3.16 Linux: a second `Pipeline` on the same `Device` segfaults
+
+Verified on robot1 (Ubuntu 24.04, depthai 3.10.0): after `with dai.Pipeline(device):` exits, the
+`Device` is closed with it; building another pipeline on the same object crashes in
+`Camera.build()` → `getConnectedCameraFeatures()` (SIGSEGV, no Python exception). Open a fresh
+`Device` (or a new process) per pipeline.
+
+### 3.17 Small, oblique 20 mm markers need wider adaptive-threshold windows
+
+At ~0.6 m an obliquely seen 20 mm marker is ~16–25 px and is missed with the default
+`adaptiveThreshWinSizeMax = 23`. `vision.py` uses min/step/max = 3/4/53: it found ID 0 on the
+saved stills with no extra false ids there. Unregistered ids (e.g. 17, 37) still appear
+occasionally in the live view; they are rejected as "設定にない ID", never used.
+
+### 3.18 Higher colour resolution did not help 20 mm marker poses
+
+Measured on the same scene (OAK-D-Lite, 60 frames each): 1920×1440 and 2104×1560 gave *more*
+normal-direction jitter for ID 3 (median 9–11°) than 1280×960 (1.4°); 1920×1440 is only an upscale
+of the 2104×1560 binned mode. A 4208×3120 request did not deliver frames within minutes (killed).
+The default stays 1280×960 (`--size` to change). The real limit is the IPPE two-solution ambiguity
+of a small square seen nearly face-on — see the `ambiguous` / `flip` states in `pose.py`.
+
 ---
 
 ## 4. Environment / shell gotchas on this machine
@@ -283,8 +305,13 @@ marker divided by the PnP distance should be ≈ 1.
 | Path | What |
 |---|---|
 | `oak.py` | CLI: `list` / `serve` (browser streaming) |
-| `vision.py`, `vision.html` | ArUco block / gripper check: annotated video + 3D view (camera frame only) |
-| `pose.py`, `markers.toml` | marker pose, block model, measured marker mounts |
+| `vision.py`, `static/` | recognition server: annotated video, ID 2 world, 3D view, arm / digital-twin panels (RGB only) |
+| `pose.py`, `markers.toml` | marker pose + quality states, block model, measured marker mounts (m / rad inside) |
+| `world.py` | provisional world frame from the ID 2 card (tracking / registered-fixed) |
+| `recorder.py` | stills, capped FFV1 recordings, replay |
+| `mount_check.py` | marker-plane rectification and ID 0 / ID 3 consistency used to decide the mounts |
+| `calib_intrinsics.py` | own ChArUco intrinsic calibration (optional; factory values are used by default) |
+| `evidence/` | images that the registered mounts are based on |
 | `oak_common.py` | device selection and per-board mono resolution |
 | `capture_still.py` | one colour + one depth still |
 | `record_video.py` | colour, depth and side-by-side mp4 |

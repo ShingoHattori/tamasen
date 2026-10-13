@@ -1,0 +1,12 @@
+# sim/.venv: Python 3.11 (uv venv --python 3.11 sim/.venv && uv pip install --python sim/.venv/bin/python -r sim/requirements.txt)
+absl-py==2.5.1
+etils==1.14.0
+fsspec==2026.9.0
+glfw==2.10.2
+mujoco==3.15.0
+numpy==2.4.6
+opencv-python-headless==5.0.0.93
+pyopengl==3.1.10
+typing-extensions==4.16.0
+websockets==17.2
+zipp==4.1.1

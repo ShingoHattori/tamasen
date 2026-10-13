@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""MuJoCo simulator for the B601-DM and the block, driven from the web page. Never commands the arm.
+
+    MUJOCO_GL=egl python sim_server.py            # http://127.0.0.1:8092 (proxied by vision.py at /sim/)
+
+Two modes:
+
+  sync   (現実同期) no physics. Every tick copies the read-only joint angles (rebot/arm_state.py)
+         and the observed block pose (oak/vision.py) into the model and runs mj_forward only, so
+         the simulator cannot drift away from what was observed. Missing inputs are shown as
+         missing (mock joints are labelled; a block that is not currently observed is hidden).
+  trial  (シミュレーション試行) a copy of the current state; live inputs no longer overwrite it.
+         The block is a free dynamic body; approach, close, lift and hold are simulated with
+         contacts. Reset returns to sync.
+
+Block placement: "observed" maps the vision block pose (ID 2 world) into the base frame with
+scene.toml [placement]; unless that is calibrated, it uses the explicit sample placement and is
+labelled 模擬（未校正）. "mock" places the block from scene.toml [mock_block]. A trial records which
+basis it used, so a mock success is never reported as a success on the real layout.
+"""
+import argparse
+import io
+import json
+import math
+import signal
+import sys
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import cv2
+import mujoco
+import numpy as np
+
+import planner
+import scene
+
+HERE = Path(__file__).resolve().parent
+BASIS_LABEL = {"mock": "模擬配置（scene.toml の mock_block、観測を使わない）",
+               "observed_sample": "観測姿勢 + 仮の台座配置（カメラ⇔台座 未校正。実配置ではない）",
+               "observed_calibrated": "観測姿勢 + 校正済みの台座配置"}
+
+
+def rpy(r):
+    cx, sx, cy, sy, cz, sz = math.cos(r[0]), math.sin(r[0]), math.cos(r[1]), math.sin(r[1]), math.cos(r[2]), math.sin(r[2])
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def rigid(R, t):
+    T = np.eye(4)
+    T[:3, :3], T[:3, 3] = R, t
+    return T
+
+
+def fetch(url: str, timeout=0.3):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+class Sim:
+    def __init__(self, args) -> None:
+        self.args = args
+        self.settings = scene.load_settings()
+        self.m, _ = scene.load_model(self.settings)
+        self.d = mujoco.MjData(self.m)
+        self.ids = scene.Ids(self.m)
+        self.gap = scene._gap_model(self.m)
+        self.lock = threading.RLock()
+        self.mode = "sync"
+        self.placement_source = "mock"
+        self.sync_info = {}
+        self.joint_source = ["—"] * 6
+        self.block_visible = False
+        self.block_basis = None
+        self.plan = None
+        self.plan_basis = None
+        self.trial = None
+        self.trial_thread = None
+        self.stop_trial = threading.Event()
+        self.view = {"cam": "overview", "geom": "visual"}
+        self.fk_vs_vision = ""
+        self.real_fk = None
+        mujoco.mj_forward(self.m, self.d)
+
+    # ------------------------------------------------------------------ placement
+    def T_base_world(self):
+        p = self.settings["placement"]
+        if p["status"] == "calibrated":
+            return rigid(rpy(p["rotation_rpy_rad"]), p["translation_m"]), "observed_calibrated"
+        return rigid(rpy(p["sample_rotation_rpy_rad"]), p["sample_translation_m"]), "observed_sample"
+
+    def mock_block(self):
+        mb = self.settings["mock_block"]
+        return rigid(rpy([0, 0, mb["yaw_rad"]]), mb["position_m"])
+
+    def observed_block(self, vs: dict):
+        """Block pose in base from the current vision frame, or (None, reason). Never averaged."""
+        if vs.get("available") is False or "block" not in vs:
+            return None, "認識サーバーに接続できない"
+        if time.time() - vs.get("t", 0) > 0.5:
+            return None, f"観測が古い（{time.time() - vs.get('t', 0):.1f} s 前）"
+        if not vs["world"]["valid"]:
+            return None, "ID 2 world が無効: " + vs["world"].get("reason", "")
+        side = {str(mk["id"]): mk["side_px"] for mk in vs["markers"]}
+        cands = [(k, b) for k, b in vs["block"].items() if b["T_world_obj"] and b["status"] in ("ok", "pair")]
+        uncertain = False
+        if not cands:
+            # Show an ambiguous / flipped estimate, clearly marked, but never plan or simulate on it.
+            cands = [(k, b) for k, b in vs["block"].items() if b["T_world_obj"]]
+            uncertain = True
+            if not cands:
+                return None, "ブロックの観測がない（ID 0 / ID 3 が見えていない、または取り付け未登録）"
+        k, b = max(cands, key=lambda kb: side.get(kb[0], 0))      # the larger marker in the image
+        T, basis = self.T_base_world()
+        return (T @ np.array(b["T_world_obj"]), basis, f"ID {k} から（{b['status']}）", uncertain, np.array(b["T_world_obj"])), None
+
+    def set_block(self, T):
+        q = self.ids.block_q
+        if T is None:
+            self.d.qpos[q:q + 7] = [10, 10, -1, 1, 0, 0, 0]       # out of sight
+            return
+        quat = np.zeros(4)
+        mujoco.mju_mat2Quat(quat, T[:3, :3].ravel())
+        self.d.qpos[q:q + 3], self.d.qpos[q + 3:q + 7] = T[:3, 3], quat
+        self.d.qvel[self.ids.block_d:self.ids.block_d + 6] = 0
+
+    def block_T(self):
+        q = self.ids.block_q
+        R = np.zeros(9)
+        mujoco.mju_quat2Mat(R, self.d.qpos[q + 3:q + 7])
+        return rigid(R.reshape(3, 3), self.d.qpos[q:q + 3].copy())
+
+    # ------------------------------------------------------------------ sync
+    def sync_tick(self) -> None:
+        arm = fetch(self.args.arm_url + "/state.json")
+        vs = fetch(self.args.vision_url + "/state.json")
+        with self.lock:
+            if self.mode != "sync":
+                return
+            info = {}
+            q = np.array(self.settings["mock_joints"]["q_rad"], float)
+            src = ["模擬姿勢（scene.toml）"] * 6
+            grip = None
+            if arm.get("ok"):
+                by = {j["name"]: j for j in arm["joints"]}
+                for i, n in enumerate(scene.ARM_JOINTS):
+                    if by.get(n) and by[n]["pos"] is not None and by[n]["age_s"] is not None and by[n]["age_s"] < 0.5:
+                        q[i], src[i] = by[n]["pos"], "実機（読み取り専用）"
+                g = by.get("gripper")
+                if g and g["pos"] is not None:
+                    grip = g["pos"]
+                info["joints"] = "実機の関節角を反映中（読み取り専用）" + ("" if all(s.startswith("実機") for s in src) else "、一部は模擬")
+                self.real_fk = arm.get("fk")
+            else:
+                info["joints"] = "実機の関節角なし → 模擬姿勢: " + (arm.get("error") or "arm_state の応答なし / 値が古い")
+                self.real_fk = None
+            self.d.qpos[self.ids.arm_qadr] = q
+            self.joint_source = src
+            jaw = self.settings["jaw"]
+            if grip is not None:
+                gap = float(np.clip(grip / jaw["gripper_rad_full_open"] * jaw["max_gap_m"], 0, jaw["max_gap_m"]))
+                half = float(np.clip((gap - self.gap.gap0) / 2, *self.ids.fl_range))
+                info["gripper"] = f"実機グリッパー角 {grip:+.3f} rad → 隙間 {gap * 1000:.0f} mm（換算式は未検証）"
+            else:
+                half = 0.0
+                info["gripper"] = "グリッパー角なし → 閉"
+            self.d.qpos[self.ids.fl_q], self.d.qpos[self.ids.fr_q] = half, -half
+            self.block_uncertain = False
+            if self.placement_source == "mock":
+                self.set_block(self.mock_block())
+                self.block_visible, self.block_basis = True, "mock"
+                info["block"] = BASIS_LABEL["mock"]
+            else:
+                ob, why = self.observed_block(vs)
+                if ob is None:
+                    self.set_block(None)
+                    self.block_visible, self.block_basis = False, None
+                    info["block"] = "非表示: " + why
+                else:
+                    T, basis, which, uncertain, T_world_obj = ob
+                    self.set_block(T)
+                    self.block_visible, self.block_basis = True, basis
+                    self.block_uncertain = uncertain
+                    self.block_obs = {"T_world_obj": T_world_obj.tolist(), "T_base_obj": T.tolist(), "which": which}
+                    info["block"] = f"{BASIS_LABEL[basis]}、{which}" + ("。観測が曖昧なため表示のみ（計画・試行には使わない）" if uncertain else "")
+            self.m.geom_rgba[self.ids.block_geom] = [1.0, 0.5, 0.1, 0.45] if self.block_uncertain else [0.95, 0.85, 0.15, 1]
+            mujoco.mj_forward(self.m, self.d)        # kinematics only, no physics in sync mode
+            self.sync_info = info
+            self.fk_vs_vision = self._fk_vs_vision(vs)
+
+    def _fk_vs_vision(self, vs: dict) -> str:
+        cal = self.settings["placement"]["status"] == "calibrated"
+        g = (vs.get("config") or {}).get("markers", {}).get("1", {}).get("grip", {})
+        grip_cal = g.get("status") in ("measured", "calibrated")
+        if not (cal and grip_cal):
+            return ("関節角からの手先と、ID 1 の観測は別々に保持している。カメラ⇔台座"
+                    + ("" if cal else "（未校正）") + "・ID 1→把持中心" + ("" if grip_cal else "（未校正）")
+                    + " が揃うまで比較しない。")
+        return "校正済み: 比較は未実装（校正後に追加する）"
+
+    # ------------------------------------------------------------------ plan / trial
+    def do_plan(self) -> str:
+        with self.lock:
+            if not self.block_visible:
+                return "ブロックが配置されていないため計画できない"
+            if getattr(self, "block_uncertain", False):
+                return "ブロックの観測が曖昧（IPPE の 2 解が近い / 反転）なため計画しない"
+            T = self.block_T()
+            q0 = self.d.qpos[self.ids.arm_qadr].copy()
+            basis = self.block_basis
+        cands = planner.plan(self.m, self.settings, T, q0)
+        with self.lock:
+            self.plan = {"basis": basis, "basis_label": BASIS_LABEL[basis], "T_base_obj": T.tolist(),
+                         "candidates": cands, "t": time.time()}
+        ok = [c for c in cands if c.ok]
+        return f"候補 {len(cands)} 件中 {len(ok)} 件が条件を満たす（{BASIS_LABEL[basis]}）"
+
+    def set_mode(self, mode: str) -> str:
+        if mode == "sync":
+            return self.reset()
+        with self.lock:
+            if self.mode == "sync":
+                self.mode = "trial"
+                self.trial = {"phase": "待機（状態をコピー済み、ライブ観測による上書きを停止）", "log": [],
+                              "running": False, "done": False, "success": False, "result": "",
+                              "basis": self.block_basis, "basis_label": BASIS_LABEL.get(self.block_basis, "ブロックなし")}
+        return "シミュレーション試行モード（現在の状態をコピーした）"
+
+    def reset(self) -> str:
+        self.stop_trial.set()
+        if self.trial_thread:
+            self.trial_thread.join(timeout=5)
+        with self.lock:
+            self.mode = "sync"
+            self.d.qvel[:] = 0
+            self.d.ctrl[:] = 0
+            self.stop_trial.clear()
+        return "現実同期モードへ戻した（試行の状態は破棄。結果の記録は output/trials に残る）"
+
+    def start_trial(self, cand_index: int | None) -> str:
+        if self.trial_thread and self.trial_thread.is_alive():
+            return "試行中"
+        if self.mode == "sync":
+            self.set_mode("trial")
+        with self.lock:
+            if not self.block_visible:
+                return "ブロックが配置されていないため試行できない"
+            if getattr(self, "block_uncertain", False):
+                self.mode = "sync"
+                return "ブロックの観測が曖昧なため試行しない"
+            if self.plan is None or self.plan["basis"] != self.trial["basis"]:
+                pass
+        if self.plan is None or self.plan["basis"] != self.trial["basis"]:
+            self.do_plan()
+        ok = [c for c in self.plan["candidates"] if c.ok]
+        if cand_index is not None:
+            cand = self.plan["candidates"][cand_index]
+        elif ok:
+            cand = ok[0]
+        else:
+            return "条件を満たす把持候補がない（試行しない）"
+        self.trial_thread = threading.Thread(target=self._run_trial, args=(cand,), daemon=True)
+        self.trial_thread.start()
+        return f"試行開始: {cand.name}"
+
+    def _log(self, msg: str) -> None:
+        self.trial["log"].append(f"{self.d.time:6.2f}s {msg}")
+
+    def _run_trial(self, cand: planner.Candidate) -> None:
+        m, d, ids, tr = self.m, self.d, self.ids, self.trial
+        jaw = self.settings["jaw"]
+        max_gap = min(jaw["max_gap_m"], self.gap(ids.fl_range[1]))
+        with self.lock:
+            tr.update(running=True, done=False, success=False, result="", candidate=cand.name, phase="初期化")
+            d.time = 0.0
+            d.qvel[:] = 0
+            # The copied block pose may float above or sink into the floor (observed pose with an
+            # uncalibrated placement). Rest it on the floor, and say by how much it was moved.
+            T = self.block_T()
+            corners = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]) * \
+                np.array(self.settings["block"]["size_m"]) / 2
+            zmin = float(np.min((T[:3, :3] @ corners.T)[2] + T[2, 3]))
+            if abs(zmin) > 1e-4:
+                d.qpos[ids.block_q + 2] -= zmin
+                self._log(f"ブロックの最下点 z={zmin * 1000:+.1f} mm → 床に接地させた（補正 {-zmin * 1000:+.1f} mm）")
+            q_now = d.qpos[ids.arm_qadr].copy()
+            d.ctrl[ids.act_arm] = q_now
+            open_half = float(np.clip((min(cand.width_m + 0.01, max_gap) - self.gap.gap0) / 2, *ids.fl_range))
+            d.ctrl[ids.act_grip] = d.qpos[ids.fl_q]
+            z0 = float(d.qpos[ids.block_q + 2])
+        self._log(f"候補: {cand.name}、必要開口 {cand.width_m * 1000:.0f} mm、開く量 {2 * open_half * 1000 + self.gap.gap0 * 1000:.0f} mm")
+        try:
+            self._move(None, open_half, 0.6, "顎を開く")
+            self._move(cand.q_pre, open_half, 2.0, "接近前の姿勢へ")
+            self._move(cand.q_grasp, open_half, 1.5, "把持位置へ下降")
+            self._move(None, 0.0, 1.2, "顎を閉じる")
+            self._settle(0.5, "保持力の安定待ち")
+            fl_closed = float(d.qpos[ids.fl_q])
+            gap_closed = self.gap(fl_closed)
+            self._log(f"閉じた後の隙間 {gap_closed * 1000:.1f} mm")
+            self._move(cand.q_lift, 0.0, 2.0, "持ち上げ")
+            self._settle(1.5, "保持（1.5 s）")
+            with self.lock:
+                res = self._evaluate(z0, gap_closed)
+                tr.update(res)
+        except InterruptedError:
+            with self.lock:
+                tr.update(result="中断（リセット）", success=False)
+        finally:
+            with self.lock:
+                tr.update(running=False, done=True, phase="終了")
+            self._save_result(cand)
+
+    def _step_until(self, t_end: float) -> None:
+        while d_time(self) < t_end:
+            if self.stop_trial.is_set():
+                raise InterruptedError
+            t0 = time.monotonic()
+            with self.lock:
+                for _ in range(10):
+                    mujoco.mj_step(self.m, self.d)
+            time.sleep(max(0.0, 0.010 - (time.monotonic() - t0)))   # about real time
+
+    def _move(self, q_target, finger_target, duration: float, label: str) -> None:
+        d, ids = self.d, self.ids
+        with self.lock:
+            self.trial["phase"] = label
+            q0 = d.ctrl[ids.act_arm].copy()
+            f0 = float(d.ctrl[ids.act_grip])
+            t0 = d.time
+        self._log(label)
+        qt = q0 if q_target is None else np.asarray(q_target)
+        while True:
+            with self.lock:
+                s = min(1.0, (d.time - t0) / duration)
+                w = 0.5 - 0.5 * math.cos(math.pi * s)
+                d.ctrl[ids.act_arm] = q0 + (qt - q0) * w
+                d.ctrl[ids.act_grip] = f0 + (finger_target - f0) * w
+            if s >= 1.0:
+                break
+            self._step_until(d.time + 0.02)
+        self._settle(0.3, None)
+
+    def _settle(self, duration: float, label: str | None) -> None:
+        if label:
+            with self.lock:
+                self.trial["phase"] = label
+            self._log(label)
+        self._step_until(self.d.time + duration)
+
+    def _contacts(self) -> dict:
+        m, d, ids = self.m, self.d, self.ids
+        out = {"left": 0, "right": 0, "floor_block": 0, "arm_floor": 0, "other": []}
+        for c in d.contact[:d.ncon]:
+            b1, b2 = m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2]
+            pair = {b1, b2}
+            if ids.block_body in pair:
+                other = (pair - {ids.block_body}).pop() if len(pair) > 1 else ids.block_body
+                if other in ids.finger_left:
+                    out["left"] += 1
+                elif other in ids.finger_right:
+                    out["right"] += 1
+                elif ids.floor_geom in (c.geom1, c.geom2):
+                    out["floor_block"] += 1
+                else:
+                    out["other"].append(mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, other))
+            elif ids.floor_geom in (c.geom1, c.geom2):
+                out["arm_floor"] += 1
+        return out
+
+    def _evaluate(self, z0: float, gap_closed: float) -> dict:
+        c = self._contacts()
+        dz = float(self.d.qpos[self.ids.block_q + 2] - z0)
+        size = np.array(self.settings["block"]["size_m"])
+        lifted = dz > 0.8 * planner.LIFT
+        held = c["left"] > 0 and c["right"] > 0
+        reasons = []
+        if not lifted:
+            reasons.append(f"持ち上がっていない（上昇 {dz * 1000:.1f} mm / 目標 {planner.LIFT * 1000:.0f} mm）")
+        if not held:
+            reasons.append(f"両顎で接触していない（左 {c['left']}、右 {c['right']} 点）")
+        if c["floor_block"]:
+            reasons.append("ブロックが床に接したまま")
+        if gap_closed < min(size) * 0.5:
+            reasons.append(f"顎がほぼ閉じきった（隙間 {gap_closed * 1000:.1f} mm）＝物体を挟めていない")
+        ok = lifted and held and not c["floor_block"]
+        res = {"success": ok, "lift_mm": dz * 1000, "contacts": c, "gap_closed_mm": gap_closed * 1000,
+               "result": ("成功: 持ち上げて両顎で保持（シミュレーション内、" + BASIS_LABEL.get(self.trial["basis"], "") + "）")
+               if ok else "失敗: " + "; ".join(reasons)}
+        self._log(res["result"])
+        return res
+
+    def _save_result(self, cand) -> None:
+        out = HERE / "output" / "trials"
+        out.mkdir(parents=True, exist_ok=True)
+        with self.lock:
+            rec = {k: v for k, v in self.trial.items() if k != "log"}
+            rec.update(log=self.trial["log"], candidate=cand.json(), settings=self.settings,
+                       saved=time.strftime("%Y-%m-%d %H:%M:%S"))
+        (out / (time.strftime("%Y%m%d-%H%M%S") + ".json")).write_text(json.dumps(rec, ensure_ascii=False, indent=1, default=str))
+
+    # ------------------------------------------------------------------ real-arm path checks
+    # The arm service executes only paths stored here, fetched by id; the browser never sends raw
+    # joint targets to the arm. The check covers the floor, self-collision (beyond the hull
+    # tolerance) and joint limits along the straight joint-space path. The block and the camera
+    # stand are NOT checked: their positions relative to the base are not calibrated.
+    def check_path(self, target: str, cand_index: int | None) -> dict:
+        """Simulate the move the real arm would make, and accept it only if the simulation is clean.
+
+        The profile (times, joint targets) computed here is exactly what the arm service executes:
+        straight joint-space path, max joint speed VMAX. The simulation runs the model's dynamics
+        with gravity and the sim position actuators tracking that profile (block removed: its real
+        position is unknown until calibrated). Checks: floor clearance >= FLOOR_CLEARANCE for every
+        arm / jaw geom (so a real arm that sags or lags inside the execution corridor still clears
+        it), self-collision beyond the hull tolerance, joint limits, and the simulated tracking error.
+        Not checked: the block and the camera stand (positions relative to the base not calibrated).
+        """
+        arm = fetch(self.args.arm_url + "/state.json")
+        if not arm.get("ok"):
+            return {"ok": False, "message": "実機の関節角が読めない: " + str(arm.get("error", "応答なし"))}
+        by = {j["name"]: j["pos"] for j in arm["joints"]}
+        q_from = np.array([by[n] for n in scene.ARM_JOINTS])
+        if target == "engage_pose":
+            qe = (arm.get("control") or {}).get("q_engage")
+            if not qe:
+                return {"ok": False, "message": "有効化時の姿勢が記録されていない"}
+            q_to, label = np.array([qe[n] for n in scene.ARM_JOINTS]), "有効化時の姿勢へ戻る"
+        else:
+            if not self.plan:
+                return {"ok": False, "message": "把持候補が未計算"}
+            ok = [c for c in self.plan["candidates"] if c.ok]
+            cand = self.plan["candidates"][cand_index] if cand_index is not None else (ok[0] if ok else None)
+            if cand is None or not cand.ok:
+                return {"ok": False, "message": "条件を満たす候補がない"}
+            q_to = {"pre": cand.q_pre, "grasp": cand.q_grasp, "lift": cand.q_lift}[target]
+            label = f"{cand.name}: " + {"pre": "接近前の姿勢", "grasp": "把持姿勢", "lift": "持ち上げ姿勢"}[target]
+        res = simulate_profile(self.m, self.ids, q_from, np.asarray(q_to, float), self.gap.gap0)
+        import uuid
+        pid = uuid.uuid4().hex[:12]
+        rec = dict(res, id=pid, label=label, checked_at=time.time(), q_from=q_from.tolist(),
+                   message=("シミュレーションで問題なし（床との距離・自己衝突・関節制限・追従）。ブロック・カメラスタンドとの干渉は未確認"
+                            if res["ok"] else "実行不可: " + "; ".join(res["reasons"])))
+        with self.lock:
+            self.paths = {k: v for k, v in getattr(self, "paths", {}).items() if time.time() - v["checked_at"] < 600}
+            if rec["ok"]:
+                self.paths[pid] = rec
+            self.last_path = rec
+            self.preview = {"traj": res["sim_q"], "dt": res["sim_dt"], "t0": time.monotonic()}
+        return {k: v for k, v in rec.items() if k not in ("sim_q",)}
+
+    def real_grasp_blockers(self) -> list[str]:
+        b = []
+        if self.settings["placement"]["status"] != "calibrated":
+            b.append("カメラ⇔アーム台座が未校正")
+        if not self.plan or self.plan["basis"] != "observed_calibrated":
+            b.append("把持計画が校正済みの実物配置に基づいていない")
+        if self.settings["jaw"]["gripper_map_status"] not in ("measured", "calibrated"):
+            b.append("グリッパーのモーター角と開口の対応が未確認")
+        if self.settings["jaw"]["max_gap_status"] not in ("measured", "calibrated"):
+            b.append("実機の最大開口が未確認")
+        return b
+
+    # ------------------------------------------------------------------ state
+    def state(self) -> dict:
+        with self.lock:
+            m, d, ids = self.m, self.d, self.ids
+            joints = []
+            for i, n in enumerate(scene.ARM_JOINTS):
+                lo, hi = ids.arm_range[i]
+                q = float(d.qpos[ids.arm_qadr[i]])
+                src = self.joint_source[i] if self.mode == "sync" else "シミュレーション"
+                if q < lo - 1e-3 or q > hi + 1e-3:
+                    src += f"（モデルの可動範囲外 {math.degrees(q - (lo if q < lo else hi)):+.1f}°）"
+                joints.append({"name": n, "q": q, "lo": float(lo), "hi": float(hi), "source": src})
+            fl = float(d.qpos[ids.fl_q])
+            joints.append({"name": "finger_left（顎）", "q": fl, "lo": float(ids.fl_range[0]), "hi": float(ids.fl_range[1]),
+                           "source": "slide [m]（角度欄は rad 表示の換算なし）"})
+            contacts = []
+            if self.mode == "trial":
+                c = self._contacts()
+                contacts = [f"ブロック–左顎 {c['left']} 点、ブロック–右顎 {c['right']} 点、ブロック–床 {c['floor_block']} 点、"
+                            f"アーム–床 {c['arm_floor']} 点" + (f"、その他 {c['other']}" if c["other"] else "")]
+            jaw = self.settings["jaw"]
+            plan = None
+            if self.plan:
+                plan = {"basis": self.plan["basis"], "basis_label": self.plan["basis_label"],
+                        "candidates": [c.json() for c in self.plan["candidates"]]}
+            mT = d.xmat[ids.end_body].reshape(3, 3)
+            return {
+                "mode": self.mode,
+                "placement": {"source": self.placement_source,
+                              "label": BASIS_LABEL.get(self.block_basis, "ブロックなし") if self.mode == "sync" or not self.trial
+                              else self.trial["basis_label"],
+                              "calibrated": self.block_basis == "observed_calibrated"},
+                "sync": self.sync_info, "joints": joints,
+                "block_observation": getattr(self, "block_obs", None) if self.placement_source == "observed" else None,
+                "jaw": {"gap_m": self.gap(fl), "max_gap_model_m": self.gap(ids.fl_range[1]),
+                        "max_gap_config": {"value": jaw["max_gap_m"], "status": jaw["max_gap_status"]},
+                        "note": "物理的な把持 = 指の衝突メッシュ（front/mid/rear）、表示 = 着色メッシュ。"
+                                "実機グリッパーの形状・開口幅とモデルの対応は未確認。"},
+                "fk": {"frame": "end_link（台座座標、MuJoCo）", "p": d.xpos[ids.end_body].tolist(), "R": mT.tolist()},
+                "real_fk": self.real_fk,
+                "fk_vs_vision": self.fk_vs_vision,
+                "plan": plan, "trial": self.trial,
+                "physics": {k: v.json() for k, v in scene.physics_params(self.settings).items()},
+                "contacts": contacts,
+                "last_path": getattr(self, "last_path", None) and {k: v for k, v in self.last_path.items() if k not in ("sim_q", "q_plan", "times")},
+                "real_grasp_blockers": self.real_grasp_blockers(),
+                "notes": [
+                    "公開モデル Seeed-Projects/Borot-Arm_Mujoco @ 3f3e98d（rebotarm_b601_colored.xml）を読み込み、"
+                    "床・ブロック・リンクの凸包衝突・アクチュエータを追加（scene.py）。",
+                    f"自己衝突の確認から除外: {', '.join('–'.join(p) for p in scene.EXCLUDED_SELF_PAIRS)}（凸包が常に重なるため）。",
+                    "実機へは何も送らない。sync モードは物理演算なし（mj_forward のみ）。",
+                    "シミュレーションでの把持成功は、実機で同じ把持力で成功することを意味しない。",
+                ],
+            }
+
+
+VMAX = 0.25                  # rad/s — the same profile is executed by rebot/arm_state.py
+FLOOR_CLEARANCE = 0.015      # m, every arm / jaw geom along the simulated motion
+SIM_TRACK_MAX = 0.05         # rad, the simulated arm must follow the profile this closely
+
+
+def profile(q_from, q_to, dt=0.02):
+    """Straight joint-space path, all joints arriving together, smooth (cosine) start and stop.
+
+    The cosine profile peaks at pi/2 times the mean speed, so T is chosen to keep that peak <= VMAX.
+    """
+    T = max(math.pi / 2 * float(np.max(np.abs(q_to - q_from))) / VMAX, 0.5)
+    n = int(np.ceil(T / dt)) + 1
+    t = np.linspace(0, T, n)
+    s = 0.5 - 0.5 * np.cos(np.pi * t / T)
+    return t, q_from + np.outer(s, q_to - q_from)
+
+
+def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
+    t, qp = profile(q_from, q_to)
+    d = mujoco.MjData(m)
+    d.qpos[ids.arm_qadr] = q_from
+    d.qpos[ids.block_q:ids.block_q + 7] = [10, 10, 1, 1, 0, 0, 0]
+    d.ctrl[ids.act_arm] = q_from
+    mujoco.mj_forward(m, d)
+    base = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base_link")   # stands on the floor by design
+    arm_geoms = [g for g in range(m.ngeom) if m.geom_bodyid[g] in ids.arm_bodies and m.geom_bodyid[g] != base
+                 and m.geom_contype[g] | m.geom_conaffinity[g]]
+    lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
+    reasons, sim_q, track, min_clear, worst = [], [], 0.0, math.inf, None
+    if np.any(q_to < lo - 1e-3) or np.any(q_to > hi + 1e-3):
+        reasons.append("目標が関節制限の外")
+    steps = int(round((t[1] - t[0]) / m.opt.timestep)) if len(t) > 1 else 1
+    for k in range(len(t) + 25):                       # +0.5 s settle
+        d.ctrl[ids.act_arm] = qp[min(k, len(t) - 1)]
+        for _ in range(steps):
+            mujoco.mj_step(m, d)
+        q = d.qpos[ids.arm_qadr].copy()
+        sim_q.append(q.tolist())
+        track = max(track, float(np.max(np.abs(q - qp[min(k, len(t) - 1)]))))
+        for g in arm_geoms:
+            dist = mujoco.mj_geomDistance(m, d, g, ids.floor_geom, 0.05, None)
+            if dist < min_clear:
+                min_clear, worst = dist, mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[g])
+        for c in d.contact[:d.ncon]:
+            b1, b2 = m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2]
+            if b1 in ids.arm_bodies and b2 in ids.arm_bodies and -c.dist > planner.SELF_PEN_TOL:
+                reasons.append(f"自己衝突 {mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, b1)}–"
+                               f"{mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, b2)}（t={k * 0.02:.1f} s）")
+                break
+        if reasons:
+            break
+    if min_clear < FLOOR_CLEARANCE:
+        reasons.append(f"床との距離 {min_clear * 1000:.1f} mm < {FLOOR_CLEARANCE * 1000:.0f} mm（{worst}）")
+    if track > SIM_TRACK_MAX:
+        reasons.append(f"シミュレーション上の追従誤差 {track:.3f} rad > {SIM_TRACK_MAX}")
+    return {"ok": not reasons, "reasons": reasons, "times": t.tolist(), "q_plan": qp.tolist(),
+            "duration_s": float(t[-1]), "max_step_rad": float(np.max(np.abs(q_to - q_from))),
+            "min_floor_clearance_m": float(min_clear), "sim_track_max_rad": track,
+            "sim_q": sim_q, "sim_dt": 0.02, "vmax": VMAX}
+
+
+def d_time(sim):
+    with sim.lock:
+        return sim.d.time
+
+
+CAMS = {"overview": dict(lookat=[0.2, 0.0, 0.1], distance=1.0, azimuth=135, elevation=-30),
+        "side": dict(lookat=[0.2, 0.0, 0.12], distance=0.8, azimuth=90, elevation=-10),
+        "gripper": None}
+
+
+class RenderLoop:
+    def __init__(self, sim: Sim, w=640, h=480, fps=15) -> None:
+        self.sim, self.w, self.h, self.fps = sim, w, h, fps
+        self.jpeg = None
+        self.cond = threading.Condition()
+        self.seq = 0
+        self.stop = threading.Event()
+
+    def run(self) -> None:
+        r = mujoco.Renderer(self.sim.m, self.h, self.w)
+        cam = mujoco.MjvCamera()
+        opt = mujoco.MjvOption()
+        try:
+            while not self.stop.is_set():
+                t0 = time.monotonic()
+                v = self.sim.view
+                geom = v["geom"]
+                opt.geomgroup[:] = 0
+                opt.geomgroup[0] = 1
+                opt.geomgroup[1] = 1
+                if geom in ("visual", "both"):
+                    opt.geomgroup[2] = 1
+                if geom in ("collision", "both"):
+                    opt.geomgroup[3] = 1
+                    opt.geomgroup[4] = 1
+                opt.sitegroup[:] = 0
+                opt.sitegroup[1] = 1
+                opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = self.sim.mode == "trial"
+                c = CAMS.get(v["cam"])
+                pv = getattr(self.sim, "preview", None)
+                data = self.sim.d
+                if pv is not None:
+                    k = int((time.monotonic() - pv["t0"]) / pv["dt"])
+                    if k < len(pv["traj"]) + 25:
+                        if not hasattr(self, "pd"):
+                            self.pd = mujoco.MjData(self.sim.m)
+                        with self.sim.lock:
+                            self.pd.qpos[:] = self.sim.d.qpos
+                        self.pd.qpos[self.sim.ids.arm_qadr] = pv["traj"][min(k, len(pv["traj"]) - 1)]
+                        mujoco.mj_forward(self.sim.m, self.pd)
+                        data = self.pd
+                    else:
+                        self.sim.preview = None
+                with self.sim.lock:
+                    if c is None:
+                        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+                        cam.lookat[:] = self.sim.d.site_xpos[self.sim.ids.grip_site]
+                        cam.distance, cam.azimuth, cam.elevation = 0.35, 150, -35
+                    else:
+                        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+                        cam.lookat[:] = c["lookat"]
+                        cam.distance = v.get("distance", c["distance"])
+                        cam.azimuth = v.get("azimuth", c["azimuth"])
+                        cam.elevation = v.get("elevation", c["elevation"])
+                    r.update_scene(data, cam, opt)
+                img = r.render()
+                bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                label = ("PATH PREVIEW (simulated)" if data is not self.sim.d else
+                         "SYNC (no physics)" if self.sim.mode == "sync" else "TRIAL (simulation only)") + \
+                        ("" if self.sim.block_basis == "observed_calibrated" else " | placement: NOT calibrated")
+                cv2.putText(bgr, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(bgr, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                with self.cond:
+                    self.jpeg, self.seq = buf.tobytes(), self.seq + 1
+                    self.cond.notify_all()
+                time.sleep(max(0.0, 1.0 / self.fps - (time.monotonic() - t0)))
+        finally:
+            r.close()
+
+    def wait(self, seq):
+        with self.cond:
+            self.cond.wait_for(lambda: self.seq != seq or self.stop.is_set(), 5)
+            return self.jpeg, self.seq
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8092)
+    ap.add_argument("--arm-url", default="http://127.0.0.1:8091")
+    ap.add_argument("--vision-url", default="http://127.0.0.1:8090")
+    ap.add_argument("--rate", type=float, default=20.0, help="sync rate (Hz)")
+    args = ap.parse_args()
+
+    sim = Sim(args)
+    rl = RenderLoop(sim)
+    stop = threading.Event()
+
+    def sync_loop():
+        while not stop.is_set():
+            t0 = time.monotonic()
+            try:
+                sim.sync_tick()
+            except Exception as e:
+                sim.sync_info = {"joints": f"同期エラー: {e}", "block": ""}
+            stop.wait(max(0.0, 1.0 / args.rate - (time.monotonic() - t0)))
+
+    threading.Thread(target=sync_loop, daemon=True).start()
+    threading.Thread(target=rl.run, daemon=True).start()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _json(self, obj, code=200):
+            body = json.dumps(obj, ensure_ascii=False, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path, _, query = self.path.partition("?")
+            if path == "/api/state":
+                return self._json(sim.state())
+            if path == "/stream.mjpg":
+                params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+                if params.get("cam") in CAMS and params["cam"] != sim.view["cam"]:
+                    sim.view = {"cam": params["cam"], "geom": sim.view["geom"]}   # drop dragged angles
+                if params.get("geom") in ("visual", "collision", "both"):
+                    sim.view["geom"] = params["geom"]
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                seq = -1
+                try:
+                    while not stop.is_set():
+                        jpeg, seq = rl.wait(seq)
+                        if jpeg:
+                            self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                             + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            if path.startswith("/api/path/"):
+                rec = getattr(sim, "paths", {}).get(path.rsplit("/", 1)[-1])
+                return self._json(rec or {"ok": False, "message": "未確認または期限切れの経路 id"})
+            if path == "/api/real_grasp_check":
+                return self._json({"blockers": sim.real_grasp_blockers()})
+            if path == "/snapshot.jpg":
+                jpeg, _ = rl.wait(-1)
+                body = jpeg or b""
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_error(404)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            path = self.path.split("?")[0]
+            if path == "/api/mode":
+                return self._json({"message": sim.set_mode(body.get("mode", "sync"))})
+            if path == "/api/placement":
+                src = body.get("source")
+                if src not in ("observed", "mock"):
+                    return self._json({"message": "source は observed / mock"}, 400)
+                if sim.mode != "sync":
+                    return self._json({"message": "試行中は配置を変えない（リセットしてから）"})
+                sim.placement_source = src
+                sim.plan = None
+                return self._json({"message": f"ブロックの配置: {src}"})
+            if path == "/api/plan":
+                return self._json({"message": sim.do_plan()})
+            if path == "/api/trial":
+                return self._json({"message": sim.start_trial(body.get("candidate"))})
+            if path == "/api/reset":
+                return self._json({"message": sim.reset()})
+            if path == "/api/check_path":
+                return self._json(sim.check_path(body.get("target", "pre"), body.get("candidate")))
+            if path == "/api/preview":
+                lp = getattr(sim, "last_path", None)
+                if not lp:
+                    return self._json({"message": "シミュレートした経路がない"})
+                sim.preview = {"traj": lp["sim_q"], "dt": lp["sim_dt"], "t0": time.monotonic()}
+                return self._json({"message": "経路のシミュレーションを再生中"})
+            if path == "/api/view":
+                for k in ("azimuth", "elevation", "distance"):
+                    if k in body:
+                        sim.view[k] = float(body[k])
+                return self._json({"ok": True})
+            if path == "/api/reload":
+                if sim.mode != "sync":
+                    return self._json({"message": "リセットしてから"})
+                with sim.lock:
+                    sim.settings = scene.load_settings()
+                return self._json({"message": "scene.toml を読み直した（モデル形状の変更は再起動が必要）"})
+            self.send_error(404)
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.daemon_threads = True
+    print(f"sim_server on http://{args.host}:{args.port}/ (MuJoCo {mujoco.__version__})", flush=True)
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        sim.stop_trial.set()
+        rl.stop.set()
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
