@@ -113,6 +113,8 @@ physically_fixed = false
 [grip_jig]
 id = 3
 size_mm = 40.0
-size_status = "sample"         # 印刷シートの公称値。黒枠を実測したら measured
-jig_to_grip_mm = [nan, nan, nan]
-jig_to_grip_status = "unset"
+size_status = "measured"       # 依頼者実測 2026-10-13: 黒枠 40 mm
+# 依頼者情報 2026-10-13: 両顎を閉じるとパッドがマーカー両端（中心から左右 20 mm）に当たり、奥行き方向のずれは 0。
+# よって把持中心 = 治具マーカー中心。顎で挟んだ状態で記録すること（机に置いただけでは成り立たない）。
+jig_to_grip_mm = [0.0, 0.0, 0.0]
+jig_to_grip_status = "measured"
