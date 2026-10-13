@@ -412,6 +412,15 @@ function renderPoses(cp) {
     lastPoses = null; loadHE();
   });
 }
+const heChecked = new Set();
+async function heDelete(ids, all = false) {
+  if (!confirm(all ? "このセッションのサンプルをすべて削除します（退避ファイルに残ります）。よろしいですか？" : `サンプル #${ids.join(", #")} を削除します。よろしいですか？`)) return;
+  const r = await post("/api/handeye/delete", { session: $("heSession").value, ids, all });
+  $("heMsg").innerHTML = r.ok ? `<span class="ok">${esc(r.message)}</span>` : `<span class="bad">${esc(r.message || "")}</span>`;
+  heChecked.clear(); lastPoses = null; loadHE();
+}
+$("heDelSel").onclick = () => heChecked.size ? heDelete([...heChecked]) : ($("heMsg").textContent = "削除するサンプルにチェックを入れてください");
+$("heDelAll").onclick = () => heDelete([], true);
 async function loadHE() {
   try {
     const r = await (await fetch("/api/handeye/sessions")).json();
@@ -423,9 +432,12 @@ async function loadHE() {
     if (JSON.stringify(rec) !== JSON.stringify(recorded)) { recorded = rec; }
     const nc = list.filter(x => x.role === "calib").length, ne = list.filter(x => x.role === "eval").length;
     $("heSamples").innerHTML = `<b>記録済みサンプル: 校正用 ${nc} 個（6 個以上必要）、評価用 ${ne} 個（1 個以上必要）</b>` + (list.length ?
-      `<table><tr><th>#</th><th class="l">用途</th><th class="l">姿勢</th><th>ID 1 検出</th><th>角点の揺れ px</th><th class="l">時刻</th></tr>` +
-      list.map(x => `<tr><td>${x.id}</td><td class="l">${x.role === "eval" ? "評価用" : "校正用"}</td><td class="l">${esc(x.label)}</td>
-        <td>${x.n_frames} フレーム</td><td class="${x.corner_std_px > 0.5 ? "warn" : ""}">${f(x.corner_std_px, 3)}${x.corner_std_px > 0.5 ? "（揺れ大）" : ""}</td><td class="l">${esc(x.time)}</td></tr>`).join("") + "</table>" : "");
+      `<table><tr><th></th><th>#</th><th class="l">用途</th><th class="l">姿勢</th><th>ID 1 検出</th><th>角点の揺れ px</th><th class="l">時刻</th><th></th></tr>` +
+      list.map(x => `<tr><td><input type="checkbox" class="heSel" value="${x.id}" ${heChecked.has(x.id) ? "checked" : ""}></td><td>${x.id}</td><td class="l">${x.role === "eval" ? "評価用" : "校正用"}</td><td class="l">${esc(x.label)}</td>
+        <td>${x.n_frames} フレーム</td><td class="${x.corner_std_px > 0.5 ? "warn" : ""}">${f(x.corner_std_px, 3)}${x.corner_std_px > 0.5 ? "（揺れ大）" : ""}</td><td class="l">${esc(x.time)}</td>
+        <td><button class="heDelOne" data-id="${x.id}">削除</button></td></tr>`).join("") + "</table>" : "");
+    document.querySelectorAll(".heSel").forEach(cb => cb.onchange = () => cb.checked ? heChecked.add(+cb.value) : heChecked.delete(+cb.value));
+    document.querySelectorAll(".heDelOne").forEach(b => b.onclick = () => heDelete([+b.dataset.id]));
     $("heResult").innerHTML = `サンプル ${cur ? cur.samples : 0} 個` + (res ? `<br>結果: <b class="${res.ok ? "ok" : "bad"}">${esc(res.message || "")}</b>
       （校正 ${res.n_calib}、評価 ${res.n_eval}）<br>回転の多様性: ${esc(res.diversity ? res.diversity.message : "")}
       ${res.holdout && res.holdout.n ? `<br>評価用姿勢: 再投影 平均 ${f(res.holdout.reproj_px_mean)} / 最大 ${f(res.holdout.reproj_px_max)} px、位置 中央値 ${f(res.holdout.pos_err_mm_median, 1)} mm（画像面内 ${f(res.holdout.lateral_err_mm_median, 1)} mm）、

@@ -414,7 +414,10 @@ def main() -> int:
             sols = pose.solve_marker(cm, spec.size_m, np.array(intr["K"]), np.array(intr["dist_coeffs"]))
             d.mkdir(parents=True, exist_ok=True)
             f = d / "samples.jsonl"
-            idx = len(f.read_text().splitlines()) if f.exists() else 0
+            used = [json.loads(l)["id"] for l in f.read_text().splitlines() if l.strip()] if f.exists() else []
+            deleted = [json.loads(l)["id"] for l in (d / "samples_deleted.jsonl").read_text().splitlines() if l.strip()] \
+                if (d / "samples_deleted.jsonl").exists() else []
+            idx = max(used + deleted, default=-1) + 1          # ids are never reused, even after deletion
             role = body.get("role") or ("eval" if idx % 4 == 3 else "calib")
             rec = {"id": idx, "role": role, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "label": body.get("label", ""),
                    "q": q1.tolist(), "T_base_ee": np.vstack([np.column_stack([np.array(a1["fk"]["R"]), a1["fk"]["p"]]), [0, 0, 0, 1]]).tolist(),
@@ -478,6 +481,22 @@ def main() -> int:
             out.write_text(json.dumps(res, indent=1, ensure_ascii=False))
             t = T_m1_jig[:3, 3] * 1000
             return {"ok": True, "message": f"記録: ID1→治具 ({t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}) mm。{res['T_m1_grip_status']}（{out.name}）"}
+        if cmd == "delete":
+            # Move the selected samples (or all with "all": true) to samples_deleted.jsonl; nothing is lost.
+            f = d / "samples.jsonl"
+            if not f.exists():
+                return {"ok": False, "message": "サンプルがない"}
+            rows = [l for l in f.read_text().splitlines() if l.strip()]
+            ids = set(body.get("ids") or [])
+            drop = [l for l in rows if body.get("all") or json.loads(l)["id"] in ids]
+            keep = [l for l in rows if l not in drop]
+            with (d / "samples_deleted.jsonl").open("a") as fh:
+                for l in drop:
+                    fh.write(json.dumps(dict(json.loads(l), deleted_at=time.strftime("%Y-%m-%d %H:%M:%S"))) + "\n")
+            f.write_text("".join(l + "\n" for l in keep))
+            if (d / "result.json").exists():
+                (d / "result.json").rename(d / f"result_before_delete_{time.strftime('%H%M%S')}.json")
+            return {"ok": True, "message": f"{len(drop)} 個を削除（samples_deleted.jsonl に退避。結果は解き直しが必要）"}
         if cmd == "solve":
             if not (d / "samples.jsonl").exists():
                 return {"ok": False, "message": "サンプルがない"}

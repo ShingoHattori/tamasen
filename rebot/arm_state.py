@@ -59,6 +59,8 @@ DEADBAND = 0.003            # rad: inside it the correction is frozen (no P, no 
 I_MAX, CORR_MAX = 0.15, 0.20   # rad, limits of the integral and of the total correction
 CORRIDOR_RAD = 0.08         # rad, per-joint deviation from the simulated plan that stops the motion
 CORRIDOR_M = 0.020          # m, end_link deviation (FK) that stops the motion
+LAG_FREE, LAG_STOP = 0.01, 0.04   # rad: plan runs at full speed below LAG_FREE lag, stops at LAG_STOP
+STALL_S = 2.0               # s the plan may stand still before it is a fault
 CAN_LOSS_S = 0.3            # s without fresh feedback while engaged = CAN / bus fault
 ENGAGE_GRACE_S = 0.5        # after enabling, status 0x1 must be reported within this time
 FAULT_POLICY = {
@@ -178,7 +180,7 @@ class FakeState:
 class FakeBus:
     """No hardware. Motors follow POS_VEL targets at the commanded speed limit."""
 
-    def __init__(self, joints, allow_motion, q0=None, sag=0.0):
+    def __init__(self, joints, allow_motion, q0=None, sag=0.0, speed=1.0):
         self.allow_motion = allow_motion
         self.sag = {"joint2": sag, "joint3": -sag}     # gravity sag: a POS_VEL motor settles off target
         self.joints = joints
@@ -188,6 +190,7 @@ class FakeBus:
         self.target, self.vlim, self.enabled, self.t = dict(self.q), 0.0, set(), time.monotonic()
         self.log = []
         self.inject = {"no_feedback": False, "status": {}}     # test hooks (fake only)
+        self.speed = speed                                     # <1: motors slower than commanded (lag)
 
     def read_params(self):
         return {n: {"can_timeout": 0, "ctrl_mode": 2, "fake": True} for n in self.q}
@@ -196,7 +199,7 @@ class FakeBus:
         dt, self.t = time.monotonic() - self.t, time.monotonic()
         for n in self.enabled:
             e = self.target[n] + self.sag.get(n, 0.0) - self.q[n]
-            self.q[n] += math.copysign(min(abs(e), self.vlim * dt), e)
+            self.q[n] += math.copysign(min(abs(e), self.vlim * self.speed * dt), e)
 
     def poll(self, settle_s=0.0):
         self._advance()
@@ -315,7 +318,7 @@ class ArmService:
             while not self.stop_evt.is_set():
                 if bus is None:
                     try:
-                        bus = (FakeBus(self.joints, self.args.allow_motion, {"joint1": -1.7, "joint2": 0.0}, self.args.fake_sag)
+                        bus = (FakeBus(self.joints, self.args.allow_motion, {"joint1": -1.7, "joint2": 0.0}, self.args.fake_sag, self.args.fake_speed)
                                if self.args.fake else Bus(self.args.port, self.joints, self.args.allow_motion))
                         self.bus = bus
                         self.motor_params = bus.read_params()
@@ -425,12 +428,25 @@ class ArmService:
             mv = c["motion"]
             hb = time.monotonic() - c["last_heartbeat"]
             if hb > HEARTBEAT_S:
-                qs = self._plan_at(mv, time.monotonic() - mv["t0"])
+                qs = self._plan_at(mv, mv["tp"])
                 c.update(state="holding", motion=None, hold_q=dict(zip(ARM, qs)),
                          message=f"ページからの生存確認が {hb:.1f} s 途絶えたため停止（計画上の現在点で保持）")
                 self.audit("stopped: heartbeat lost", "service")
                 return
-            t = time.monotonic() - mv["t0"]
+            # Time scaling: the plan clock advances only as fast as the arm follows it. Real motors lag
+            # their commands; comparing against plan(wall time) turned normal lag into a corridor stop.
+            lag_now = float(np.max(np.abs(self._plan_at(mv, mv["tp"]) - qm)[:5]))
+            rate = float(np.clip(1.0 - (lag_now - LAG_FREE) / (LAG_STOP - LAG_FREE), 0.0, 1.0))
+            mv["tp"] = min(mv["T"], mv["tp"] + dt * rate)
+            mv["rate"] = rate
+            if rate > 0.05:
+                mv["stalled_since"] = None
+            elif mv.get("stalled_since") is None:
+                mv["stalled_since"] = time.monotonic()
+            elif time.monotonic() - mv["stalled_since"] > STALL_S:
+                self._fault(f"追従できない: 計画が {STALL_S:.0f} s 進まない（遅れ {lag_now:.3f} rad）", keep_target=True)
+                return
+            t = mv["tp"]
             qp = self._plan_at(mv, t)
             mv["progress"] = min(1.0, t / mv["T"])
         else:
@@ -439,7 +455,9 @@ class ArmService:
         fb = c.setdefault("fb", {"I": [0.0] * 6, "max_err": 0.0, "max_tcp_dev": 0.0})
         active = np.abs(e) > DEADBAND
         e_ctl = np.where(active, e - np.sign(e) * DEADBAND, 0.0)
-        I = np.clip(np.array(fb["I"]) + KI * e_ctl * dt, -I_MAX, I_MAX)
+        # Integrate only while holding (static gravity sag). During motion the lag is handled by the
+        # time scaling above; integrating it wound up and overshot the end of the path.
+        I = np.array(fb["I"]) if c["state"] == "moving" else np.clip(np.array(fb["I"]) + KI * e_ctl * dt, -I_MAX, I_MAX)
         q_cmd = qp + np.clip(KP * e_ctl + I, -CORR_MAX, CORR_MAX)
         tcp_dev = self._tcp_dev(qp, qm)
         fb.update(I=I.tolist(), err=e.tolist(), err_max_now=float(np.max(np.abs(e))), tcp_dev=tcp_dev,
@@ -458,7 +476,7 @@ class ArmService:
         # Faults latch: they are cleared only by the user ("ack_fault") once the cause is gone, or by release.
         c["last_cmd"] = dict(zip(ARM, q_cmd))
         bus.send_pos_vel(c["last_cmd"], VMAX * 1.5)
-        if c["state"] == "moving" and t >= mv["T"] + 0.5:
+        if c["state"] == "moving" and t >= mv["T"] and lag_now < LAG_FREE * 2:
             end = dict(zip(ARM, np.array(mv["q_plan"][-1])))
             c.update(state="holding", motion=None, hold_q=end,
                      message=f"移動完了（最大偏差 {fb['max_err']:.3f} rad / 手先 {fb['max_tcp_dev'] * 1000:.0f} mm）。保持中もフィードバック継続")
@@ -469,7 +487,7 @@ class ArmService:
         if c.get("fault") == why:
             return
         if c["state"] == "moving":
-            qp = self._plan_at(c["motion"], time.monotonic() - c["motion"]["t0"])
+            qp = self._plan_at(c["motion"], c["motion"]["tp"])
             c.update(hold_q=dict(zip(ARM, qp)))
         c.update(state="holding", motion=None, fault=why, message="停止（異常）: " + why)
         self.audit("fault: " + why, "service")
@@ -546,7 +564,8 @@ class ArmService:
             c["fb"] = {"I": c.get("fb", {}).get("I", [0.0] * 6), "max_err": 0.0, "max_tcp_dev": 0.0}
             c.update(state="moving", message=f"移動中: {path['label']}",
                      motion={"label": path["label"], "path_id": path["id"], "times": path["times"],
-                             "q_plan": path["q_plan"], "T": float(path["times"][-1]), "t0": time.monotonic(), "progress": 0.0})
+                             "q_plan": path["q_plan"], "T": float(path["times"][-1]), "t0": time.monotonic(), "tp": 0.0,
+                             "progress": 0.0, "rate": 1.0})
         elif cmd == "ack_fault":
             if not c.get("fault"):
                 c["message"] = "異常はない"
@@ -644,6 +663,7 @@ def main() -> int:
     ap.add_argument("--sim-url", default="http://127.0.0.1:8092")
     ap.add_argument("--allow-motion", action="store_true", help="accept motion commands from the web page (user only)")
     ap.add_argument("--fake", action="store_true", help="simulated motors; never opens the serial port")
+    ap.add_argument("--fake-speed", type=float, default=1.0, help="fake motors: fraction of the commanded speed")
     ap.add_argument("--fake-sag", type=float, default=0.03, help="fake motors: steady offset on joint2/3 (rad)")
     ap.add_argument("--seconds", type=float)
     args = ap.parse_args()

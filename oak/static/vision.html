@@ -87,6 +87,8 @@
    <button id="heSolve">解く</button><button id="heAdopt">評価合格の結果を採用</button></div>
   <div id="heMsg" style="font-size:15px;font-weight:bold;margin:4px 0"></div>
   <div id="heSamples"></div>
+  <div><button id="heDelSel">選択したサンプルを削除</button><button id="heDelAll">このセッションのサンプルを全削除</button>
+   <span class="dim">削除したサンプルは samples_deleted.jsonl に退避される（番号は再利用しない）</span></div>
   <div id="calibPoses"></div><div id="heResult"></div>
   <h2>把持中心（ID 1 → 実際の顎の中心）— camera↔base とは別の校正</h2>
   <div class="dim">治具 = 印刷シートの ID 3（30 mm）を貼った薄い板。両顎を閉じて挟み（板面 = 両顎の中央面）、治具→把持中心のずれを実測して markers.toml [grip_jig] に記入してから記録する。
