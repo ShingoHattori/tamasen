@@ -1,0 +1,16 @@
+{
+ "n_calib": 1,
+ "n_eval": 0,
+ "time": "2026-10-13 10:21:16",
+ "frames": "X = T_cam_base (base -> cam), Y = T_ee_m1 (ID 1 marker -> end_link), metres",
+ "not_modelled": "link/gearbox deflection, joint zero offsets, grip centre (separate)",
+ "diversity": {
+  "ok": false,
+  "pairs": 0,
+  "axis_spread": 0.0,
+  "max_rel_rot_deg": 0.0,
+  "message": "15° 以上の相対回転を持つ組が足りない（並進だけ・小さい回転だけでは解けない）"
+ },
+ "ok": false,
+ "message": "校正用サンプルが 1 個（6 個以上必要）"
+}

@@ -378,7 +378,10 @@ def main() -> int:
             for sd in sorted(calib_root.iterdir()) if calib_root.exists() else []:
                 n = len((sd / "samples.jsonl").read_text().splitlines()) if (sd / "samples.jsonl").exists() else 0
                 r = json.loads((sd / "result.json").read_text()) if (sd / "result.json").exists() else None
-                out.append({"session": sd.name, "samples": n, "result": None if r is None else
+                rows = [json.loads(l) for l in (sd / "samples.jsonl").read_text().splitlines() if l.strip()] if n else []
+                brief = [{"id": x["id"], "role": x["role"], "label": x.get("label", ""), "time": x["time"],
+                          "n_frames": x["n_frames"], "corner_std_px": x["corner_std_px"], "status": x.get("status")} for x in rows]
+                out.append({"session": sd.name, "samples": n, "sample_list": brief, "result": None if r is None else
                             {k: r.get(k) for k in ("ok", "message", "n_calib", "n_eval", "diversity", "sd", "weighted_rms")}
                             | {"holdout": {k: v for k, v in r.get("holdout", {}).items() if k != "rows"},
                                "fit": {k: v for k, v in r.get("fit", {}).items() if k != "rows"}}})

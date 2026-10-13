@@ -85,6 +85,8 @@
    (4) 解く → 評価用姿勢（校正に使わない）の誤差を確認 → 採用。ID 1 の姿勢を end_link の姿勢とは見なさない（取り付け変換も同時に推定）。たわみ・関節零点誤差は補償しない（残差に出る）。</div>
   <div>セッション <input id="heSession" size="12"> <button id="genPoses">校正姿勢を生成</button><button id="previewPoses">全姿勢をツインで巡回再生</button>
    <button id="heSolve">解く</button><button id="heAdopt">評価合格の結果を採用</button></div>
+  <div id="heMsg" style="font-size:15px;font-weight:bold;margin:4px 0"></div>
+  <div id="heSamples"></div>
   <div id="calibPoses"></div><div id="heResult"></div>
   <h2>把持中心（ID 1 → 実際の顎の中心）— camera↔base とは別の校正</h2>
   <div class="dim">治具 = 印刷シートの ID 3（30 mm）を貼った薄い板。両顎を閉じて挟み（板面 = 両顎の中央面）、治具→把持中心のずれを実測して markers.toml [grip_jig] に記入してから記録する。
@@ -98,7 +100,8 @@
    <div class="warn">カメラスタンド（映像の下端）とブロックはシミュレーターの干渉確認に入っていない（台座⇔カメラ未校正）。経路を目視で確認してから実行すること。
     このページを閉じる・別タブにすると生存確認が止まり、移動中なら停止する。</div>
    <div><button id="engage">有効化（現在位置で保持）</button><button id="stopArm" style="background:#7a1f1f;font-weight:bold">停止</button>
-    <button id="release">トルクを切る</button><button id="ackFault">異常を確認して解除</button></div>
+    <button id="release">トルクを切る</button><button id="ackFault">異常を確認して解除</button>
+    <button id="goHome" style="background:#2d5a3b">初期位置（有効化した姿勢）に戻す</button></div>
    <div>1. 経路をシミュレート（現在の実機の関節角から）: <button data-path="pre">接近前の姿勢へ</button><button data-path="grasp">把持姿勢へ</button>
     <button data-path="lift">持ち上げ姿勢へ</button><button data-path="engage_pose">有効化時の姿勢へ戻る</button>
     <button id="previewPath">シミュレーション結果をツインで再生</button></div>
