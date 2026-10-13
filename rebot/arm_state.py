@@ -513,12 +513,21 @@ class ArmService:
 
     @staticmethod
     def _plan_at(mv, t):
+        """Planned joints at plan time t. A start offset (measured - planned start, <= START_TOL) is
+        blended out over the first T_blend seconds, so the arm joins the simulated path smoothly
+        instead of starting with a step it cannot follow."""
         ts, qp = mv["times"], mv["q_plan"]
         if t >= ts[-1]:
-            return np.array(qp[-1])
-        i = int(np.searchsorted(ts, t, side="right")) - 1
-        a = (t - ts[i]) / (ts[i + 1] - ts[i])
-        return (1 - a) * np.array(qp[i]) + a * np.array(qp[i + 1])
+            q = np.array(qp[-1])
+        else:
+            i = int(np.searchsorted(ts, t, side="right")) - 1
+            a = (t - ts[i]) / (ts[i + 1] - ts[i])
+            q = (1 - a) * np.array(qp[i]) + a * np.array(qp[i + 1])
+        off = mv.get("offset")
+        if off is not None and t < mv["T_blend"]:
+            w = 0.5 + 0.5 * math.cos(math.pi * t / mv["T_blend"])     # 1 -> 0, smooth
+            q = q + w * np.array(off)
+        return q
 
     def handle(self, bus, q, cmd, kw) -> None:
         c = self.control
@@ -562,10 +571,12 @@ class ArmService:
                                 "（シミュレーション後に動いた）。シミュレートし直す")
                 return
             c["fb"] = {"I": c.get("fb", {}).get("I", [0.0] * 6), "max_err": 0.0, "max_tcp_dev": 0.0}
+            offset = (q_now - start).tolist()
             c.update(state="moving", message=f"移動中: {path['label']}",
                      motion={"label": path["label"], "path_id": path["id"], "times": path["times"],
                              "q_plan": path["q_plan"], "T": float(path["times"][-1]), "t0": time.monotonic(), "tp": 0.0,
-                             "progress": 0.0, "rate": 1.0})
+                             "progress": 0.0, "rate": 1.0, "offset": offset,
+                             "T_blend": min(2.0, 0.3 * float(path["times"][-1]))})
         elif cmd == "ack_fault":
             if not c.get("fault"):
                 c["message"] = "異常はない"
