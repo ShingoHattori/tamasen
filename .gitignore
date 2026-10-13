@@ -7,3 +7,9 @@ __pycache__/
 .venv/
 rebot/rebot/
 oak/venv.tar.gz
+run/
+oak/output/snapshots/
+oak/output/recordings/
+oak/output/replay_world_ref.json
+oak/calib/world_ref.json
+sim/output/

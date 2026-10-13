@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Start / stop the recognition, arm-state and simulator services on robot1.
+#
+#   ./run.sh start [vision|arm|sim|all]     (default: all)
+#   ./run.sh stop  [vision|arm|sim|all]
+#   ./run.sh status
+#   ./run.sh log   vision|arm|sim
+#
+# All three bind to 127.0.0.1 only. View from your own machine through an SSH forward:
+#   ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   then open http://127.0.0.1:8090/
+# (the page proxies the arm service on :8091 and the simulator on :8092, so one forward is enough)
+#
+# Options are passed through environment variables:
+#   VISION_ARGS="--device 18443"   ARM_ARGS="--port /dev/ttyACM0"   SIM_ARGS=""
+# Nothing here sends commands to the motors: arm_state.py only requests feedback frames.
+set -u
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+RUN="$ROOT/run"
+mkdir -p "$RUN"
+
+declare -A DIR=([vision]="$ROOT/oak" [arm]="$ROOT/rebot" [sim]="$ROOT/sim")
+declare -A PY=([vision]="$ROOT/oak/.venv/bin/python" [arm]="$ROOT/rebot/reBotArm_control_py/.venv/bin/python" [sim]="$ROOT/sim/.venv/bin/python")
+declare -A SCRIPT=([vision]="vision.py" [arm]="arm_state.py" [sim]="sim_server.py")
+declare -A ARGS=([vision]="${VISION_ARGS:---device 18443}" [arm]="${ARM_ARGS:---port /dev/ttyACM0}" [sim]="${SIM_ARGS:-}")
+declare -A PORT=([vision]=8090 [arm]=8091 [sim]=8092)
+
+alive() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
+
+start() {
+  local s=$1
+  if alive "$s"; then echo "$s: already running (pid $(cat "$RUN/$s.pid"))"; return; fi
+  cd "${DIR[$s]}" || return 1
+  # shellcheck disable=SC2086
+  MUJOCO_GL=egl setsid "${PY[$s]}" -u "${SCRIPT[$s]}" ${ARGS[$s]} >"$RUN/$s.log" 2>&1 &
+  echo $! >"$RUN/$s.pid"
+  echo "$s: started pid $! (log: $RUN/$s.log, http://127.0.0.1:${PORT[$s]}/)"
+}
+
+stop() {
+  local s=$1
+  if ! alive "$s"; then echo "$s: not running"; rm -f "$RUN/$s.pid"; return; fi
+  local pid; pid=$(cat "$RUN/$s.pid")
+  kill -TERM "$pid"            # SIGTERM = the same clean shutdown as Ctrl-C (releases the OAK / serial port)
+  for _ in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+  if kill -0 "$pid" 2>/dev/null; then echo "$s: did not exit, sending SIGKILL"; kill -KILL "$pid"; fi
+  rm -f "$RUN/$s.pid"; echo "$s: stopped"
+}
+
+which=${2:-all}
+case "$which" in all) set_=(arm sim vision) ;; vision|arm|sim) set_=("$which") ;; *) echo "unknown service $which"; exit 2 ;; esac
+case "${1:-}" in
+  start) for s in "${set_[@]}"; do start "$s"; done ;;
+  stop) for s in "${set_[@]}"; do stop "$s"; done ;;
+  restart) for s in "${set_[@]}"; do stop "$s"; start "$s"; done ;;
+  status) for s in vision arm sim; do if alive "$s"; then echo "$s: running pid $(cat "$RUN/$s.pid") port ${PORT[$s]}"; else echo "$s: stopped"; fi; done ;;
+  log) tail -n 40 "$RUN/$which.log" ;;
+  *) sed -n '2,15p' "$0"; exit 2 ;;
+esac

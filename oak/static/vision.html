@@ -1,0 +1,87 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>B601-DM マーカー認識 / 仮想表示</title>
+<style>
+ :root { color-scheme: dark; }
+ body { margin:0; background:#111; color:#eee; font:13px/1.5 system-ui,sans-serif; }
+ header { padding:6px 12px; background:#1d1d1d; display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+ header b { font-size:15px; }
+ main { display:grid; grid-template-columns: 1fr 1fr; gap:10px; padding:10px; }
+ .media { width:100%; aspect-ratio: 4/3; border-radius:6px; background:#000; display:block; object-fit:contain; }
+ section { background:#1b1b1b; border-radius:6px; padding:8px 12px; overflow-x:auto; }
+ h2 { font-size:14px; margin:6px 0 4px; }
+ table { border-collapse:collapse; width:100%; }
+ td, th { padding:2px 6px; border-bottom:1px solid #333; text-align:right; white-space:nowrap; }
+ td:first-child, th:first-child, td.l, th.l { text-align:left; }
+ .warn { color:#fc6; } .bad { color:#f77; } .ok { color:#7d7; } .dim { color:#888; } .info { color:#9cf; }
+ button { background:#2d3b4d; color:#eee; border:1px solid #4a6078; border-radius:4px; padding:3px 10px; cursor:pointer; margin:2px; }
+ button:hover { background:#3a4d63; }
+ ul { margin:4px 0; padding-left:18px; }
+ .legend span { margin-right:12px; }
+ .tag { display:inline-block; padding:0 6px; border-radius:3px; font-size:12px; }
+ .tag.prov { background:#5a4a12; } .tag.cal { background:#1f4d2a; } .tag.no { background:#5a1f1f; }
+ #msg { color:#9cf; }
+ .full { grid-column: 1 / span 2; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/static/vendor/three/three.module.js",
+               "three/addons/": "/static/vendor/three/addons/" } }
+</script>
+</head><body>
+<header>
+ <b>B601-DM 認識・仮想表示</b>
+ <span id="src" class="dim"></span>
+ <span class="tag no">実機への指令: なし（このページに実機動作の操作はない）</span>
+ <span id="msg"></span>
+</header>
+<main>
+ <div>
+  <img class="media" src="/stream.mjpg" alt="live">
+  <div class="legend dim">外側の細線 = 検出輪郭（実際の黒枠の 4 px 外側に描画）、黄丸 = corner 0（印刷の左上）。
+   線色: <span class="ok">ok</span><span class="warn">ambiguous</span><span class="bad">flip / rejected</span>。
+   軸 赤 x・緑 y・青 z。投影ブロック: <span style="color:#0ff">ID 0 から</span><span style="color:#f0f">ID 3 から</span>（破線 = 観測が ok でない）</div>
+  <div>
+   <button id="snap">静止画を保存（元画像 + 注釈画像 + 状態）</button>
+   <button id="recStart">録画開始</button><button id="recStop">録画停止</button>
+   <span id="rec" class="dim"></span>
+  </div>
+ </div>
+ <div>
+  <div id="view" class="media"></div>
+  <div>表示座標: <label><input type="radio" name="frame" value="world" checked> world（ID 2 基準・暫定）</label>
+   <label><input type="radio" name="frame" value="cam"> カメラ座標</label>
+   <label><input type="checkbox" id="showAlt"> IPPE のもう一方の解も表示</label></div>
+  <div class="legend dim"><span style="color:#0ff">■ ID 0 からのブロック</span><span style="color:#f0f">■ ID 3 からのブロック</span>
+   <span style="color:#fa0">■ ブロック用マーカー</span><span style="color:#6f6">■ ID 1</span><span style="color:#69f">■ ID 2</span>
+   半透明 = ok 以外の観測。白い四角錐 = カメラ視野。world 表示では Z=0 = カード表面（床ではない）。</div>
+  <div id="frameNote" class="warn"></div>
+ </div>
+
+ <section><h2>マーカー（現在のフレーム）</h2><div id="markers"></div>
+  <h2>ID 0 / ID 3 によるブロック姿勢</h2><div id="block"></div>
+  <h2>グリッパー (ID 1)</h2><div id="grip"></div></section>
+ <section><h2>基準 ID 2（暫定 world）</h2><div id="world"></div>
+  <div><button id="wReg">現在の ID 2 で基準を登録・固定</button><button id="wRel">固定を解除（毎フレーム追従）</button><button id="wUse">保存済み基準を使う</button></div>
+  <h2>未確定・未校正の項目</h2><div id="missing"></div>
+  <h2>カメラ内部パラメータ</h2><div id="intr"></div></section>
+
+ <section class="full"><h2>シミュレーション（MuJoCo）</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+   <div><img class="media" id="simimg" alt="MuJoCo (未起動)">
+    <div class="dim">MuJoCo のオフスクリーン描画（サーバー側 EGL）。視点:
+     <button data-cam="overview">全体</button><button data-cam="gripper">グリッパー</button><button data-cam="side">側面</button>
+     表示: <button data-geom="visual">表示用形状</button><button data-geom="collision">衝突形状</button><button data-geom="both">両方</button></div></div>
+   <div>
+    <div>モード: <button data-mode="sync">現実同期</button><button data-mode="trial">シミュレーション試行</button>
+     <span id="simMode"></span></div>
+    <div>ブロックの配置: <button data-place="observed">観測（ID 2 world → 仮配置）</button><button data-place="mock">模擬配置</button>
+     <span id="simPlace"></span></div>
+    <div><button id="plan">把持候補を計算</button><button id="trial">試行開始</button><button id="reset">リセット（現実同期へ戻す）</button></div>
+    <div id="sim"></div>
+   </div>
+  </div>
+ </section>
+
+ <section><h2>アーム関節（読み取り専用）</h2><div id="arm"></div></section>
+ <section><h2>保存したファイル</h2><div id="files"></div></section>
+</main>
+<script type="module" src="/static/app.js"></script>
+</body></html>

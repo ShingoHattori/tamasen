@@ -1,63 +1,102 @@
-# ArUco マーカーと物体モデルの登録。単位は mm。vision.py が起動中もこのファイルの変更を読み直す。
+# ArUco マーカー・ブロック・基準カードの登録。vision.py は起動中もこのファイルの変更を読み直す。
 #
-# 未計測の値は nan（数値）または ""（文字列）のままにしておく。推測値で埋めないこと:
-# 埋まっていない項目はブロックの姿勢計算に使われず、確認画面に「未登録」として表示される。
+# 単位: このファイルでは長さ mm、角度 deg（キー名の _mm / _deg で明示）。読み込み時に m・rad へ変換し、
+#       プログラム内部と state.json はすべて m・rad。
+#
+# 値の状態（*_status）:
+#   "unset"      未入力。値があっても使わない（0 や単位行列で代用しない）
+#   "sample"     サンプル値・仮定。表示はするが「仮」と明示し、校正値としては扱わない
+#   "measured"   実測済み（依頼者の実測、または画像での確認を経たもの）
+#   "calibrated" 校正済み（観測データから推定し、検証したもの）
+#
+# 座標系と変換の向き（T_a_b は b 座標の点を a 座標へ移す: p_a = T_a_b · p_b）:
+#   cam   カラーカメラ（OpenCV: x 右, y 下, z 前方）
+#   m<ID> マーカー（中心が原点。印刷の向きで x 右, y 上, z はマーカー面から外向き。
+#         ArUco の四隅順 0..3 = 印刷の左上・右上・右下・左下）
+#   world 暫定 world = ID 2 のマーカー座標そのもの（Z=0 はカード表面。床面ではない）
+#   obj   ブロック中心
+#   base  アーム台座（カメラとの位置合わせは未実施）
 
-dictionary = "4X4_50"
+dictionary = "DICT_4X4_50"
 
 # ---------------------------------------------------------------------------------------------
 # 直方体ブロック
 #
-# 物体座標の定義（右手系、原点は直方体の中心）:
+# 物体座標 obj の定義（右手系、原点は直方体の中心、X/Y/Z の寸法 = 67/78/31 mm）:
 #   +Z : ID 0 を貼った 67 x 78 面の外向き法線（この面を「上面」と呼ぶ）
-#   -Y : ID 3 を貼った 67 x 31 面の外向き法線（この面を「正面」と呼ぶ）
-#   +X : 正面を見て上面が上にあるとき、右向き
-# 寸法は X / Y / Z = 67 / 78 / 31。
+#   -X : ID 3 を貼った 78 x 31 面の外向き法線（この面を「正面」と呼ぶ）
+#        依頼者確認（2026-10-13）: ID 3 の面は 78 x 31 mm（当初の「67 x 31」は誤り。画像で約 78 mm と推定し、依頼者が実測で確認）
+#   +Y : 右手系から決まる（正面を見て上面が上のとき、左向き）
+#   78 x 31 面と 67 x 78 面は必ず 78 mm の辺で隣り合うので、この定義は物理的な配置を仮定しない。
+#   決まっていないのは「各面のどの角にマーカーがあるか」と「マーカーの回転」で、画像で確認して記入する。
 #
-# 面図（マーカーの取り付けを記入するときの見方）:
-#   上面 (+Z) : 真上から見て、正面 (ID 3 の面) が手前 = 図の下側。図の右 = +X、上 = +Y
-#   正面 (-Y) : 正面から見て、上面 (ID 0 の面) が図の上側。      図の右 = +X、上 = +Z
+# 面図（取り付けを記入するときの見方）:
+#   上面 (+Z) : 真上から見て、正面（ID 3 の面）が図の下側。図の右 = -Y、上 = +X（図の横 78 mm、縦 67 mm）
+#   正面 (-X) : 正面から見て、上面（ID 0 の面）が図の上側。図の右 = -Y、上 = +Z（図の横 78 mm、縦 31 mm）
+#   依頼者の「左上」は依頼者の見方での左上で、この面図の左上と同じとは限らない。
 # ---------------------------------------------------------------------------------------------
 [block]
 size_mm = [67.0, 78.0, 31.0]
+size_status = "measured"
 
-# 取り付け項目（ブロック用マーカー）:
-#   size_mm     マーカー黒枠の外寸（一辺）
-#   corner      マーカーが寄っている面の角（面図での位置）:
-#               "top-left" | "top-right" | "bottom-left" | "bottom-right"
-#   offset_x_mm その角の左右の辺から、マーカー黒枠の近い辺までの距離
-#   offset_y_mm その角の上下の辺から、マーカー黒枠の近い辺までの距離
-#   x_axis      確認画面でマーカーに描かれる x 軸（赤）が、面図で向いている方向:
-#               "right" | "left" | "up" | "down"
-#               （マーカーの印刷上の向き。y 軸（緑）は x 軸を反時計回りに 90° 回した向き）
+# ブロック用マーカーの取り付け:
+#   size_mm      黒い正方形の一辺（白い余白を除く）
+#   offset_x_mm  寄っている角の左右の辺から黒枠まで / offset_y_mm 上下の辺から黒枠まで
+#   corner       寄っている角（面図での位置）: "top-left" | "top-right" | "bottom-left" | "bottom-right"
+#   x_axis       マーカーの x 軸（赤）が面図で向く方向: "right" | "left" | "up" | "down"
+#   mount_status corner と x_axis を画像で確認したら "measured" にする。"unset" の間は取り付け変換を作らない
+#   mount_evidence 確認に使った画像（保存した静止画のパスなど）
 
 [marker.0]
 role = "block"
 face = "+Z"
-size_mm = nan
-corner = ""
-offset_x_mm = nan
-offset_y_mm = nan
-x_axis = ""
+size_mm = 20.0
+size_status = "measured"
+offset_x_mm = 3.0
+offset_y_mm = 3.0
+offset_status = "measured"
+corner = "bottom-left"
+x_axis = "left"
+mount_status = "measured"
+mount_evidence = "evidence/mount-20261013/（元 output/snapshots/20261013-090030-716。両面が写った静止画。単面の外形照合 mount_0/3.jpg で各面の位置、ID 3 の姿勢＋取り付けから予測した ID 0 の四隅が検出と平均 4.9 px で一致。次点 11 px）"
 
 [marker.3]
 role = "block"
-face = "-Y"
-size_mm = nan
-corner = ""
-offset_x_mm = nan
-offset_y_mm = nan
-x_axis = ""
+face = "-X"
+size_mm = 20.0
+size_status = "measured"
+offset_x_mm = 3.0
+offset_y_mm = 3.0
+offset_status = "measured"
+corner = "bottom-left"
+x_axis = "left"
+mount_status = "measured"
+mount_evidence = "evidence/mount-20261013/（元 output/snapshots/20261013-090030-716。両面が写った静止画。単面の外形照合 mount_0/3.jpg で各面の位置、ID 3 の姿勢＋取り付けから予測した ID 0 の四隅が検出と平均 4.9 px で一致。次点 11 px）"
 
 # ---------------------------------------------------------------------------------------------
-# グリッパー根元のマーカー（顎の開閉では動かない部分）
-# grip_* は ID 1 のマーカー座標から把持中心への固定変換。校正するまで calibrated = false のまま。
+# グリッパー根元のマーカー（顎の開閉では動かない本体部分）
+# grip: ID 1 マーカー座標 → 把持中心の固定変換 T_m1_grip。校正するまで status = "unset"。
 # ---------------------------------------------------------------------------------------------
 [marker.1]
 role = "gripper"
-size_mm = nan
+size_mm = 20.0
+size_status = "measured"
 
 [marker.1.grip]
-calibrated = false
+status = "unset"
 translation_mm = [nan, nan, nan]
 rotation_rpy_deg = [nan, nan, nan]
+
+# ---------------------------------------------------------------------------------------------
+# 基準カード（暫定 world 座標）
+# world = ID 2 のマーカー座標。原点 = マーカー中心、軸 = マーカー軸、Z=0 = マーカー表面。
+# 床面は Z = -card_thickness だが、厚みは未測定のため床の高さは未校正。
+# physically_fixed: カードをテープ等で固定したら true にする（依頼者の申告）。
+# ---------------------------------------------------------------------------------------------
+[marker.2]
+role = "world_reference"
+size_mm = 40.0
+size_status = "measured"
+card_thickness_mm = nan
+card_thickness_status = "unset"
+physically_fixed = false

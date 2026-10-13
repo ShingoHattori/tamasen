@@ -1,0 +1,168 @@
+{
+ "status": {
+  "0": "ok",
+  "3": "ok"
+ },
+ "ranked": [
+  {
+   "id0": "bottom-right x=left",
+   "id3": "top-right x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 12.528154459281929,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-left x=left",
+   "id3": "top-left x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 12.844802250515102,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-right x=left",
+   "id3": "bottom-right x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 14.003912443614267,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-left x=left",
+   "id3": "bottom-left x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 14.229093217081546,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "top-left x=left",
+   "id3": "top-left x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 28.583242486404654,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "top-left x=left",
+   "id3": "bottom-left x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 28.904932507818984,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "top-right x=left",
+   "id3": "top-right x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 28.922493170927538,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "top-right x=left",
+   "id3": "bottom-right x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 29.269109042035137,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-left x=left",
+   "id3": "top-right x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 50.83255342055174,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-left x=left",
+   "id3": "bottom-right x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 51.1998694937673,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-left x=right",
+   "id3": "top-left x=right",
+   "ippe0": "T_cam_marker_alt",
+   "ippe3": "T_cam_marker_alt",
+   "dt_mm": 47.61397978929941,
+   "drot_deg": 7.453662889536648
+  },
+  {
+   "id0": "bottom-right x=right",
+   "id3": "top-right x=right",
+   "ippe0": "T_cam_marker_alt",
+   "ippe3": "T_cam_marker_alt",
+   "dt_mm": 48.463522773635326,
+   "drot_deg": 7.453662889536648
+  },
+  {
+   "id0": "bottom-right x=left",
+   "id3": "top-left x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 56.08786537635,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-right x=left",
+   "id3": "bottom-left x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 56.435835707893524,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-left x=right",
+   "id3": "bottom-left x=right",
+   "ippe0": "T_cam_marker_alt",
+   "ippe3": "T_cam_marker_alt",
+   "dt_mm": 52.17970209039281,
+   "drot_deg": 7.453662889536648
+  },
+  {
+   "id0": "top-left x=left",
+   "id3": "top-right x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 57.12709028403225,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "top-left x=left",
+   "id3": "bottom-right x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 57.288723293200846,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "bottom-right x=right",
+   "id3": "bottom-right x=right",
+   "ippe0": "T_cam_marker_alt",
+   "ippe3": "T_cam_marker_alt",
+   "dt_mm": 53.019387038848436,
+   "drot_deg": 7.453662889536648
+  },
+  {
+   "id0": "top-right x=left",
+   "id3": "top-left x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 61.6267916466315,
+   "drot_deg": 2.6866881578980024
+  },
+  {
+   "id0": "top-right x=left",
+   "id3": "bottom-left x=left",
+   "ippe0": "T_cam_marker",
+   "ippe3": "T_cam_marker",
+   "dt_mm": 61.79022237821712,
+   "drot_deg": 2.6866881578980024
+  }
+ ]
+}
