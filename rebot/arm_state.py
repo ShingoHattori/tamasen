@@ -244,7 +244,7 @@ class ArmService:
         self.last_vals, self.last_change = {}, {}
         self.control = {"state": "read_only", "message": "", "engaged_at": None, "q_engage": None,
                         "motion": None, "last_heartbeat": 0.0}
-        self.log_path = HERE.parent / "run" / "arm_commands.log"
+        self.log_path = HERE.parent / "run" / ("arm_commands_fake.log" if args.fake else "arm_commands.log")
         self.log_path.parent.mkdir(exist_ok=True)
         self.notes = [
             "読み取り専用の間に送信するのは Damiao のフィードバック要求（0x7FF, 0xCC）だけ。",
@@ -260,7 +260,8 @@ class ArmService:
     def submit(self, cmd: str, src: str, **kw) -> dict:
         if not self.args.allow_motion:
             return {"ok": False, "message": "このプロセスは読み取り専用で起動されている（--allow-motion なし）。実機操作は受け付けない。"}
-        self.audit(f"{cmd} {json.dumps(kw, ensure_ascii=False)}", src)
+        if cmd != "heartbeat":
+            self.audit(f"{cmd} {json.dumps({k: v for k, v in kw.items() if k != 'path'} | ({'path': kw['path']['label']} if 'path' in kw else {}), ensure_ascii=False)}", src)
         if cmd == "heartbeat":
             self.control["last_heartbeat"] = time.monotonic()
             return {"ok": True}
