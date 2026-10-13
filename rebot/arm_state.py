@@ -62,7 +62,11 @@ CORRIDOR_M = 0.020          # m, end_link deviation (FK) that stops the motion
 LAG_FREE, LAG_STOP = 0.01, 0.04   # rad: plan runs at full speed below LAG_FREE lag, stops at LAG_STOP
 STALL_S = 2.0               # s the plan may stand still before it is a fault
 CAN_LOSS_S = 0.3            # s without fresh feedback while engaged = CAN / bus fault
-ENGAGE_GRACE_S = 0.5        # after enabling, status 0x1 must be reported within this time
+ENGAGE_GRACE_S = 0.5
+# Motor-internal POS_VEL gains that differ from the SDK yaml (written at engage). joint6 (light wrist
+# roll) hunted ~0.0008 rad with torque cycling 0 -> 0.1 Nm under a constant command (2026-10-13): the
+# motor's own position integral; drop it there.
+PV_OVERRIDE = {"joint6": {"pos_ki": 0.0}}        # after enabling, status 0x1 must be reported within this time
 FAULT_POLICY = {
     "ページ切断（生存確認なし）": "移動中なら停止し、その場で保持（トルクは維持）。保持中はそのまま保持。",
     "サービス終了要求（SIGTERM）": "有効中は 1 回目を拒否し記録。5 s 以内の 2 回目で終了 — その場合モーターは最後の指令を保持したまま有効で残る"
@@ -135,7 +139,7 @@ class Bus:
         self._check()
         by = {j["name"]: j for j in self.joints}
         for n in names:
-            m, pv = self._m[n], by[n]["pv"]
+            m, pv = self._m[n], dict(by[n]["pv"], **PV_OVERRIDE.get(n, {}))
             for reg, key in ((25, "vel_kp"), (26, "vel_ki"), (27, "pos_kp"), (28, "pos_ki")):
                 if key in pv:
                     m.write_register_f32(reg, pv[key])
@@ -368,7 +372,7 @@ class ArmService:
                       "limits": {"vmax_rad_s": VMAX, "corridor_rad": CORRIDOR_RAD, "corridor_m": CORRIDOR_M,
                                  "heartbeat_s": HEARTBEAT_S, "kp": KP.tolist(), "ki": KI.tolist(), "deadband_rad": DEADBAND,
                                  "can_loss_s": CAN_LOSS_S},
-                      "motor_params": self.motor_params,
+                      "motor_params": self.motor_params, "pv_override": PV_OVERRIDE,
                       "compensation": {
                           "joint_feedback": "関節角（エンコーダ）の追従補正: 有効中は常時（joint1-3 強め、joint4-5 弱め、joint6 なし、不感帯 0.003 rad）。モーター軸の角度を計画に合わせるだけ。",
                           "visual_tcp_correction": "視覚（ID 1）による手先誤差補正: 未実装（camera↔base と 手先リンク↔ID 1 の校正後に検討）。",
