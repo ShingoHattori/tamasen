@@ -1,0 +1,31 @@
+# Damiao arm parameters export (TSV)
+# vendor: damiao
+# joints: 1, 2, 3, 4, 5, 6, 7
+# writable params: 21
+# cell values: numeric | "ERR" (read failed) | "offline" (joint offline)
+# priority: high = safety/motion/tuning-critical, review before import.
+# identity params (mstId/escId/timeout/canBr) are excluded and cannot be imported.
+# import: split each non-"#" line by tab; skip cells that are not numeric.
+
+rid	type	name	desc_zh	group	priority	J1	J2	J3	J4	J5	J6	J7
+10	u32	CTRL_MODE	控制模式	core	high	2	2	2	2	2	2	2
+24	f32	I_BW	电流环控制带宽	core	high	1000	1000	1000	1000	1000	1000	1000
+25	f32	KP_ASR	速度环 Kp	core	high	0.0038399999029934406	0.0038399999029934406	0.0038399999029934406	0.003719999920576811	0.003719999920576811	0.003719999920576811	0.003719999920576811
+26	f32	KI_ASR	速度环 Ki	core	high	0.0020000000949949026	0.0020000000949949026	0.0020000000949949026	0.0020000000949949026	0.0020000000949949026	0.0020000000949949026	0.0020000000949949026
+27	f32	KP_APR	位置环 Kp	core	high	54	54	54	54	54	54	54
+28	f32	KI_APR	位置环 Ki	core	high	0	0	0	0	0	0	0
+0	f32	UV_Value	低压保护值	limits	high	15	15	15	15	15	15	15
+2	f32	OT_Value	过温保护值	limits	high	100	100	100	100	100	100	100
+3	f32	OC_Value	过流保护值	limits	high	0.800000011920929	0.800000011920929	0.800000011920929	0.800000011920929	0.800000011920929	0.800000011920929	0.800000011920929
+6	f32	MAX_SPD	最大速度	limits	high	600	600	600	600	600	600	600
+21	f32	PMAX	位置映射范围	limits	high	12.5	12.5	12.5	12.5	12.5	12.5	12.5
+22	f32	VMAX	速度映射范围	limits	high	10	10	10	30	30	30	30
+23	f32	TMAX	扭矩映射范围	limits	high	28	28	28	10	10	10	10
+4	f32	ACC	加速度	advanced	normal	2	2	2	2	2	2	2
+5	f32	DEC	减速度	advanced	normal	-2	-2	-2	-2	-2	-2	-2
+29	f32	OV_Value	过压保护值	advanced	normal	32	32	32	32	32	32	32
+30	f32	GREF	齿轮力矩效率	advanced	normal	1	1	1	1	1	1	1
+31	f32	Deta	速度环阻尼系数	advanced	normal	4	4	4	4	4	4	4
+32	f32	V_BW	速度环滤波带宽	advanced	normal	40	40	40	40	40	40	40
+33	f32	IQ_c1	电流环增强系数	advanced	normal	2500	2500	2500	2500	2500	2500	2500
+34	f32	VL_c1	速度环增强系数	advanced	normal	500	500	500	500	500	500	500

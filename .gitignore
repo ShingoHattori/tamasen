@@ -1,0 +1,9 @@
+# OS / editor
+.DS_Store
+__pycache__/
+*.pyc
+
+# Python virtual environments (rebuild from pyproject.toml / requirements.txt / uv.lock)
+.venv/
+rebot/rebot/
+oak/venv.tar.gz
