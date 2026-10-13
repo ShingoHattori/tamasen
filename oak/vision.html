@@ -1,0 +1,175 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>marker / block check</title>
+<style>
+ :root { color-scheme: dark; }
+ body { margin:0; background:#111; color:#eee; font:13px/1.5 system-ui,sans-serif; }
+ main { display:grid; grid-template-columns: 1fr 1fr; gap:10px; padding:10px; }
+ img, #view { width:100%; aspect-ratio: 4/3; border-radius:6px; background:#000; display:block; }
+ section { background:#1b1b1b; border-radius:6px; padding:8px 12px; }
+ h2 { font-size:14px; margin:4px 0; }
+ table { border-collapse:collapse; width:100%; }
+ td, th { padding:2px 6px; border-bottom:1px solid #333; text-align:right; white-space:nowrap; }
+ td:first-child, th:first-child { text-align:left; }
+ .warn { color:#fc6; } .bad { color:#f77; } .ok { color:#7d7; } .dim { color:#888; }
+ code { color:#9cf; }
+ ul { margin:4px 0; padding-left:18px; }
+ .legend span { margin-right:12px; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+               "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/" } }
+</script>
+</head><body>
+<main>
+ <div><img src="/stream.mjpg" alt="live">
+  <div class="legend dim">四隅の黄色 = corner 0（印刷時の左上）/ 軸 赤 x・緑 y・青 z / 投影ブロック: <span style="color:#0ff">ID 0 から</span><span style="color:#f0f">ID 3 から</span></div></div>
+ <div><div id="view"></div>
+  <div class="legend dim">カメラ座標系（原点 = カラーカメラ、白い四角錐 = 視野）。ドラッグで回転・ホイールで拡大。
+   <span style="color:#0ff">■ ID 0 からのブロック</span><span style="color:#f0f">■ ID 3 からのブロック</span><span style="color:#fa0">■ 観測マーカー</span><span style="color:#888">破線 = サイズ未登録（深度からの仮スケール）</span></div></div>
+ <section><h2>マーカー</h2><div id="markers"></div><h2>ID 0 / ID 3 によるブロック姿勢の比較</h2><div id="compare"></div><h2>グリッパー (ID 1)</h2><div id="grip"></div></section>
+ <section><h2>未登録・未校正の項目</h2><div id="missing"></div><h2>カメラ内部パラメータ</h2><div id="intr"></div>
+  <h2>座標系</h2><div class="dim">表示はすべてカメラ座標系。作業台・アーム台座の座標は未校正のため表示・変換していない。</div></section>
+</main>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const el = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+el.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a0a);
+const cam = new THREE.PerspectiveCamera(50, 4 / 3, 1, 20000);
+cam.up.set(0, -1, 0);                       // OpenCV y points down
+cam.position.set(500, -400, -400);
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.target.set(0, 0, 400);
+controls.update();
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2); sun.position.set(0, -500, -300); scene.add(sun);
+scene.add(new THREE.AxesHelper(80));
+
+function resize() {
+  const w = el.clientWidth, h = el.clientHeight;
+  renderer.setSize(w, h, false); renderer.domElement.style.width = "100%"; renderer.domElement.style.height = "100%";
+  cam.aspect = w / h; cam.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(el); resize();
+
+const dyn = new THREE.Group(); scene.add(dyn);
+let frustum = null;
+
+const mat4 = (rows) => new THREE.Matrix4().set(...rows.flat());
+
+function frustumFrom(K, size) {
+  const z = 150, [w, h] = size, fx = K[0][0], fy = K[1][1], cx = K[0][2], cy = K[1][2];
+  const c = [[0, 0], [w, 0], [w, h], [0, h]].map(([u, v]) => new THREE.Vector3((u - cx) / fx * z, (v - cy) / fy * z, z));
+  const o = new THREE.Vector3();
+  const pts = [o, c[0], o, c[1], o, c[2], o, c[3], c[0], c[1], c[1], c[2], c[2], c[3], c[3], c[0]];
+  return new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0xffffff }));
+}
+
+function square(size, color, dashed) {
+  const h = size / 2, p = [[-h, h], [h, h], [h, -h], [-h, -h], [-h, h]].map(([x, y]) => new THREE.Vector3(x, y, 0));
+  const geo = new THREE.BufferGeometry().setFromPoints(p);
+  const line = dashed ? new THREE.Line(geo, new THREE.LineDashedMaterial({ color, dashSize: size / 10, gapSize: size / 10 }))
+                      : new THREE.Line(geo, new THREE.LineBasicMaterial({ color }));
+  if (dashed) line.computeLineDistances();
+  const g = new THREE.Group(); g.add(line);
+  if (!dashed) g.add(new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.25, side: THREE.DoubleSide })));
+  const ax = new THREE.AxesHelper(size * 0.7); g.add(ax);
+  // corner 0 (TL) marker, same as the yellow dot in the video
+  const dot = new THREE.Mesh(new THREE.SphereGeometry(Math.max(size * 0.06, 1)), new THREE.MeshBasicMaterial({ color: 0xffff00 }));
+  dot.position.set(-h, h, 0); g.add(dot);
+  return g;
+}
+
+function block(size, color, mounts, sizes) {
+  const g = new THREE.Group();
+  const geo = new THREE.BoxGeometry(...size);
+  g.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color, transparent: true, opacity: 0.18, depthWrite: false })));
+  g.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color })));
+  g.add(new THREE.AxesHelper(45));
+  for (const [id, T] of Object.entries(mounts)) {            // registered marker positions on the block
+    const s = square(sizes[id], 0xffffff, false);
+    s.matrixAutoUpdate = false; s.matrix.copy(mat4(T)); g.add(s);
+  }
+  return g;
+}
+
+const COLORS = { "0": 0x00ffff, "3": 0xff00ff };
+const f = (v, d = 1) => v == null ? "—" : Number(v).toFixed(d);
+let fitted = false;
+
+function update(s) {
+  if (!s.markers) return;
+  if (!frustum && s.intrinsics && s.intrinsics.K) { frustum = frustumFrom(s.intrinsics.K, s.intrinsics.image); scene.add(frustum); }
+  dyn.clear();
+  for (const m of s.markers) {
+    if (!m.T) continue;
+    const g = square(m.size_mm, m.role === "gripper" ? 0x66ff66 : 0xffaa00, m.provisional);
+    g.matrixAutoUpdate = false; g.matrix.copy(mat4(m.T)); dyn.add(g);
+  }
+  const blockMounts = Object.fromEntries(Object.entries(s.mounts).filter(([id]) => id !== "1"));
+  for (const [id, T] of Object.entries(s.block)) {
+    const g = block(s.block_size, COLORS[id] ?? 0xcccccc, blockMounts, s.sizes);
+    g.matrixAutoUpdate = false; g.matrix.copy(mat4(T)); dyn.add(g);
+  }
+  if (!fitted) {                                              // aim the view at the first marker seen
+    const m = s.markers.find(m => m.T);
+    if (m) { controls.target.set(m.T[0][3], m.T[1][3], m.T[2][3]); controls.update(); fitted = true; }
+  }
+  renderTables(s);
+}
+
+function renderTables(s) {
+  const ids = new Set(s.markers.map(m => m.id));
+  const expect = [[3, "ブロック"], [1, "グリッパー"], [0, "ブロック"]];
+  let rows = expect.filter(([id]) => !ids.has(id)).map(([id, r]) =>
+    `<tr><td>ID ${id} <span class="dim">${r}</span></td><td colspan="8" class="dim">見えていない${id === 0 ? "（正常: 現在の置き方では見えない面）" : ""}</td></tr>`);
+  rows = s.markers.map(m => {
+    const amb = m.ambiguity > 0.6 ? `<span class="warn">${f(m.ambiguity, 2)}</span>` : f(m.ambiguity, 2);
+    const ratio = m.depth_over_pnp == null ? "—" :
+      `<span class="${Math.abs(m.depth_over_pnp - 1) < 0.05 ? "ok" : "warn"}">${f(m.depth_over_pnp, 3)}</span>`;
+    return `<tr><td>ID ${m.id} <span class="dim">${m.role}</span></td>
+      <td>${m.size_registered ? f(m.size_mm, 1) + " mm" : '<span class="warn">未登録</span>'}</td>
+      <td>${m.distance_mm == null ? "—" : f(m.distance_mm, 0) + (m.provisional ? " (仮)" : "")}</td>
+      <td>${f(m.reproj_px, 2)}</td><td>${amb}</td><td>${f(m.depth_mm, 0)}</td><td>${f(m.pnp_z_mm, 0)}</td><td>${ratio}</td>
+      <td>${f(m.size_from_depth_mm, 1)}</td></tr>`;
+  }).concat(rows);
+  document.getElementById("markers").innerHTML = `<table><tr><th></th><th>実寸</th><th>距離 mm</th><th>再投影 px</th>
+    <th title="IPPE 2解の誤差比。1 に近いと面の向きが曖昧">曖昧度</th><th>ステレオ深度</th><th>PnP z</th><th>深度/PnP</th><th>深度から見た実寸</th></tr>${rows.join("")}</table>
+    <div class="dim">深度/PnP ≈ 1 なら、内部パラメータと登録した実寸が使用画像と整合。深度から見た実寸は参考値（登録値には使わない）。</div>`;
+
+  const c = s.compare_0_3;
+  document.getElementById("compare").innerHTML = c
+    ? `位置差 <b>${f(c.dt_mm, 1)} mm</b>（物体座標で ${c.dt_obj_mm.map(v => f(v, 1)).join(", ")}）、回転差 <b>${f(c.drot_deg, 2)}°</b>`
+    : `<span class="dim">ID 0 と ID 3 の両方が見えていて、両方の取り付けが登録されたときに比較する。現在の推定: ${Object.keys(s.block).map(k => "ID " + k).join(", ") || "なし"}</span>`;
+
+  const g = s.markers.find(m => m.id === 1);
+  document.getElementById("grip").innerHTML =
+    (g ? (g.T ? `観測姿勢 t = (${g.T.slice(0, 3).map(r => f(r[3], 0)).join(", ")}) mm${g.provisional ? "（仮スケール）" : ""}` : "観測中（実寸未登録・深度なしのため位置は未算出、向きは映像の軸を参照）")
+       : '<span class="dim">見えていない</span>') +
+    `<br>把持中心への変換: ${s.grip_calibrated ? '<span class="ok">校正済み</span>' : '<span class="warn">未校正</span>（把持中心は表示しない）'}`;
+
+  const miss = (s.config_error ? [`<span class="bad">${s.config_error}</span>`] : []).concat(s.missing);
+  document.getElementById("missing").innerHTML = miss.length ? `<ul>${miss.map(x => `<li>${x}</li>`).join("")}</ul>
+    <div class="dim">markers.toml に記入すると、起動中のまま反映される。</div>` : '<span class="ok">なし</span>';
+
+  const i = s.intrinsics || {};
+  document.getElementById("intr").innerHTML = i.K ? `${i.source}<br>
+    <span class="dim">${i.device}</span><br>
+    校正解像度 ${i.calibrated_at.join("×")} → センサーモード ${i.sensor_mode.join("×")} → 使用画像 ${i.image.join("×")}
+    ${i.image_matches ? '<span class="ok">（処理画像と一致）</span>' : '<span class="bad">（処理画像と不一致）</span>'}<br>
+    fx = fy = ${f(i.K[0][0], 2)}, cx = ${f(i.K[0][2], 2)}, cy = ${f(i.K[1][2], 2)}<br>
+    <span class="dim">校正値を単純に縮小した場合の fx = ${i.naive_fx}（${i.naive_fx_error_pct > 0 ? "+" : ""}${i.naive_fx_error_pct} %、使用しない）</span><br>
+    歪み: ${i.dist_model}, ${i.dist_coeffs.length} 係数` : "未取得";
+}
+
+async function poll() {
+  try { update(await (await fetch("/state.json", { cache: "no-store" })).json()); } catch (e) {}
+  setTimeout(poll, 100);
+}
+poll();
+(function loop() { renderer.render(scene, cam); requestAnimationFrame(loop); })();
+</script>
+</body></html>

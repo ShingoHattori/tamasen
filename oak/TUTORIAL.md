@@ -251,6 +251,16 @@ Each board is a single-owner USB resource. A crashed or hung Python process keep
 the next run fails to open it. If a run hangs: `pkill -f <script>.py`, then re-probe with
 `dai.Device.getAllAvailableDevices()`.
 
+### 3.15 Do not rescale the factory intrinsics to the output size — use the frame's transformation
+
+`CalibrationHandler.getCameraIntrinsics(CAM_A, w, h)` rescales the EEPROM calibration (stored at
+3840×2160 on the Lite) straight to `w×h`. The ISP does not produce frames that way: it reads a
+binned 2104×1560 sensor mode and then scales and crops. On the OAK-D-Lite this gives fx = 989 for a
+1280×960 request, while the frame really has fx = **913** — an 8 % error in every distance
+(10 % at 1280×720: 989 vs 903). `imgFrame.getTransformation().getIntrinsicMatrix()` carries the
+real chain; `vision.py` uses it and shows both values on its page. Cross-check: stereo depth at a
+marker divided by the PnP distance should be ≈ 1.
+
 ---
 
 ## 4. Environment / shell gotchas on this machine
@@ -273,6 +283,8 @@ the next run fails to open it. If a run hangs: `pkill -f <script>.py`, then re-p
 | Path | What |
 |---|---|
 | `oak.py` | CLI: `list` / `serve` (browser streaming) |
+| `vision.py`, `vision.html` | ArUco block / gripper check: annotated video + 3D view (camera frame only) |
+| `pose.py`, `markers.toml` | marker pose, block model, measured marker mounts |
 | `oak_common.py` | device selection and per-board mono resolution |
 | `capture_still.py` | one colour + one depth still |
 | `record_video.py` | colour, depth and side-by-side mp4 |
