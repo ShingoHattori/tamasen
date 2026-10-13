@@ -78,14 +78,14 @@ reBot Arm B601-DM と OAK カメラで、ArUco マーカー付きの直方体ブ
 3. ID 1 → 把持中心の校正。
 4. 把持精度の検証（検出とは別に報告する）。
 
-## robot1 へ移すときの手順（未実施）
-1. OAK-D-Lite を robot1 の USB3 ポートへ付け替える。`lsusb | grep 03e7` で Movidius が見えることを確認する（ブート前と後で PID が変わる）。
-2. 一般ユーザーで開くための udev ルールを入れる（Luxonis の推奨）:
-   `echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"' | sudo tee /etc/udev/rules.d/80-movidius.rules && sudo udevadm control --reload-rules && sudo udevadm trigger`
-3. Python 環境: robot1 の Python は 3.12.3（pyproject は >=3.11,<3.13 なので可）。uv は未導入。
-   `cd ~/tamasen/oak && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`（`python3-venv` が無ければ apt で入れる）。
-   サーバーで `opencv-python` を import すると `libGL.so.1` が無くて失敗することがある。その場合は `opencv-python-headless`（同じ版）に替えるか、`libgl1` を入れる。
-   depthai 3.10.0 の linux x86_64 / cp312 版の wheel があるかは未確認。
-4. `python oak.py list` → `python vision.py --device 18443 --host 0.0.0.0` で起動し、手元のブラウザで `http://192.168.32.20:8090/` を開く
-   （届かなければ `ssh -L 8090:localhost:8090 win10.hpcs-sb1124.sec.llhi.org` を使う）。3D 表示は three.js を unpkg から読み込むため、**ブラウザ側に**インターネット接続が必要。
-5. Linux 上の DepthAI の挙動（TUTORIAL 3.3〜3.4 の再列挙・強制終了まわり）は Mac でしか確認していない。改めて確認する。
+## robot1 のセットアップ状況（2026-10-13）
+- [x] uv 0.13.0（`~/.local/bin`、`.bashrc` / `.profile` で PATH に追加済み）
+- [x] `oak/.venv`: Python 3.11、`requirements.txt` どおり（depthai 3.10.0 / opencv-python 5.0.0 / numpy 2.4.6）。import 確認済み（libGL の問題なし）
+- [x] `rebot/reBotArm_control_py/.venv`: `uv sync --frozen`、Python 3.10.22（pyproject が <3.12 を要求）、motorbridge 0.5.6。`rebot/teach.py` もこの venv で動く想定
+- [x] udev: `/etc/udev/rules.d/80-movidius.rules` — `SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0660", GROUP="plugdev"`（cely は plugdev 所属）
+- [ ] **OAK-D-Lite がまだ USB に出ていない**（付け替え後も `lsusb` に `03e7` が無く、dmesg にも接続ログが無い）。
+      USB3 ポートとケーブルを確認し、`lsusb | grep 03e7` で見えたら次へ進む
+- [ ] `oak/.venv/bin/python oak.py list` で開けることと `UsbSpeed.SUPER` を確認 → `oak/.venv/bin/python vision.py --device 18443 --host 0.0.0.0`
+      → 手元のブラウザで `http://192.168.32.20:8090/` を開く（届かなければ `ssh -L 8090:localhost:8090 win10.hpcs-sb1124.sec.llhi.org`）。
+      3D 表示は three.js を unpkg から読み込むため、**ブラウザ側に**インターネット接続が必要
+- [ ] Linux 上の DepthAI の挙動（TUTORIAL 3.3〜3.4 の再列挙・強制終了まわり）は Mac でしか確認していない。改めて確認する
