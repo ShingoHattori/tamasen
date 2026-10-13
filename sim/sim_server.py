@@ -523,8 +523,9 @@ class Sim:
                  # evaluation poses: different combinations, never used for fitting
                  ("xy", -22, [-0.02, 0, 0.02]), ("yz", -25, [0.03, 0.02, 0]), ("xz", 22, [0, -0.03, -0.02]), ("z", 15, [0.02, 0.03, 0.01])]
         out = []
-        for k, (axes, deg, dt) in enumerate(specs[:n_calib] + specs[10:10 + n_eval]):
-            role = "calib" if k < n_calib else "eval"
+        chosen = [(sp, "calib") for sp in specs[:n_calib]] + [(sp, "eval") for sp in specs[10:10 + n_eval]] + \
+                 [(sp, "calib") for sp in specs[14:]]
+        for k, ((axes, deg, dt), role) in enumerate(chosen):
             R = R0.copy()
             for ax in axes:
                 R = R @ planner_rot(ax, a(deg))

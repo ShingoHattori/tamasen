@@ -109,23 +109,44 @@ def _mean_T(Ts):
     return pose.rigid(U @ np.diag([1, 1, np.linalg.det(U @ Vt)]) @ Vt, t)
 
 
+# Prior on joint zero offsets: a few degrees for joint2..5; joint1 and joint6 offsets are not observable
+# (absorbed by T_cam_base and T_ee_m1), so they are pinned to 0.
+OFFSET_PRIOR = np.radians([0.01, 3.0, 3.0, 3.0, 3.0, 0.01])
+_chain = None
+
+
+def F_of(s, dq):
+    """end_link pose of a sample, re-evaluated with joint zero offsets dq (URDF FK)."""
+    global _chain
+    if dq is None or s.get("q") is None:
+        return s["F"]
+    if _chain is None:
+        import urdf_fk
+        _chain = urdf_fk.Chain()
+    return _chain(np.asarray(s["q"]) + dq)
+
+
 def residuals(p, samples):
     X = rt_to_T(p[0:3], p[3:6])
     Y = rt_to_T(p[6:9], p[9:12])
-    return np.concatenate([(project(X @ s["F"] @ Y, s["size"], s["K"], s["dist"]) - s["corners"]).ravel() / s["sigma"]
-                           for s in samples])
+    dq = p[12:18] if len(p) > 12 else None
+    r = [(project(X @ F_of(s, dq) @ Y, s["size"], s["K"], s["dist"]) - s["corners"]).ravel() / s["sigma"] for s in samples]
+    if dq is not None:
+        r.append(dq / OFFSET_PRIOR)
+    return np.concatenate(r)
 
 
-def refine(X, Y, samples, iters=60):
-    p = np.concatenate([*T_to_rt(X), *T_to_rt(Y)])
+def refine(X, Y, samples, iters=60, offsets=False, dq0=None):
+    p = np.concatenate([*T_to_rt(X), *T_to_rt(Y)] + ([np.zeros(6) if dq0 is None else dq0] if offsets else []))
+    npar = len(p)
     lam = 1e-3
     r = residuals(p, samples)
     cost = r @ r
     for _ in range(iters):
-        J = np.empty((r.size, 12))
-        for k in range(12):
-            h = 1e-6 if k % 6 < 3 else 1e-7
-            dp = np.zeros(12); dp[k] = h
+        J = np.empty((r.size, npar))
+        for k in range(npar):
+            h = 1e-6 if (k % 6 < 3 or k >= 12) else 1e-7
+            dp = np.zeros(npar); dp[k] = h
             J[:, k] = (residuals(p + dp, samples) - r) / h
         A, g = J.T @ J, J.T @ r
         while True:
@@ -139,26 +160,27 @@ def refine(X, Y, samples, iters=60):
                 break
         if np.linalg.norm(step) < 1e-10 or lam > 1e8:
             break
-    J = np.empty((r.size, 12))
-    for k in range(12):
-        h = 1e-6 if k % 6 < 3 else 1e-7
-        dp = np.zeros(12); dp[k] = h
+    J = np.empty((r.size, npar))
+    for k in range(npar):
+        h = 1e-6 if (k % 6 < 3 or k >= 12) else 1e-7
+        dp = np.zeros(npar); dp[k] = h
         J[:, k] = (residuals(p + dp, samples) - r) / h
-    dof = max(1, r.size - 12)
+    dof = max(1, r.size - npar)
     s2 = (r @ r) / dof
     try:
         cov = np.linalg.inv(J.T @ J) * s2
         sd = np.sqrt(np.diag(cov))
     except np.linalg.LinAlgError:
-        sd = np.full(12, np.nan)
-    return rt_to_T(p[0:3], p[3:6]), rt_to_T(p[6:9], p[9:12]), sd, float(np.sqrt(s2))
+        sd = np.full(npar, np.nan)
+    dq = p[12:18] if offsets else None
+    return rt_to_T(p[0:3], p[3:6]), rt_to_T(p[6:9], p[9:12]), sd, float(np.sqrt(s2)), dq
 
 
-def evaluate(X, Y, samples) -> dict:
+def evaluate(X, Y, samples, dq=None) -> dict:
     """Prediction X F Y vs observation, for samples (normally the held-out ones)."""
     rows = []
     for s in samples:
-        P = X @ s["F"] @ Y
+        P = X @ F_of(s, dq) @ Y
         px = float(np.linalg.norm(project(P, s["size"], s["K"], s["dist"]) - s["corners"], axis=1).mean())
         O = s["O"]
         rows.append({"id": s["id"], "reproj_px": px, "pos_err_mm": float(np.linalg.norm(P[:3, 3] - O[:3, 3]) * 1000),
@@ -203,12 +225,25 @@ def solve(samples) -> dict:
         res.update(ok=False, message="姿勢の回転が不足: " + res["diversity"]["message"])
         return res
     X0, Y0, e0, method = init_guess(cal)
-    X, Y, sd, rms_w = refine(X0, Y0, cal)
+    X, Y, sd, rms_w, _ = refine(X0, Y0, cal)
+    # Joint zero offsets: the real motor zeros need not match the URDF zero. Estimated together with
+    # X and Y (weak prior of a few degrees); reported, never written to the motors.
+    plain = evaluate(X, Y, cal)
+    Xo, Yo, sdo, rmso, dq = refine(X, Y, cal, offsets=True)
+    with_off = evaluate(Xo, Yo, cal, dq)
+    use_off = with_off["reproj_px_mean"] < 0.7 * plain["reproj_px_mean"]
+    res["joint_offsets"] = {"used": bool(use_off), "deg": np.degrees(dq).tolist(),
+                            "sd_deg": np.degrees(sdo[12:18]).tolist(),
+                            "fit_px_without": plain["reproj_px_mean"], "fit_px_with": with_off["reproj_px_mean"],
+                            "note": "関節零点ずれ（URDF の 0 rad に対する実機の 0 rad）。推定値の報告のみで、モーターには書き込まない"}
+    if use_off:
+        X, Y, sd, rms_w = Xo, Yo, sdo, rmso
+    dqu = dq if use_off else None
     res.update(init_method=method, init_reproj_px=e0,
                T_cam_base=X.tolist(), T_base_cam=pose.invert(X).tolist(), T_ee_m1=Y.tolist(),
                sd={"cam_base_rot_deg": np.degrees(sd[0:3]).tolist(), "cam_base_t_mm": (sd[3:6] * 1000).tolist(),
                    "ee_m1_rot_deg": np.degrees(sd[6:9]).tolist(), "ee_m1_t_mm": (sd[9:12] * 1000).tolist()},
-               weighted_rms=rms_w, fit=evaluate(X, Y, cal), holdout=evaluate(X, Y, ev))
+               weighted_rms=rms_w, fit=evaluate(X, Y, cal, dqu), holdout=evaluate(X, Y, ev, dqu))
     h = res["holdout"]
     if h["n"] == 0:
         res.update(ok=False, message="評価用（校正に使わない）サンプルがない。評価なしでは採用しない")
