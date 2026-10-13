@@ -264,6 +264,15 @@ setInterval(() => {               // dead-man: only while this page is visible a
 }, 200);
 $("engage").onclick = () => { const t = prompt("実機の 6 関節を有効化し、現在位置で保持します。アーム周辺に人・物がないことを確認して MOVE と入力"); if (t) post("/arm/api/engage", { confirm: t }); };
 $("stopArm").onclick = () => post("/arm/api/stop");
+async function simulateAndGo(target, what) {
+  const p = await post("/sim/api/check_path", { target });
+  checkedPath = p;
+  $("pathres").innerHTML = p.ok ? `<span class="ok">${esc(p.label)}: ${esc(p.message)}</span>` : `<span class="bad">${what}へ戻る経路が不可: ${esc(p.message || "")}</span>`;
+  if (!p.ok) return;
+  if (confirm(`${what}へ戻します（シミュレーション済み、所要 ${f(p.duration_s, 1)} s、最大関節変化 ${deg(p.max_step_rad, 1)}°）。経路上に物がないことを目視で確認しましたか？`))
+    post("/arm/api/execute", { path_id: p.id });
+}
+$("goZero").onclick = () => simulateAndGo("zero", "ゼロ姿勢");
 $("goHome").onclick = async () => {
   const p = await post("/sim/api/check_path", { target: "engage_pose" });
   checkedPath = p;

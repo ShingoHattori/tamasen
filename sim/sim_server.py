@@ -453,6 +453,8 @@ class Sim:
             if not p["ok"]:
                 return {"ok": False, "message": "この校正姿勢は静的チェック不合格: " + "; ".join(p["reasons"])}
             q_to, label = np.array(p["q"]), f"校正姿勢 {p['i']}（{p['role']}）{p['label']}"
+        elif target == "zero":
+            q_to, label = np.zeros(6), "ゼロ姿勢（全関節 0 rad = モーター零点の姿勢）"
         elif target == "engage_pose":
             qe = (arm.get("control") or {}).get("q_engage")
             if not qe:
