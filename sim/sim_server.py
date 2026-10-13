@@ -539,7 +539,7 @@ class Sim:
                 reasons.append(f"IK 解なし（{pe * 1000:.1f} mm / {math.degrees(re):.1f}°）")
             k_ = planner.static_contacts(m, d, ids, q, self.gap.gap0, block_away=True)
             if k_["floor"]:
-                reasons.append("床・障害物と干渉")
+                reasons.append("床・登録障害物（余裕込み）と干渉")
             if [x for x in k_["self"] if x[0] > planner.SELF_PEN_TOL]:
                 reasons.append("自己衝突")
             big = float(np.max(np.abs(np.degrees(q - q0) * ([1, 1, 1, 1, 1, 1]))))

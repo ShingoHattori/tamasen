@@ -69,13 +69,13 @@ q_rad = [0.0, -0.9, -1.4, 0.0, 0.0, 0.0]
 # ---------------------------------------------------------------------------------------------
 [[obstacle]]
 name = "camera_stand"
-note = "OAK のスタンド（映像の下端）。依頼者情報 2026-10-13: カメラ画像で見て電源ボックスの右 20 cm・下 20 cm。camera↔base 校正後に画像から台座座標へ変換して sample 登録する（高さ・脚の広がりは未測定）"
-status = "unset"
-position_m = [nan, nan, nan]
-size_m = [nan, nan, nan]
+note = "OAK のスタンド。依頼者情報 2026-10-13: カメラ画像で台座から下 40 cm・右 20 cm。画像の右 ≈ base -Y（joint1=-99° でアームが画像右・base -Y に伸びていることから）、画像の下 ≈ base -X（真上から見下ろすカメラ）として換算。向きの対応は目測（±10° 程度）。高さ 0.7 m・脚の広がり 25 cm 角は仮定"
+status = "sample"
+position_m = [-0.40, -0.20, 0.35]
+size_m = [0.25, 0.25, 0.70]
 yaw_rad = 0.0
 margin_m = 0.02
-uncertainty_m = 0.05
+uncertainty_m = 0.10
 
 [[obstacle]]
 name = "power_supply"

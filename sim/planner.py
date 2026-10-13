@@ -114,9 +114,10 @@ def static_contacts(m, d, ids: scene.Ids, q, gap: float, block_away: bool) -> di
         d.qpos[ids.block_q:ids.block_q + 7] = [10, 10, 1, 1, 0, 0, 0]
     mujoco.mj_forward(m, d)
     floor, self_, block = [], [], []
+    obst = set(ids.obstacle_geoms)
     for c in d.contact[:d.ncon]:
         b1, b2 = m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2]
-        if ids.floor_geom in (c.geom1, c.geom2):
+        if ids.floor_geom in (c.geom1, c.geom2) or c.geom1 in obst or c.geom2 in obst:   # floor or registered obstacle
             other = b2 if c.geom1 == ids.floor_geom else b1
             if other in ids.arm_bodies:
                 floor.append(-c.dist)
