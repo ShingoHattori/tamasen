@@ -664,6 +664,19 @@ def profile(q_from, q_to, dt=0.02):
 
 
 def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
+    # Obstacles are judged by distance below; in this dynamics run they must not push the arm around
+    # (a path that starts inside an inflated box would otherwise be blocked by it).
+    saved = [(g, m.geom_contype[g], m.geom_conaffinity[g]) for g in ids.obstacle_geoms]
+    for g, _, _ in saved:
+        m.geom_contype[g] = m.geom_conaffinity[g] = 0
+    try:
+        return _simulate_profile(m, ids, q_from, q_to, gap0)
+    finally:
+        for g, ct, ca in saved:
+            m.geom_contype[g], m.geom_conaffinity[g] = ct, ca
+
+
+def _simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
     lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
     d = mujoco.MjData(m)
     d.qpos[ids.arm_qadr] = q_from
