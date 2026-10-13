@@ -51,7 +51,11 @@ DAMIAO_STATUS = {0x0: "無効（トルクなし）", 0x1: "有効", 0x8: "過電
                  0xB: "MOS 過熱", 0xC: "ロータ過熱", 0xD: "通信断", 0xE: "過負荷"}
 STALE_S = 0.5
 VMAX = 0.25                 # rad/s, joint speed limit (the simulator builds the profile with the same value)
-KP, KI = 0.5, 1.0           # outer feedback loop on (plan - measured)
+# Outer feedback loop on (plan - measured), per joint. Wrist joints carry little gravity load, and
+# correcting them made joint6 hunt on the real arm (2026-10-13): lower gains on 4/5, none on 6.
+KP = np.array([0.5, 0.5, 0.5, 0.2, 0.2, 0.0])
+KI = np.array([1.0, 1.0, 1.0, 0.3, 0.3, 0.0])
+DEADBAND = 0.003            # rad: inside it the correction is frozen (no P, no integration)
 I_MAX, CORR_MAX = 0.15, 0.20   # rad, limits of the integral and of the total correction
 CORRIDOR_RAD = 0.08         # rad, per-joint deviation from the simulated plan that stops the motion
 CORRIDOR_M = 0.020          # m, end_link deviation (FK) that stops the motion
@@ -359,10 +363,11 @@ class ArmService:
                       "control": {k: v for k, v in c.items() if k not in ("last_heartbeat",)} | {
                           "heartbeat_age_s": (time.monotonic() - c["last_heartbeat"]) if c["last_heartbeat"] else None},
                       "limits": {"vmax_rad_s": VMAX, "corridor_rad": CORRIDOR_RAD, "corridor_m": CORRIDOR_M,
-                                 "heartbeat_s": HEARTBEAT_S, "kp": KP, "ki": KI, "can_loss_s": CAN_LOSS_S},
+                                 "heartbeat_s": HEARTBEAT_S, "kp": KP.tolist(), "ki": KI.tolist(), "deadband_rad": DEADBAND,
+                                 "can_loss_s": CAN_LOSS_S},
                       "motor_params": self.motor_params,
                       "compensation": {
-                          "joint_feedback": "関節角（エンコーダ）の追従補正: 有効中は常時。モーター軸の角度を計画に合わせるだけ。",
+                          "joint_feedback": "関節角（エンコーダ）の追従補正: 有効中は常時（joint1-3 強め、joint4-5 弱め、joint6 なし、不感帯 0.003 rad）。モーター軸の角度を計画に合わせるだけ。",
                           "visual_tcp_correction": "視覚（ID 1）による手先誤差補正: 未実装（camera↔base と 手先リンク↔ID 1 の校正後に検討）。",
                           "deflection": "リンク・減速機・取り付けのたわみ: 補償していない（関節角が計画どおりでも手先はずれ得る）。"},
                       "faults_policy": FAULT_POLICY,
@@ -432,8 +437,10 @@ class ArmService:
             qp = np.array([c["hold_q"][n] for n in ARM])
         e = qp - qm
         fb = c.setdefault("fb", {"I": [0.0] * 6, "max_err": 0.0, "max_tcp_dev": 0.0})
-        I = np.clip(np.array(fb["I"]) + KI * e * dt, -I_MAX, I_MAX)
-        q_cmd = qp + np.clip(KP * e + I, -CORR_MAX, CORR_MAX)
+        active = np.abs(e) > DEADBAND
+        e_ctl = np.where(active, e - np.sign(e) * DEADBAND, 0.0)
+        I = np.clip(np.array(fb["I"]) + KI * e_ctl * dt, -I_MAX, I_MAX)
+        q_cmd = qp + np.clip(KP * e_ctl + I, -CORR_MAX, CORR_MAX)
         tcp_dev = self._tcp_dev(qp, qm)
         fb.update(I=I.tolist(), err=e.tolist(), err_max_now=float(np.max(np.abs(e))), tcp_dev=tcp_dev,
                   max_err=max(fb["max_err"], float(np.max(np.abs(e)))),

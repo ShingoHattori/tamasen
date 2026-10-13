@@ -426,7 +426,9 @@ def main() -> int:
                    "T_cam_world": None if not cap["world"] else np.mean(cap["world"], axis=0).tolist()}
             with f.open("a") as fh:
                 fh.write(json.dumps(rec) + "\n")
-            return {"ok": True, "message": f"サンプル {idx}（{role}）を記録: ID 1 {len(cap['corners'])} フレーム、角点の揺れ {cstd:.3f} px",
+            warn = (f"。角点の揺れが {cstd:.2f} px と大きい（> 0.5 px）: 記録中にグリッパーが揺れていた可能性。取り直し推奨"
+                    if cstd > 0.5 else "")
+            return {"ok": cstd <= 0.5, "message": f"サンプル {idx}（{role}）を記録: ID 1 {len(cap['corners'])} フレーム、角点の揺れ {cstd:.3f} px" + warn,
                     "id": idx}
         if cmd == "jig_mode":
             vision.jig_mode = bool(body.get("on"))

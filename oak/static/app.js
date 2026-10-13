@@ -253,7 +253,7 @@ function renderCtl(a) {
     ${c.fault ? `<br><b class="bad">異常: ${esc(c.fault)}</b>` : ""}
     ${c.fb ? `<br>計画との偏差（フィードバック補正後）: 現在 ${f(c.fb.err_max_now, 3)} rad / 手先 ${mm(c.fb.tcp_dev, 1)} mm、
       最大 ${f(c.fb.max_err, 3)} rad / ${mm(c.fb.max_tcp_dev, 1)} mm、補正の積分項 ${(c.fb.I || []).map(v => f(v, 3)).join(", ")} rad` : ""}
-    <br><span class="dim">速度上限 ${a.limits.vmax_rad_s} rad/s。有効中（移動・保持とも）は常に 計画−実測 の PI 補正（Kp ${a.limits.kp}, Ki ${a.limits.ki}）。
+    <br><span class="dim">速度上限 ${a.limits.vmax_rad_s} rad/s。有効中（移動・保持とも）は常に 計画−実測 の PI 補正（Kp ${a.limits.kp.join("/")}, Ki ${a.limits.ki.join("/")}, 不感帯 ${a.limits.deadband_rad} rad）。
       偏差 ${a.limits.corridor_rad} rad / 手先 ${mm(a.limits.corridor_m, 0)} mm を超えたら停止。生存確認 ${a.limits.heartbeat_s} s</span>`;
   const fresh = checkedPath && checkedPath.ok && (Date.now() / 1000 - checkedPath.checked_at) < 120;
   $("execPath").disabled = !(fresh && c.state === "holding" && !c.fault);
@@ -398,7 +398,8 @@ function renderPoses(cp) {
   document.querySelectorAll("[data-calcap]").forEach(b => b.onclick = async () => {
     $("heMsg").innerHTML = `<span class="info">姿勢 ${b.dataset.calcap} を記録中（約 3 秒、動かさないで）…</span>`;
     const r = await post("/api/handeye/capture", { session: $("heSession").value, role: b.dataset.role, label: "pose " + b.dataset.calcap + " " + b.dataset.label });
-    $("heMsg").innerHTML = r.ok ? `<span class="ok">✔ ${esc(r.message)}</span>` : `<span class="bad">✘ 記録失敗: ${esc(r.message || "")}</span>`;
+    $("heMsg").innerHTML = r.ok ? `<span class="ok">✔ ${esc(r.message)}</span>` :
+      (r.id != null ? `<span class="warn">△ ${esc(r.message)}</span>` : `<span class="bad">✘ 記録失敗: ${esc(r.message || "")}</span>`);
     lastPoses = null; loadHE();
   });
 }
@@ -415,7 +416,7 @@ async function loadHE() {
     $("heSamples").innerHTML = `<b>記録済みサンプル: 校正用 ${nc} 個（6 個以上必要）、評価用 ${ne} 個（1 個以上必要）</b>` + (list.length ?
       `<table><tr><th>#</th><th class="l">用途</th><th class="l">姿勢</th><th>ID 1 検出</th><th>角点の揺れ px</th><th class="l">時刻</th></tr>` +
       list.map(x => `<tr><td>${x.id}</td><td class="l">${x.role === "eval" ? "評価用" : "校正用"}</td><td class="l">${esc(x.label)}</td>
-        <td>${x.n_frames} フレーム</td><td>${f(x.corner_std_px, 3)}</td><td class="l">${esc(x.time)}</td></tr>`).join("") + "</table>" : "");
+        <td>${x.n_frames} フレーム</td><td class="${x.corner_std_px > 0.5 ? "warn" : ""}">${f(x.corner_std_px, 3)}${x.corner_std_px > 0.5 ? "（揺れ大）" : ""}</td><td class="l">${esc(x.time)}</td></tr>`).join("") + "</table>" : "");
     $("heResult").innerHTML = `サンプル ${cur ? cur.samples : 0} 個` + (res ? `<br>結果: <b class="${res.ok ? "ok" : "bad"}">${esc(res.message || "")}</b>
       （校正 ${res.n_calib}、評価 ${res.n_eval}）<br>回転の多様性: ${esc(res.diversity ? res.diversity.message : "")}
       ${res.holdout && res.holdout.n ? `<br>評価用姿勢: 再投影 平均 ${f(res.holdout.reproj_px_mean)} / 最大 ${f(res.holdout.reproj_px_max)} px、位置 中央値 ${f(res.holdout.pos_err_mm_median, 1)} mm（画像面内 ${f(res.holdout.lateral_err_mm_median, 1)} mm）、
