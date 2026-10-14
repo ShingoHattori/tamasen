@@ -25,6 +25,12 @@ declare -A PY=([vision]="$ROOT/oak/.venv/bin/python" [arm]="$ROOT/rebot/reBotArm
 declare -A SCRIPT=([vision]="vision.py" [arm]="arm_state.py" [sim]="sim_server.py")
 declare -A ARGS=([vision]="${VISION_ARGS:---device 18443 --host 0.0.0.0 --allow-from 127.0.0.1/32,192.168.32.0/24}" [arm]="${ARM_ARGS:---port /dev/ttyACM0}" [sim]="${SIM_ARGS:-}")
 declare -A PORT=([vision]=8090 [arm]=8091 [sim]=8092)
+# numpy's OpenBLAS starts one busy thread per core (24) for every matrix call; the simulator's grasp
+# planning / pose generation then took all cores and the arm service missed its 50 Hz feedback for
+# 0.3-0.8 s (CAN-loss faults, 2026-10-14, each time sim or vision was busy). Few BLAS threads for all,
+# and vision / sim at a lower priority than the arm service.
+declare -A THREADS=([vision]=2 [arm]=1 [sim]=2)
+declare -A NICE=([vision]=5 [arm]=0 [sim]=5)
 
 alive() { [ -f "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
 
@@ -33,7 +39,8 @@ start() {
   if alive "$s"; then echo "$s: already running (pid $(cat "$RUN/$s.pid"))"; return; fi
   cd "${DIR[$s]}" || return 1
   # shellcheck disable=SC2086
-  MUJOCO_GL=egl setsid "${PY[$s]}" -u "${SCRIPT[$s]}" ${ARGS[$s]} >"$RUN/$s.log" 2>&1 &
+  MUJOCO_GL=egl OMP_NUM_THREADS=${THREADS[$s]} OPENBLAS_NUM_THREADS=${THREADS[$s]} MKL_NUM_THREADS=${THREADS[$s]} \
+    setsid nice -n "${NICE[$s]}" "${PY[$s]}" -u "${SCRIPT[$s]}" ${ARGS[$s]} >"$RUN/$s.log" 2>&1 &
   echo $! >"$RUN/$s.pid"
   echo "$s: started pid $! (log: $RUN/$s.log, http://127.0.0.1:${PORT[$s]}/)"
 }
