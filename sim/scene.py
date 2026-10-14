@@ -14,11 +14,15 @@ in memory only:
   * position actuators for joint1..6 and the gripper, used only inside the simulator
   * the block: free body, box of the measured size from oak/markers.toml
   * a "grip" site midway along the finger pads, the point the planner puts on the block centre
+  * the ID 1 marker mount (scene.toml [marker_mount], design values from cad/): visual mesh, two
+    collision boxes in group 4 (they count as end_link geometry in every floor / obstacle / self /
+    block check), the 30 mm black square and a "marker1" site at its centre (x right, y up, z out)
 
 Contact bits: floor / block / jaws (contype 1, conaffinity 1); link hulls (contype 2, conaffinity 3),
 so hulls touch the floor, the block and each other (self-collision) but MuJoCo still skips
 parent-child pairs.
 """
+import json
 import math
 import tomllib
 import xml.etree.ElementTree as ET
@@ -95,7 +99,51 @@ def physics_params(s: dict) -> dict[str, Param]:
         "顎の最大開口 m": Param(j["max_gap_m"], j["max_gap_status"]),
         "グリッパー角→開口の換算": Param(f"gap = motor/{j['gripper_rad_full_open']} * max_gap", j["gripper_map_status"]),
         "関節の位置制御ゲイン（sim 内）": Param({"kp": a["kp"], "kv": a["kv"], "force": a["force_limit_nm"]}, a["status"]),
+        "ID 1 マーカー台（end_link）": _mount_param(s),
     }
+
+
+def _mount_param(s: dict) -> Param:
+    spec = marker_mount_spec(s)
+    if spec is None:
+        return Param("無効（scene.toml [marker_mount] enabled = false）", "unset")
+    c = spec["marker_centre_mm"]
+    return Param(f"マーカー中心 end_link ({c[0]:.1f}, {c[1]:.1f}, {c[2]:.1f}) mm、{spec['marker_size_mm']:g} mm、"
+                 f"厚さ {spec['thickness_mm']:g} mm（{'設計値・未製作' if spec['status'] == 'design' else spec['status']}）",
+                 spec["status"])
+
+
+def marker_mount_spec(s: dict) -> dict | None:
+    mm = s.get("marker_mount", {})
+    if not mm.get("enabled"):
+        return None
+    spec = json.loads((HERE / mm["spec"]).read_text())
+    return dict(spec, status=mm.get("status", "design"), mesh_path=str((HERE / mm["mesh"]).resolve()))
+
+
+def add_marker_mount(s: dict, asset: ET.Element, end: ET.Element) -> None:
+    """ID 1 marker mount on end_link: visual mesh, two collision boxes, the black square, a marker site."""
+    spec = marker_mount_spec(s)
+    if spec is None:
+        return
+    ET.SubElement(asset, "mesh", name="marker_mount_mesh", file=spec["mesh_path"], scale="0.001 0.001 0.001")
+    ET.SubElement(end, "geom", name="marker_mount_visual", type="mesh", mesh="marker_mount_mesh", group="2",
+                  contype="0", conaffinity="0", mass="0", rgba="0.92 0.92 0.88 1")
+    for b in spec["collision_boxes_mm"]:
+        ET.SubElement(end, "geom", name=f"marker_mount_{b['name']}_hull", type="box", group="4",
+                      pos=" ".join(f"{v * 1e-3:.6f}" for v in b["centre"]),
+                      size=" ".join(f"{v * 1e-3:.6f}" for v in b["half"]),
+                      contype="2", conaffinity="3", condim="3", mass="0", rgba="0.2 0.6 1.0 0.35")
+    c = np.array(spec["marker_centre_mm"]) * 1e-3
+    R = np.array(spec["T_end_link_marker"])[:3, :3]
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, R.astype(float).ravel())
+    h = spec["marker_size_mm"] * 1e-3 / 2
+    ET.SubElement(end, "geom", name="marker1_square_visual", type="box", group="2", contype="0", conaffinity="0",
+                  mass="0", pos=" ".join(f"{v:.6f}" for v in c + R[:, 2] * 0.0001),
+                  quat=" ".join(f"{v:.8f}" for v in quat), size=f"{h:.6f} {h:.6f} 0.0001", rgba="0.02 0.02 0.02 1")
+    ET.SubElement(end, "site", name="marker1", pos=" ".join(f"{v:.6f}" for v in c),
+                  quat=" ".join(f"{v:.8f}" for v in quat), size="0.004", rgba="1 0 1 1", group="1")
 
 
 def build_xml(s: dict) -> str:
@@ -144,6 +192,7 @@ def build_xml(s: dict) -> str:
     # grip site midway along the pads (end_link x: pads span about -0.065..0, fingertips at 0)
     end = next(b for b in root.iter("body") if b.get("name") == "end_link")
     ET.SubElement(end, "site", name="grip", pos="-0.025 0 0", size="0.006", rgba="0 1 0 1", group="1")
+    add_marker_mount(s, asset, end)
 
     # static obstacles (group 5): registered boxes only; unset ones are listed, never guessed
     for ob in usable_obstacles(s):

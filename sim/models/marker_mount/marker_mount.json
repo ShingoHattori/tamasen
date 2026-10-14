@@ -1,0 +1,97 @@
+{
+ "frame": "end_link (URDF), mm",
+ "link": "end_link",
+ "thickness_mm": 4.0,
+ "platform_mm": [
+  40.0,
+  40.0
+ ],
+ "marker_size_mm": 30.0,
+ "inner_corner_chamfer_mm": 1.0,
+ "screws": "replace KA3-12:4 and KA3-12:5 (upper back, y = +-11, z = +30) by countersunk self-tapping screws 3 x 16 mm, the same kind as KA3 (upstream BOM: Phillips tapping screw) so that they follow the existing thread in the printed rail bracket",
+ "bosses": {
+  "cone_semi_angle_deg": 45,
+  "base_dia_mm": 5.8,
+  "height_mm": 0.8,
+  "fits": "90 deg countersink dia 6.0 x 1.4 deep in 02_Slider_Bracket",
+  "radial_clearance_mm": 0.1
+ },
+ "marker_centre_mm": [
+  -87.374,
+  0.0,
+  38.24
+ ],
+ "marker_axes_in_end_link": {
+  "x": [
+   0,
+   1,
+   0
+  ],
+  "y": [
+   -1,
+   0,
+   0
+  ],
+  "z": [
+   0,
+   0,
+   1
+  ]
+ },
+ "T_end_link_marker": [
+  [
+   0,
+   -1,
+   0,
+   -87.374
+  ],
+  [
+   1,
+   0,
+   0,
+   0.0
+  ],
+  [
+   0,
+   0,
+   1,
+   38.24
+  ],
+  [
+   0,
+   0,
+   0,
+   1
+  ]
+ ],
+ "note": "design value from CAD; sticker thickness (~0.1 mm) and print tolerance not included; not built, not measured",
+ "volume_mm3": 7531.202447124605,
+ "collision_boxes_mm": [
+  {
+   "name": "platform",
+   "centre": [
+    -87.374,
+    0.0,
+    36.24
+   ],
+   "half": [
+    20.0,
+    20.0,
+    2.0
+   ]
+  },
+  {
+   "name": "tab",
+   "centre": [
+    -105.374,
+    0.0,
+    29.12
+   ],
+   "half": [
+    2.0,
+    20.0,
+    9.120000000000001
+   ]
+  }
+ ]
+}

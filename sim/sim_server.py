@@ -214,14 +214,29 @@ class Sim:
             self.fk_vs_vision = self._fk_vs_vision(vs)
 
     def _fk_vs_vision(self, vs: dict) -> str:
-        cal = self.settings["placement"]["status"] == "calibrated"
+        he = self.handeye()
+        cal = he is not None or self.settings["placement"]["status"] == "calibrated"
         g = (vs.get("config") or {}).get("markers", {}).get("1", {}).get("grip", {})
         grip_cal = g.get("status") in ("measured", "calibrated")
-        if not (cal and grip_cal):
+        if not (cal and grip_cal) or he is None:
             return ("関節角からの手先と、ID 1 の観測は別々に保持している。カメラ⇔台座"
                     + ("" if cal else "（未校正）") + "・ID 1→把持中心" + ("" if grip_cal else "（未校正）")
                     + " が揃うまで比較しない。")
-        return "校正済み: 比較は未実装（校正後に追加する）"
+        # ID 1 where the joint angles (FK, model angles incl. zero offsets) and the adopted calibration
+        # put it, vs where the camera sees it now. Only with fresh joints and an unambiguous observation.
+        m1 = next((m for m in vs.get("markers", []) if m.get("id") == 1 and m.get("status") == "ok"), None)
+        if m1 is None or self.sync_info.get("joints", "").startswith("実機の関節角なし"):
+            return "校正済み。ID 1 が ok で見えていないか関節角がないため、今は比較していない"
+        F = np.eye(4)
+        F[:3, :3], F[:3, 3] = self.d.xmat[self.ids.end_body].reshape(3, 3), self.d.xpos[self.ids.end_body]
+        P = np.array(he["T_cam_base"]) @ F @ np.array(he["T_ee_m1"])
+        O = np.array(m1["T_cam_marker"])
+        dp = (P[:3, 3] - O[:3, 3]) * 1000
+        Rd = P[:3, :3].T @ O[:3, :3]
+        ang = math.degrees(math.acos(np.clip((np.trace(Rd) - 1) / 2, -1, 1)))
+        return (f"ID 1: 関節角＋校正の予測と観測の差 {np.linalg.norm(dp):.1f} mm（画像の面内 {np.linalg.norm(dp[:2]):.1f} mm、"
+                f"奥行き {dp[2]:+.1f} mm）、向き {ang:.1f}°（校正 {he.get('session')}、採用時の評価: 位置 中央値 "
+                f"{he.get('holdout', {}).get('pos_err_mm_median', float('nan')):.1f} mm）")
 
     # ------------------------------------------------------------------ plan / trial
     def do_plan(self) -> str:
@@ -559,6 +574,170 @@ class Sim:
         return {"ok": n_ok > 0, "message": f"校正姿勢 {len(out)} 個を生成（静的チェック合格 {n_ok}）。"
                                            "各姿勢へは経路シミュレーション → 実機実行（依頼者）→ サンプル記録の順"}
 
+    def make_calib_poses_workspace(self, n: int = 8, n_eval: int = 2, tries: int = 30000) -> dict:
+        """Calibration poses spread over the workspace, chosen where ID 1 is predicted to be seen.
+
+        Random joint configurations in a broad working region (joint2 -120..-3 deg, joint3 -150..-3, joint4/5 within
+        +-100, joint1 within +-90 of the current pose; end_link 12-45 cm from the base axis and >= 6 cm high; the
+        full joint ranges produced folded-over and behind-the-base poses); kept if the static check passes (floor / registered
+        obstacles with their margins, self-collision, end_link >= 5 cm above the floor) and the ID 1 marker,
+        placed with the latest hand-eye estimate (T_cam_base, T_ee_m1 from oak/calib/handeye/<newest>/result.json,
+        used for this prediction even if not adopted) and the camera intrinsics from the vision service,
+        projects fully inside the image (60 px margin), at least 30 px a side, facing the camera within 50 deg.
+        From those, n are taken that differ most in end_link orientation (what the calibration needs) and in arm
+        configuration (joints 2-5, for the joint zero offsets) -- farthest-point on a combined distance -- and
+        ordered as a short tour from the current pose; no step changes a joint by more than CALIB_STEP_MAX_DEG
+        (bridging candidates are inserted only where needed). Occlusion by the arm itself is not predicted. Paths are simulated before execution as usual.
+        """
+        arm = fetch(self.args.arm_url + "/state.json")
+        if not arm.get("ok"):
+            return {"ok": False, "message": "実機の関節角が読めない"}
+        q0 = np.array([j["pos"] for j in arm["joints"][:6]])
+        vs = fetch(self.args.vision_url + "/state.json")
+        intr = (vs or {}).get("intrinsics") or {}
+        if not intr.get("K"):
+            return {"ok": False, "message": "カメラの内部パラメータが読めない（vision）"}
+        K, dist = np.array(intr["K"]), np.array(intr.get("dist_coeffs") or np.zeros(5))
+        W, H = intr["image"]
+        root = HERE.parent / "oak" / "calib" / "handeye"
+        res = None
+        for dd in sorted([x for x in root.iterdir() if x.is_dir()], reverse=True) if root.exists() else []:
+            f = dd / "result.json"
+            if f.exists():
+                r = json.loads(f.read_text())
+                if r.get("T_cam_base") and r.get("T_ee_m1"):
+                    res, src = r, f"{dd.name}/result.json（{'採用条件を満たす' if r.get('ok') else '未採用'}の推定、見え方の予測だけに使う）"
+                    break
+        if res is None:
+            return {"ok": False, "message": "hand-eye の推定結果がない（先に既存の方法でサンプルを集めて「解く」）"}
+        X, Y = np.array(res["T_cam_base"]), np.array(res["T_ee_m1"])
+        cam_base = np.linalg.inv(X)[:3, 3]                 # camera position in the base frame (not a registered obstacle)
+        size = (self.settings.get("_marker1_size_m") or 0.03)
+        h = size / 2
+        corners_m = np.array([[-h, h, 0, 1], [h, h, 0, 1], [h, -h, 0, 1], [-h, -h, 0, 1]], float)
+        m, ids = self.m, self.ids
+        d = mujoco.MjData(m)
+        r_ = np.radians
+        lo = np.maximum(ids.arm_range[:, 0], [q0[0] - r_(90), r_(-120), r_(-150), r_(-100), r_(-100), ids.arm_range[5, 0]])
+        hi = np.minimum(ids.arm_range[:, 1], [q0[0] + r_(90), r_(-3), r_(-3), r_(100), r_(100), ids.arm_range[5, 1]])
+        rng = np.random.default_rng(int(time.time()))
+        cands = []
+        for _ in range(tries):
+            q = rng.uniform(lo, hi)
+            d.qpos[ids.arm_qadr] = q
+            mujoco.mj_kinematics(m, d)
+            p_end = d.xpos[ids.end_body]
+            if not (p_end[2] >= 0.06 and 0.12 <= math.hypot(p_end[0], p_end[1]) <= 0.45):
+                continue
+            if np.linalg.norm(p_end - cam_base) < CAM_CLEAR_M:       # keep the hand away from the camera itself
+                continue
+            F = np.eye(4)
+            F[:3, :3], F[:3, 3] = d.xmat[ids.end_body].reshape(3, 3), p_end
+            P = X @ F @ Y                                   # marker in the camera frame
+            if P[2, 3] < CAM_CLEAR_M:
+                continue
+            to_cam = -P[:3, 3] / np.linalg.norm(P[:3, 3])
+            facing = float(np.degrees(np.arccos(np.clip(P[:3, 2] @ to_cam, -1, 1))))
+            if facing > 55:
+                continue
+            c = (P @ corners_m.T).T[:, :3]
+            uv, _ = cv2.projectPoints(c, np.zeros(3), np.zeros(3), K, dist)
+            uv = uv.reshape(-1, 2)
+            side = float(np.mean(np.linalg.norm(uv - np.roll(uv, 1, axis=0), axis=1)))
+            if side < 28 or uv[:, 0].min() < 60 or uv[:, 1].min() < 60 or uv[:, 0].max() > W - 60 or uv[:, 1].max() > H - 60:
+                continue
+            k_ = planner.static_contacts(m, d, ids, q, self.gap.gap0, block_away=True)
+            if k_["floor"] or [x for x in k_["self"] if x[0] > planner.SELF_PEN_TOL]:
+                continue
+            cands.append((q, uv.mean(0), side, facing, F[:3, :3].copy()))
+        if len(cands) < n:
+            return {"ok": False, "message": f"条件を満たす姿勢が {len(cands)} 個しかない（{tries} 個から）。アームをカメラの視野の中ほどに動かしてから生成し直す"}
+        Q = np.array([c[0] for c in cands])
+        Rs = np.array([c[4] for c in cands])
+        w = np.array([1, 1, 1, 1, 1, 0.3])                  # joint6 matters less for diversity (tour distance)
+        wj = np.array([0, 0.5, 0.5, 0.5, 0.5, 0])           # arm configuration part of the selection distance
+
+        def dist(i):                                        # end_link rotation angle + configuration (rad)
+            tr = np.einsum("nij,ij->n", Rs, Rs[i])          # trace(R_n^T R_i)
+            ang = np.arccos(np.clip((tr - 1) / 2, -1, 1))
+            return np.sqrt(ang ** 2 + np.sum(((Q - Q[i]) * wj) ** 2, axis=1))
+        chosen = [int(np.argmin(np.linalg.norm((Q - q0) * w, axis=1)))]
+        dmin = dist(chosen[0])
+        while len(chosen) < n:
+            i = int(np.argmax(dmin))
+            chosen.append(i)
+            dmin = np.minimum(dmin, dist(i))
+        # Tour from the current pose. Every move (straight joint-space line, as executed) is checked here
+        # kinematically: floor clearance >= FLOOR_CLEARANCE + 10 mm, registered obstacles, self-collision.
+        # (Only the poses were checked before; the move to one dipped to 7.5 mm above the table.)
+        env = [ids.floor_geom] + list(ids.obstacle_geoms)
+        base = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+        arm_g = [g for g in range(m.ngeom) if m.geom_bodyid[g] in ids.arm_bodies and m.geom_bodyid[g] != base
+                 and (m.geom_contype[g] | m.geom_conaffinity[g])]
+        edge_cache = {}
+
+        def move_ok(qa, qb, key):
+            if key in edge_cache:
+                return edge_cache[key]
+            nstep = max(8, int(np.max(np.abs(qb - qa)) / math.radians(3)))
+            ok = True
+            for t in np.linspace(0, 1, nstep + 1)[1:]:
+                d.qpos[ids.arm_qadr] = qa + (qb - qa) * t
+                mujoco.mj_kinematics(m, d)
+                mujoco.mj_collision(m, d)
+                if any(c.dist < -planner.SELF_PEN_TOL and m.geom_bodyid[c.geom1] in ids.arm_bodies
+                       and m.geom_bodyid[c.geom2] in ids.arm_bodies for c in d.contact[:d.ncon]):
+                    ok = False; break
+                for g in arm_g:
+                    if mujoco.mj_geomDistance(m, d, g, ids.floor_geom, 0.05, None) < FLOOR_CLEARANCE + 0.010:
+                        ok = False; break
+                    if any(mujoco.mj_geomDistance(m, d, g, og, 0.05, None) < 0.0 for og in env[1:]):
+                        ok = False; break
+                if not ok:
+                    break
+            edge_cache[key] = ok
+            return ok
+
+        tour, cur, cur_key, left = [], q0, "start", set(chosen)
+        bridges, dropped = set(), []
+        step_max = math.radians(CALIB_STEP_MAX_DEG)
+        while left:
+            near = sorted([j for j in left if np.max(np.abs(Q[j] - cur)) <= step_max],
+                          key=lambda j: np.linalg.norm((Q[j] - cur) * w))
+            nxt = next((j for j in near if move_ok(cur, Q[j], (cur_key, j))), None)
+            if nxt is not None:
+                tour.append(nxt); left.remove(nxt); cur, cur_key = Q[nxt], nxt
+                continue
+            # no chosen pose reachable directly: a bridging candidate that is, nearest to the closest target
+            tgt = min(left, key=lambda j: np.linalg.norm((Q[j] - cur) * w))
+            bridge = sorted([j for j in range(len(Q)) if j not in tour and j not in left
+                             and np.max(np.abs(Q[j] - cur)) <= step_max],
+                            key=lambda b: np.linalg.norm((Q[b] - Q[tgt]) * w))[:15]
+            b = next((j for j in bridge if np.linalg.norm((Q[j] - Q[tgt]) * w) < np.linalg.norm((cur - Q[tgt]) * w)
+                      and move_ok(cur, Q[j], (cur_key, j))), None)
+            if b is None:                                   # unreachable from here: drop that target
+                left.remove(tgt); dropped.append(tgt)
+                continue
+            tour.append(b); bridges.add(b); cur, cur_key = Q[b], b
+        out = []
+        for k, i in enumerate(tour):
+            q, c_uv, side, facing, _ = cands[i]
+            br = i in bridges
+            out.append({"i": k, "role": "calib" if br else ("eval" if sum(o["role"] == "calib" and not o.get("bridge") for o in out) % 4 == 3
+                                                            and sum(o["role"] == "eval" for o in out) < n_eval else "calib"),
+                        "bridge": br,
+                        "label": ("（中継・記録は任意）" if br else "") + f"作業範囲 {k}: 予測 画像 ({c_uv[0]:.0f}, {c_uv[1]:.0f}) px、一辺 {side:.0f} px、向き {facing:.0f}° / 関節 "
+                                 + ", ".join(f"{math.degrees(v):.0f}" for v in q),
+                        "q": q.tolist(), "ok": True, "reasons": []})
+        with self.lock:
+            self.calib_poses = {"q0": q0.tolist(), "folded_centre_lifted": False, "poses": out, "t": time.time(),
+                                "mode": "workspace", "prediction_source": src}
+        if not out:
+            return {"ok": False, "message": "今の姿勢から安全に移動できる校正姿勢が見つからない"}
+        return {"ok": True, "message": f"作業範囲の校正姿勢 {len(out)} 個を生成（候補 {len(cands)} / {tries}、"
+                                       f"移動経路の確認で外した目標 {len(dropped)}、予測: {src}）。"
+                                       "各姿勢へは経路シミュレーション → 実機実行（依頼者）→ サンプル記録の順。自分の腕による遮蔽は予測しない"}
+
     def preview_calib(self) -> dict:
         cp = getattr(self, "calib_poses", None)
         if not cp:
@@ -646,6 +825,8 @@ class Sim:
 
 LIMIT_TOL = 0.03              # rad
 CALIB_MAX_JOINT_DEG = 60      # calibration poses must stay near the current pose (camera stand etc.)
+CALIB_STEP_MAX_DEG = 100      # workspace calibration poses: largest joint change of one move (each move is simulated)
+CAM_CLEAR_M = 0.25            # workspace calibration poses: end_link and ID 1 at least this far from the camera
 VMAX = 0.25                  # rad/s — the same profile is executed by rebot/arm_state.py
 FLOOR_CLEARANCE = 0.015      # m, every arm / jaw geom along the simulated motion
 SIM_TRACK_MAX = 0.05         # rad, the simulated arm must follow the profile this closely
@@ -754,6 +935,34 @@ CAMS = {"overview": dict(lookat=[0.2, 0.0, 0.1], distance=1.0, azimuth=135, elev
         "gripper": None}
 
 
+# Minimal stand-alone viewer (the full UI is the vision page, which proxies only the main sim on 8092).
+VIEWER_HTML = """<!doctype html><meta charset="utf-8"><title>sim viewer</title>
+<style>body{font:14px sans-serif;margin:8px;background:#222;color:#ddd}img{width:960px;cursor:grab;display:block;margin-top:6px}
+button{margin-right:4px}</style>
+<div>カメラ: <button onclick="cam('overview')">overview</button><button onclick="cam('side')">side</button>
+<button onclick="cam('gripper')">gripper</button> 表示: <button onclick="geom('visual')">visual</button>
+<button onclick="geom('collision')">collision</button><button onclick="geom('both')">both</button>
+<span id="st"></span></div>
+<img id="v" src="stream.mjpg?cam=gripper&geom=visual" draggable="false">
+<div>ドラッグ = 回転、ホイール = 距離。シミュレーター内の表示だけで、アームには何も送らない。</div>
+<script>
+let c='gripper', g='visual', az=150, el=-35, dist=0.35, drag=null;
+const v=document.getElementById('v');
+function reload(){ v.src='stream.mjpg?cam='+c+'&geom='+g+'&t='+Date.now(); }
+function cam(x){ c=x; reload(); }
+function geom(x){ g=x; reload(); }
+function send(){ fetch('api/view',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({azimuth:az,elevation:el,distance:dist})}); }
+v.onmousedown=e=>{drag=[e.clientX,e.clientY]};
+window.onmouseup=()=>{drag=null};
+window.onmousemove=e=>{ if(!drag) return; az-=(e.clientX-drag[0])*0.4; el=Math.max(-89,Math.min(89,el-(e.clientY-drag[1])*0.4));
+  drag=[e.clientX,e.clientY]; send(); };
+v.onwheel=e=>{ e.preventDefault(); dist=Math.max(0.1,Math.min(3,dist*(e.deltaY>0?1.1:0.9))); send(); };
+setInterval(async()=>{ try{ const s=await (await fetch('api/state')).json();
+  document.getElementById('st').textContent=' | '+s.sync.joints; }catch(e){} }, 2000);
+</script>"""
+
+
 class RenderLoop:
     def __init__(self, sim: Sim, w=640, h=480, fps=15) -> None:
         self.sim, self.w, self.h, self.fps = sim, w, h, fps
@@ -802,7 +1011,9 @@ class RenderLoop:
                     if c is None:
                         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
                         cam.lookat[:] = self.sim.d.site_xpos[self.sim.ids.grip_site]
-                        cam.distance, cam.azimuth, cam.elevation = 0.35, 150, -35
+                        cam.distance = v.get("distance", 0.35)
+                        cam.azimuth = v.get("azimuth", 150)
+                        cam.elevation = v.get("elevation", -35)
                     else:
                         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
                         cam.lookat[:] = c["lookat"]
@@ -873,6 +1084,14 @@ def main() -> int:
 
         def do_GET(self):
             path, _, query = self.path.partition("?")
+            if path in ("/", "/view"):
+                body = VIEWER_HTML.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path == "/api/state":
                 return self._json(sim.state())
             if path == "/stream.mjpg":
@@ -941,6 +1160,8 @@ def main() -> int:
                 sim.preview = {"traj": lp["sim_q"], "dt": lp["sim_dt"], "t0": time.monotonic()}
                 return self._json({"message": "経路のシミュレーションを再生中"})
             if path == "/api/calib_poses":
+                if body.get("mode") == "workspace":
+                    return self._json(sim.make_calib_poses_workspace())
                 return self._json(sim.make_calib_poses())
             if path == "/api/preview_calib":
                 return self._json(sim.preview_calib())

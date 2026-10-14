@@ -10,6 +10,16 @@
 #   reBotArm_ros2_DM/src/rebotarm_mujoco/models/rebotarm_b601_colored.xml（CERN-OHL-W-2.0）
 mjcf = "models/borot/rebotarm_b601_colored.xml"
 
+# ID 1 マーカー台（cad/README.md）。end_link に固定する L 字の台。寸法・取り付け変換は CAD からの設計値。
+# status: "design" 設計値（未製作）| "built" 取り付け済み（寸法は設計値のまま）| "measured" 取り付け後に実測
+# enabled = true のとき、表示（group 2）と衝突の箱（group 4、リンク凸包と同じ扱い）を end_link に足し、
+# 床・障害物・自己衝突・ブロックとの判定と経路シミュレーションに入れる。
+[marker_mount]
+enabled = true
+status = "built"        # 2026-10-14 取り付け済み（30 mm 版の ID 1）。hand-eye 推定の位置は CAD と 2 mm 以内
+mesh = "models/marker_mount/marker_mount.stl"   # end_link 座標・mm（cad/tools/marker_mount.py の粗い出力）
+spec = "models/marker_mount/marker_mount.json"  # 衝突の箱・マーカー中心と軸（同じスクリプトの出力）
+
 [block]
 mass_kg = 0.10
 mass_status = "sample"            # 未計量
@@ -73,6 +83,16 @@ note = "OAK スタンドの上部。依頼者情報 2026-10-13: スタンドの�
 status = "sample"
 position_m = [-0.40, -0.20, 0.60]
 size_m = [0.30, 0.30, 0.20]
+yaw_rad = 0.0
+margin_m = 0.02
+uncertainty_m = 0.05
+
+[[obstacle]]
+name = "camera_head"
+note = "OAK-D-Lite 本体（机の上に張り出して真下を向く）。位置は 2026-10-14 の hand-eye 推定（oak/calib/handeye/20261014/result.json、未採用・精度 5 mm 程度）のカメラ原点 base (-0.055, -0.315, 0.655) m。カメラ本体と取り付け金具を含む 20 cm 角の箱（寸法は仮定）。スタンドの柱からの張り出し部は位置不明のため未登録"
+status = "sample"
+position_m = [-0.055, -0.315, 0.655]
+size_m = [0.20, 0.20, 0.20]
 yaw_rad = 0.0
 margin_m = 0.02
 uncertainty_m = 0.05
