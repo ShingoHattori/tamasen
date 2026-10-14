@@ -113,6 +113,9 @@ function update3d(s) {
     dyn.add(place(blockMesh(cfg.block_size.value, id === "0" ? 0x00ffff : id === "3" ? 0xff00ff : 0xcccccc,
       b.status === "ok" || b.status === "pair" ? 1 : 0.4, mounts, sizes), toView.clone().multiply(m4(b.T_cam_obj))));
   }
+  const bt = s.block_table;
+  if (bt && bt.status === "on_table")
+    dyn.add(place(blockMesh(cfg.block_size.value, 0x00dd00, 1, mounts, sizes), toView.clone().multiply(m4(bt.T_cam_obj))));
   if (!fitted && frameMode === "cam") {
     const m = s.markers.find(m => m.T_cam_marker);
     if (m) { controls.target.set(m.T_cam_marker[0][3], m.T_cam_marker[1][3], m.T_cam_marker[2][3]); controls.update(); fitted = true; }
@@ -144,6 +147,10 @@ function renderBlock(s) {
   const lines = [];
   for (const [id, b] of Object.entries(s.block))
     lines.push(`ID ${id} から: <span class="${STATUS_CLASS[b.status]}">${STATUS_JA[b.status]}</span> 中心 cam ${pos(b.T_cam_obj)} / world ${pos(b.T_world_obj)} mm`);
+  const bt = s.block_table;
+  if (bt) lines.push(bt.status === "on_table"
+    ? `<b class="ok">机の面に拘束（緑）</b>: 中心 台座 ${pos(bt.T_base_obj)} mm、${esc(bt.face)}、ID ${bt.markers.join(", ")} の四隅に当てはめ（${f(bt.rms_px)} px、元の傾き ${f(bt.tilt_raw_deg, 1)}°）、静止平滑 ${bt.smoothed_frames} フレーム`
+    : `<span class="dim">机の面に拘束: なし（${esc(bt.reason || "")}）</span>`);
   const c = s.compare_0_3;
   if (c) lines.push(`<b>ID 0 と ID 3 の差</b>: 位置 ${mm(c.dt_m)} mm（物体座標 ${c.dt_obj_m.map(v => mm(v)).join(", ")}）、回転 ${deg(c.drot_rad, 2)}°
      ${c.both_ok ? '<span class="ok">（両方とも単独で ok の独立な推定）</span>' : '<span class="warn">（' + Object.entries(c.statuses).map(([k, v]) => "ID " + k + ": " + STATUS_JA[v]).join("、") + '。独立な一致の証拠にはならない）</span>'} <span class="dim">平均はしていない</span>`);

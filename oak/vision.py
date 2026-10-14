@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 
 import pose
+import table_fit
 import recorder
 import world
 from oak import Latest, Ticker, announce
@@ -178,6 +179,8 @@ class Vision:
         self.cfg_error = None
         self.detector = None
         self.observer = pose.Observer()
+        self.smoother = table_fit.Smoother()
+        self._he = (None, None)          # (mtime, T_cam_base) of calib/handeye_active.json
         self.world = world.WorldRef(world_path)
         self.lock = threading.Lock()      # guards world commands vs the processing thread
         self.capture: dict | None = None  # hand-eye sample being collected (frames of ID 1 corners)
@@ -209,6 +212,40 @@ class Vision:
         except FileNotFoundError:
             pass
 
+    def cam_base(self):
+        """T_cam_base of the adopted eye-to-hand calibration (re-read when the file changes), or None."""
+        f = HERE / "calib" / "handeye_active.json"
+        try:
+            mt = f.stat().st_mtime
+        except FileNotFoundError:
+            self._he = (None, None)
+            return None
+        if mt != self._he[0]:
+            try:
+                h = json.loads(f.read_text())
+                self._he = (mt, np.array(h["T_cam_base"]) if h.get("status") == "calibrated" else None)
+            except Exception:
+                self._he = (mt, None)
+        return self._he[1]
+
+    def table_estimate(self, obs, cfg, K, dist) -> dict:
+        """Block resting on the table: (x, y, yaw) fitted to all block-marker corners (table_fit.py)."""
+        X = self.cam_base()
+        if X is None:
+            return {"status": "none", "reason": "カメラ⇔台座の校正が採用されていない"}
+        specs = [(o, cfg.markers[o.id]) for o in obs if o.id in cfg.markers and cfg.markers[o.id].role == "block"
+                 and cfg.markers[o.id].T_obj_marker is not None and o.shown and o.T_cam_marker is not None]
+        if not specs:
+            return {"status": "none", "reason": "ブロック用マーカーが見えていない"}
+        res, why = table_fit.fit(specs, X, np.array(cfg.block_size.value), K, dist)
+        if res is None:
+            self.smoother = table_fit.Smoother()
+            return {"status": "none", "reason": why}
+        T, n = self.smoother.update(res)
+        return {"status": "on_table", "T_base_obj": T.tolist(), "T_cam_obj": (X @ T).tolist(),
+                "T_base_obj_raw": res["T_base_obj"].tolist(), "rms_px": res["rms_px"], "face": res["face"],
+                "tilt_raw_deg": res["tilt_raw_deg"], "markers": res["markers"], "smoothed_frames": n}
+
     def process(self, color, t: float, K, dist, meta: dict):
         cfg = self.cfg.with_jig() if self.jig_mode else self.cfg
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(color, cv2.COLOR_BGR2GRAY))
@@ -224,6 +261,9 @@ class Vision:
             draw_world(img, T_cam_world, K, dist, ws["mode"] == "fixed")
         for mid, (T, st) in sorted(est.items()):
             draw_block(img, T, cfg.block_size.value, K, dist, BLOCK_COLOURS.get(mid, (200, 200, 200)), st not in ("ok", "pair"))
+        btab = self.table_estimate(obs, cfg, K, dist)
+        if btab["status"] == "on_table":
+            draw_block(img, np.array(btab["T_cam_obj"]), cfg.block_size.value, K, dist, (0, 220, 0), False)
         for o in obs:
             spec = cfg.markers.get(o.id)
             draw_marker(img, o, spec.size_m if spec else None, K, dist)
@@ -257,7 +297,7 @@ class Vision:
         state = {
             "t": t, "frames": {"cam": "OpenCV カラーカメラ", "world": "ID 2 マーカー座標（暫定、Z=0 はカード表面）"},
             "config_error": self.cfg_error, "config": cfg.json(), "missing": pose.missing_report(cfg),
-            "markers": markers, "not_seen_age_s": not_seen, "world": ws, "block": block,
+            "markers": markers, "not_seen_age_s": not_seen, "world": ws, "block": block, "block_table": btab,
             "compare_0_3": cmp,
             "jig_mode": {"on": self.jig_mode, "id": None if cfg.grip_jig is None else cfg.grip_jig.id,
                          "size_m": None if cfg.grip_jig is None else cfg.grip_jig.size_m},

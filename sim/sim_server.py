@@ -120,6 +120,14 @@ class Sim:
             return None, f"観測が古い（{time.time() - vs.get('t', 0):.1f} s 前）"
         if not vs["world"]["valid"] and self.handeye() is None:
             return None, "ID 2 world が無効: " + vs["world"].get("reason", "")
+        bt = vs.get("block_table") or {}
+        he = self.handeye()
+        if bt.get("status") == "on_table" and he is not None:
+            # resting on the table: (x, y, yaw) fitted to all block-marker corners, height and tilt from the
+            # table plane (oak/table_fit.py) -- no IPPE ambiguity, smoothed while static
+            return (np.array(bt["T_base_obj"]), "observed_calibrated",
+                    f"机の面に拘束（ID {', '.join(map(str, bt['markers']))}、{bt['face']}、{bt['rms_px']:.2f} px）、校正 {he.get('session')}",
+                    False, None), None
         side = {str(mk["id"]): mk["side_px"] for mk in vs["markers"]}
         cands = [(k, b) for k, b in vs["block"].items() if b["T_world_obj"] and b["status"] in ("ok", "pair")]
         uncertain = False
