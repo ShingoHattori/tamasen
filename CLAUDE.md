@@ -25,6 +25,7 @@ reBot Arm B601-DM と OAK カメラで、ArUco マーカー付きの直方体ブ
   - `oak.py`（list / serve）、`capture_still.py`、`record_video.py`、`codes.py` — 既存
   - `vision.py` + `static/` + `pose.py` + `world.py` + `recorder.py` + `markers.toml` — 認識・Web UI（後述）
 - `marker/` — 印刷用 ArUco シート。辞書は **DICT_4X4_50**。`aruco_a4_compact*.pdf` には ID 0〜3 の 20/30/40/50(/60) mm 版がある（PDF の解析で確認）。
+- `cad/` — 公開 CAD（Seeed-Projects/reBot-DevArm `9ac6169`、`reBot-DevArm/` に clone、git 管理外）と稼働中 URDF の座標対応、ID 1 マーカー台の取り付け案（`end_link`）。**DM の全体 STEP は `…_20260425.step`**（`…_20260625.step` は中身が RS 版）。詳細は `cad/README.md`。
 - `rebot/teach.py` — ダイレクトティーチング（記録・再生）。`motorbridge` を使う。
 - `rebot/reBotArm_control_py/` — 上流 reBotArm_control_py の `40ab6ce`（上流に LICENSE ファイルなし。MIT は未確認） に、
   ローカルの重力補償・校正の変更を加えたもの。通常のファイルとして取り込んでいる（submodule ではない）。
@@ -53,8 +54,16 @@ ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   # 手元で http:
 - `rebot/arm_state.py` — 既定は読み取り専用（Damiao 0xCC 要求だけ。shutdown() は使わない＝全モーター無効化を送るため）。
   `--allow-motion` で Web UI からの操作を受け付ける（有効化 MOVE、停止、トルク切り RELEASE、シミュレーター確認済み経路の実行、把持実行は前提未充足のため拒否）。
   デッドマン（ページの生存確認 0.6 s）、追従フィードバック（Kp 0.5 / Ki 1.0、補正上限 0.2 rad）、逸脱 0.08 rad / 手先 20 mm で停止。
+  全 6 関節を MIT モード（kp・kd は SDK yaml）で保持し、SDK の公式 dynamics の重力 g(q) をフィードフォワード（有効化後 0.5 s で立ち上げ）、移動中は計画速度も加える。
+  POS_VEL だと保持中に joint4・joint5 が 11 mrad のスティックスリップ、joint6 がハンチング（2026-10-14 実測）。joint4・6 は MIT 化で静止を確認済み、全関節化は依頼者の判断。
+  移動中は `rebot/mit_tuning.yaml` のクーロン摩擦（joint2 0.90 / joint3 1.71 N m）を進む向きに加える。このファイルは有効化のたびに読み直す（再起動不要）。
+  移動ごとの 50 Hz 記録（計画・実測・速度・トルク・指令）が `run/arm_trace_last.jsonl` に残る。
+  関節の零点補正（ソフトウェアのみ）: `rebot/joint_offsets.yaml`（モデル角 = モーター角 + offset）。2026-10-14 の hand-eye 校正で推定した値
+  （joint2 −0.79、joint3 +1.01、joint4 −0.36、**joint5 −5.97 deg**。joint5 は定規の手合わせでも約 −7 deg を確認）。state.json の pos はモデル角、pos_motor が生の値。
+  校正サンプルは記録時の offset を `joint_offsets_rad` に残し、handeye.py はモーター角に戻して解く。
 - `sim/` — MuJoCo 3.15.0（`sim/.venv`、EGL でオフスクリーン描画）。公開モデル Borot-Arm_Mujoco `3f3e98d` をそのまま取り込み、`scene.py` で床・ブロック・凸包衝突・アクチュエータを追加。
   現実同期（物理なし）/ シミュレーション試行（接近・閉じる・持ち上げ）、把持候補 24 通りの判定、実機経路の動的シミュレーション。`verify_sim.py` で検証。
+  ID 1 マーカー台（設計値・未製作）を `scene.toml [marker_mount]` で end_link に追加（`check_mount.py` / `render_mount.py`、詳細は `cad/README.md`）。
 - 依存: oak/.venv depthai 3.10.0 / opencv 5.0.0.93 / numpy 2.4.6、rebot venv motorbridge 0.5.6 / pinocchio 3.9.0、sim/.venv は `sim/requirements.txt`。three.js 0.170.0 を `oak/static/vendor` に同梱。
 
 ## 確定したこと
