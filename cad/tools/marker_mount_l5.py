@@ -2,7 +2,12 @@
 link5 -- the 3 mm metal plate of 03_Link5 over the joint 6 motor's cable restraint (01_Joint6_7_Cable Restraint_A).
 Requester 2026-10-14: in gripper-down poses ID 1 falls into the motor's shadow.
 
-Two printed parts, because the faces have to cover the two fixing screws:
+One piece (default; requester 2026-10-14): the part sits on the plate, located by cone bosses in the emptied
+countersinks of the two upper screws (KM3-9, replaced by countersunk M3 x (9 + tA)); each screw seat is a 90 deg
+countersink, and a bore of the head's size runs from it straight out through the wedges and the marker face -- the
+screws are driven through the bores, and the marker stickers cover them afterwards.
+
+--two-piece: two printed parts instead:
   A  base plate on the link5 plate, held by the two upper countersunk screws (KM3-9 at y = +-13.4, z = +13.4,
      replaced by countersunk M3 x (9 + tA) so the tip ends where it ends today); cone bosses on its back sit in the
      emptied 90 deg countersinks of the metal plate (dia 6.0, 1.4 deep) and locate it, the screw heads sit in
@@ -48,7 +53,8 @@ from OCP.IFSelect import IFSelect_RetDone
 from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopAbs import TopAbs_SOLID
+from OCP.TopAbs import TopAbs_SOLID, TopAbs_IN, TopAbs_OUT
+from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 
 ap = argparse.ArgumentParser()
 ap.add_argument("step"); ap.add_argument("outdir")
@@ -64,6 +70,10 @@ ap.add_argument("--y-half", type=float, default=25.0, help="base plate half widt
 ap.add_argument("--rail", type=float, nargs=3, default=[10.0, 14.0, 4.0], metavar=("W_ROOT", "W_TOP", "H"),
                 help="dovetail rail: width at the plate, width at the top, height")
 ap.add_argument("--fit", type=float, default=0.2, help="clearance of the groove around the rail")
+ap.add_argument("--two-piece", action="store_true",
+                help="base plate + slid-on marker block (default: one piece with screw bores through to the marker faces)")
+ap.add_argument("--bore", type=float, default=6.8, help="one piece: bore from each screw seat out through the faces (head 6.0)")
+ap.add_argument("--gap", type=float, default=1.0, help="gap between neighbouring face footprints (default layout), mm")
 ap.add_argument("--boss-clearance", type=float, default=0.1)
 ap.add_argument("--boss-height", type=float, default=0.8)
 a = ap.parse_args()
@@ -119,8 +129,11 @@ x_rail_mid = xA - h_rail / 2
 A = cut(A, BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x_rail_mid, 0, z1 + 0.01), gp_Dir(0, 0, -1)), LOCK_PILOT / 2, 10.0).Shape())
 
 # ---------------- B: marker block ----------------
-xB = xA - a.fit                          # back of B (against A's front, fit gap)
-xBf = xB - a.tB                          # front of B's slab (wedges stand on it)
+if a.two_piece:
+    xB = xA - a.fit                      # back of B (against A's front, fit gap)
+    xBf = xB - a.tB                      # front of B's slab (wedges stand on it)
+else:
+    xB, xBf = X_PLATE, xA                # one piece: the base itself carries the wedges
 out_n = np.array([-1.0, 0, 0])
 S = a.marker + 2 * a.margin + 2 * a.rim[0]
 specs = []
@@ -144,7 +157,7 @@ for k, (tilt, az, fy, fz, spin) in enumerate(specs):
     # footprint of the square on the slab plane (projection along x)
     half = np.abs(np.array([e_x, e_y])[:, 1:]).sum(axis=0) * S / 2           # half extents in (y, z)
     if fy is None:
-        fy = cursor_y + half[0]; cursor_y = fy + half[0] + 1.0
+        fy = cursor_y + half[0]; cursor_y = fy + half[0] + a.gap
     if fz is None:
         fz = (z0 + z1) / 2
     centre_plate = np.array([xBf, fy, fz])
@@ -161,51 +174,100 @@ for k, (tilt, az, fy, fz, spin) in enumerate(specs):
     faces.append({"tilt_deg": tilt, "azimuth_deg": az, "normal": n, "centre": top, "x_axis": e_x, "y_axis": e_y,
                   "solid": fuse(fuse(plate, wedge), rim)})
     foot.append((fy - half[0], fy + half[0], fz - half[1], fz + half[1]))
-# slab covers the base plate and every footprint; its top is above the rail top (closed groove + lock screw)
 ys = [Yh, -Yh] + [v for f_ in foot for v in f_[:2]]
 zs = [z0, z1] + [v for f_ in foot for v in f_[2:]]
-lock_z_top = z1 + 6.0
-B = box(xB, min(ys), z0, xBf, max(ys), max(max(zs), lock_z_top))
-for fc in faces:
-    B = fuse(B, fc["solid"])
-B = cut(B, box(xB, -200, -200, xB + 50, 200, 200))                      # nothing behind B's back plane
-B = cut(B, box(-400, -200, z0 - 100, 0, 200, z0))                         # flat bottom for printing
-B = cut(B, dovetail(xA, w_root, w_top, h_rail, z0 - 1, z1, grow=a.fit))   # groove, closed above the rail top
-B = cut(B, BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x_rail_mid, 0, 200), gp_Dir(0, 0, -1)), LOCK_HOLE / 2, 200 - z1 + 0.5).Shape())
-hc = (LOCK_CSK - LOCK_HOLE) / 2
-zt = bbox(B)[5]
-B = cut(B, BRepPrimAPI_MakeCone(gp_Ax2(gp_Pnt(x_rail_mid, 0, zt + 0.01), gp_Dir(0, 0, -1)), LOCK_CSK / 2 + 0.01, LOCK_HOLE / 2, hc + 0.02).Shape())
-lock_len = zt - z1 + 8.0
+if not a.two_piece:
+    # one piece: base under every footprint, wedges on it; each screw seat is a 90 deg countersink with a bore of the
+    # head's size straight out through the wedges and the marker face (the sticker covers it); bosses on the back
+    P = box(X_PLATE, min(ys), z0, xA, max(ys), max(zs))
+    for fc in faces:
+        P = fuse(P, fc["solid"])
+    P = cut(P, box(X_PLATE, -200, -200, X_PLATE + 50, 200, 200))
+    P = cut(P, box(-400, -200, z0 - 100, 0, 200, z0))
+    hc = (HEAD_CSK_D - HOLE_D) / 2
+    for y, z in SCREWS:
+        P = cut(P, BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(X_PLATE + 1, y, z), gp_Dir(-1, 0, 0)), HOLE_D / 2, a.tA + 2).Shape())
+        P = cut(P, BRepPrimAPI_MakeCone(gp_Ax2(gp_Pnt(xA - 0.01, y, z), gp_Dir(1, 0, 0)), HEAD_CSK_D / 2 + 0.01, HOLE_D / 2, hc + 0.02).Shape())
+        P = cut(P, BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(xA + 0.01, y, z), gp_Dir(-1, 0, 0)), a.bore / 2, 200).Shape())
+    for y, z in SCREWS:
+        boss = BRepPrimAPI_MakeCone(gp_Ax2(gp_Pnt(X_PLATE - 0.01, y, z), gp_Dir(1, 0, 0)), rb, rb - a.boss_height - 0.01, a.boss_height + 0.01).Shape()
+        boss = cut(boss, BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(X_PLATE - 1, y, z), gp_Dir(1, 0, 0)), HOLE_D / 2, a.boss_height + 2).Shape())
+        P = fuse(P, boss)
+    out = Path(a.outdir); out.mkdir(parents=True, exist_ok=True)
+    w_ = STEPControl_Writer(); w_.Transfer(P, STEPControl_AsIs); assert w_.Write(str(out / "marker_mount_l5.step")) == IFSelect_RetDone
+    BRepMesh_IncrementalMesh(P, 0.02, False, 0.1, True); sw = StlAPI_Writer(); sw.ASCIIMode = False; sw.Write(P, str(out / "marker_mount_l5.stl"))
+    c_ = BRepBuilderAPI_Transform(P, gp_Trsf(), True).Shape()
+    BRepMesh_IncrementalMesh(c_, 0.2, False, 0.5, True); sw.Write(c_, str(out / "marker_mount_l5_coarse.stl"))
+    A = B = None
+    both = P
+# slab covers the base plate and every footprint; its top is above the rail top (closed groove + lock screw)
+if a.two_piece:
+    lock_z_top = z1 + 6.0
+    B = box(xB, min(ys), z0, xBf, max(ys), max(max(zs), lock_z_top))
+    for fc in faces:
+        B = fuse(B, fc["solid"])
+    B = cut(B, box(xB, -200, -200, xB + 50, 200, 200))                      # nothing behind B's back plane
+    B = cut(B, box(-400, -200, z0 - 100, 0, 200, z0))                         # flat bottom for printing
+    B = cut(B, dovetail(xA, w_root, w_top, h_rail, z0 - 1, z1, grow=a.fit))   # groove, closed above the rail top
+    B = cut(B, BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x_rail_mid, 0, 200), gp_Dir(0, 0, -1)), LOCK_HOLE / 2, 200 - z1 + 0.5).Shape())
+    hc = (LOCK_CSK - LOCK_HOLE) / 2
+    zt = bbox(B)[5]
+    B = cut(B, BRepPrimAPI_MakeCone(gp_Ax2(gp_Pnt(x_rail_mid, 0, zt + 0.01), gp_Dir(0, 0, -1)), LOCK_CSK / 2 + 0.01, LOCK_HOLE / 2, hc + 0.02).Shape())
+    lock_len = zt - z1 + 8.0
 
-out = Path(a.outdir); out.mkdir(parents=True, exist_ok=True)
-for name, part in (("A_base", A), ("B_markers", B)):
-    w_ = STEPControl_Writer(); w_.Transfer(part, STEPControl_AsIs); assert w_.Write(str(out / f"marker_mount_l5_{name}.step")) == IFSelect_RetDone
-    BRepMesh_IncrementalMesh(part, 0.02, False, 0.1, True); sw = StlAPI_Writer(); sw.ASCIIMode = False
-    sw.Write(part, str(out / f"marker_mount_l5_{name}.stl"))
-both = fuse(A, B)
-c_ = BRepBuilderAPI_Transform(both, gp_Trsf(), True).Shape()
-BRepMesh_IncrementalMesh(c_, 0.2, False, 0.5, True); sw = StlAPI_Writer(); sw.ASCIIMode = False; sw.Write(c_, str(out / "marker_mount_l5_coarse.stl"))
+    out = Path(a.outdir); out.mkdir(parents=True, exist_ok=True)
+    for name, part in (("A_base", A), ("B_markers", B)):
+        w_ = STEPControl_Writer(); w_.Transfer(part, STEPControl_AsIs); assert w_.Write(str(out / f"marker_mount_l5_{name}.step")) == IFSelect_RetDone
+        BRepMesh_IncrementalMesh(part, 0.02, False, 0.1, True); sw = StlAPI_Writer(); sw.ASCIIMode = False
+        sw.Write(part, str(out / f"marker_mount_l5_{name}.stl"))
+    both = fuse(A, B)
+    c_ = BRepBuilderAPI_Transform(both, gp_Trsf(), True).Shape()
+    BRepMesh_IncrementalMesh(c_, 0.2, False, 0.5, True); sw = StlAPI_Writer(); sw.ASCIIMode = False; sw.Write(c_, str(out / "marker_mount_l5_coarse.stl"))
+# sticker check: over each sticker area (marker + margins), just above the face must be air and just below solid --
+# a corner cut off by the bottom cut / a bore edge, or buried under a neighbouring wedge, fails here
+def sticker_check(solid, fc):
+    half_s = (a.marker + 2 * a.margin) / 2
+    bad_cut, bad_buried, n_ = 0, 0, 0
+    for u in np.linspace(-half_s + 0.3, half_s - 0.3, 15):
+        for v in np.linspace(-half_s + 0.3, half_s - 0.3, 15):
+            p = fc["centre"] + u * fc["x_axis"] + v * fc["y_axis"]
+            above = BRepClass3d_SolidClassifier(solid, gp_Pnt(*(p + fc["normal"] * 0.3)), 1e-4).State()
+            below = BRepClass3d_SolidClassifier(solid, gp_Pnt(*(p - fc["normal"] * 0.3)), 1e-4).State()
+            n_ += 1
+            bad_buried += above == TopAbs_IN
+            bad_cut += below != TopAbs_IN
+    return {"points": n_, "buried": int(bad_buried), "missing": int(bad_cut)}
+check_solid = both if not a.two_piece else B
+for fc in faces:
+    fc["sticker"] = sticker_check(check_solid, fc)
+    print(f"sticker area face {faces.index(fc) + 1}: {fc['sticker']} (missing includes the screw bores)")
 mk = []
 for k, fc in enumerate(faces):
     R = np.array([fc["x_axis"], fc["y_axis"], fc["normal"]]).T
     mk.append({"face": k + 1, "tilt_deg": fc["tilt_deg"], "azimuth_deg": fc["azimuth_deg"], "centre_mm": fc["centre"].round(3).tolist(),
-               "normal": fc["normal"].round(5).tolist(), "T_wrist_marker": np.vstack([np.c_[R, fc["centre"]], [0, 0, 0, 1]]).round(5).tolist()})
+               "normal": fc["normal"].round(5).tolist(), "sticker_check": fc["sticker"], "T_wrist_marker": np.vstack([np.c_[R, fc["centre"]], [0, 0, 0, 1]]).round(5).tolist()})
 spec = {"frame": "wrist STEP = end_link at joint 6 = 0 (mm); the parts are carried by link5", "link": "link5",
         "markers": mk, "marker_size_mm": a.marker, "sticker_area_mm": a.marker + 2 * a.margin, "rim_mm": a.rim,
-        "parts": {"A_base": {"solids": nsolids(A), "bbox_mm": [round(v, 2) for v in bbox(A)], "volume_mm3": round(vol(A))},
-                  "B_markers": {"solids": nsolids(B), "bbox_mm": [round(v, 2) for v in bbox(B)], "volume_mm3": round(vol(B))}},
+        "parts": ({"A_base": {"solids": nsolids(A), "bbox_mm": [round(v, 2) for v in bbox(A)], "volume_mm3": round(vol(A))},
+                   "B_markers": {"solids": nsolids(B), "bbox_mm": [round(v, 2) for v in bbox(B)], "volume_mm3": round(vol(B))}}
+                  if a.two_piece else
+                  {"one_piece": {"solids": nsolids(both), "bbox_mm": [round(v, 2) for v in bbox(both)], "volume_mm3": round(vol(both)),
+                                 "screw_bores_mm": a.bore}}),
         "screws": {"fixing": f"replace the two upper KM3-9 (y = +-13.4, z = +13.4) by countersunk M3 x {9 + a.tA:g} machine screws (same tip depth)",
-                   "lock": f"one countersunk 3 mm tapping screw, about 3 x {math.floor(lock_len):d}, from B's top into the rail (pilot {LOCK_PILOT} mm)"},
+                   "lock": (f"one countersunk 3 mm tapping screw, about 3 x {math.floor(lock_len):d}, from B's top into the rail (pilot {LOCK_PILOT} mm)"
+                            if a.two_piece else "none (one piece): drive the screws through the bores, then stick the markers over them")},
         "bosses": {"fits": "90 deg countersink dia 6.0 x 1.4 in the 03_Link5 plate", "base_dia_mm": 2 * rb, "height_mm": a.boss_height},
-        "assembly": "screw A on; slide B down onto A's rail from above until the closed groove rests on the rail top; lock screw from the top",
+        "assembly": ("screw A on; slide B down onto A's rail from above until the closed groove rests on the rail top; lock screw from the top"
+                     if a.two_piece else "put the part on (bosses in the plate countersinks), screw through the bores, stick the markers on"),
         "print": "both parts standing on their bottom face (z = z0), z up; no supports expected (faces tilted towards -z overhang by their tilt)",
         "note": "design value from CAD; sticker plane = rim base (sticker thickness not included)"}
 json.dump(spec, open(out / "marker_mount_l5.json", "w"), indent=1)
 print(json.dumps({k: spec[k] for k in ("markers", "parts", "screws")}, indent=1))
 
 # ---------------- interference: wrist parts (link6 + gripper swept over joint 6), and A vs B ----------------
-d_ab = BRepExtrema_DistShapeShape(A, B); d_ab.Perform()
-print(f"A-B min distance {d_ab.Value():.3f} mm, overlap {vol(BRepAlgoAPI_Common(A, B).Shape()):.3f} mm3")
+if a.two_piece:
+    d_ab = BRepExtrema_DistShapeShape(A, B); d_ab.Perform()
+    print(f"A-B min distance {d_ab.Value():.3f} mm, overlap {vol(BRepAlgoAPI_Common(A, B).Shape()):.3f} mm3")
 doc = TDocStd_Document(TCollection_ExtendedString("d"))
 r = STEPCAFControl_Reader(); r.SetNameMode(True); assert r.ReadFile(a.step) == IFSelect_RetDone; r.Transfer(doc)
 st = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
