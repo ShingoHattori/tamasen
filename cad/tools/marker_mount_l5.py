@@ -19,7 +19,9 @@ bridge), faces tilted about z are vertical walls, a face tilted towards -z overh
 Coordinates: wrist STEP frame = end_link at joint 6 = 0, mm (cad/out/wrist_gripper_in_end_link.step); the parts are
 carried by link5. Faces: --face tilt,azimuth[,y,z]: the plate normal (-x) tilted by `tilt` towards `azimuth` in the
 plate plane (0 = +z, 90 = +y, -90 = -y, 180 = -z); y,z = centre of the face's footprint on the plate (default: side
-by side). Marker axes: +y towards the face's high edge, +x = y x normal.
+by side); a 5th value turns the square in its own plane (default 45 for a diagonal azimuth, else 0).
+Marker axes: +y towards the face's high edge (before the turn), +x = y x normal.
+One-marker version: --face 45,-135,0,16.75
 
 usage: marker_mount_l5.py wrist_gripper_in_end_link.step outdir --face 45,-90 --face 45,180
 """
@@ -124,16 +126,21 @@ S = a.marker + 2 * a.margin + 2 * a.rim[0]
 specs = []
 for f in a.face:
     v = [float(x) for x in f.split(",")]
-    specs.append(v + [None] * (4 - len(v)))
+    specs.append(v + [None] * (5 - len(v)))
 faces, foot = [], []
 cursor_y = -Yh
-for k, (tilt, az, fy, fz) in enumerate(specs):
+for k, (tilt, az, fy, fz, spin) in enumerate(specs):
     T_, A_ = math.radians(tilt), math.radians(az)
     w = np.array([0.0, math.sin(A_), math.cos(A_)])
     n = math.cos(T_) * out_n + math.sin(T_) * w
     e_y = -np.cross(n, np.cross(w, n)) if tilt > 1e-6 else np.array([0, 0, 1.0])
     e_y /= np.linalg.norm(e_y)
     e_x = np.cross(e_y, n)
+    if spin is None:                     # a diagonal tilt: turn the square 45 deg in its plane, so it stays compact on the plate
+        spin = 45.0 if abs(math.remainder(az, 90.0)) > 1e-6 else 0.0
+    if spin:
+        c_, s_ = math.cos(math.radians(spin)), math.sin(math.radians(spin))
+        e_x, e_y = c_ * e_x + s_ * e_y, -s_ * e_x + c_ * e_y
     # footprint of the square on the slab plane (projection along x)
     half = np.abs(np.array([e_x, e_y])[:, 1:]).sum(axis=0) * S / 2           # half extents in (y, z)
     if fy is None:
