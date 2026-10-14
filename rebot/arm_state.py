@@ -64,18 +64,79 @@ LAG_FREE, LAG_STOP = 0.01, 0.04   # rad: plan runs at full speed below LAG_FREE 
 STALL_S = 2.0               # s the plan may stand still before it is a fault
 LAG_KI_GAIN = 3.0           # integral gain multiplier while the plan clock is fully held back by lag
 # Contact detection while moving (2026-10-14: the gripper was driven into the block and tore it without any
-# deviation limit tripping). Per joint, resistance = (motor torque - gravity ff - friction ff - its value at the
-# start of the move) in the direction that opposes the planned motion. Free motion (lift -> rest, 14 s) stayed
-# within 0.7 / 1.3 / 1.3 / 0.4 / 0.3 / 0.3 N m. Stop when it exceeds RES_ABS, or grows by RES_GROW within
-# RES_WIN_S while growing steeply with the travel (RES_SLOPE N m/rad, contact stiffness; the gravity-model
-# error changes by only ~1-2 N m/rad). Joints whose plan is within RES_LIMIT_MARGIN of a joint limit are
-# skipped (the folded rest pose leans on the end stops).
-RES_ABS = np.array([1.5, 3.0, 3.0, 1.0, 0.8, 0.6])
-RES_GROW = np.array([0.8, 1.5, 1.5, 0.4, 0.4, 0.25])
-RES_SLOPE = np.array([30.0, 30.0, 30.0, 10.0, 10.0, 10.0])
-RES_WIN_S = 0.3
+# deviation limit tripping). Per joint, resistance r = (motor torque - gravity ff - friction ff) in the direction
+# of the planned motion (the extra effort the motor spends to keep moving). A contact is a resistance that KEEPS
+# GROWING (requester, 2026-10-14), not a large one: an absolute limit stopped a lift off the rest pose, where the
+# end stop had carried 4.8 N m of joint3's gravity and the motor took it over (08:08). See ContactMonitor.
+# Thresholds in rebot/mit_tuning.yaml "contact:" (read at engage). Joints whose plan is within RES_LIMIT_MARGIN
+# of a joint limit are skipped (the folded rest pose leans on the end stops).
+CONTACT_DEFAULTS = {
+    # rise of r above its recent minimum (a minimum below the model, e.g. leaning on an end stop, counts as 0).
+    # Free motion on the real arm reached 0.6 / 2.0 / 1.5 / 0.2 / 0.1 / 0.2 N m (stick-slip of joint2/3).
+    "rise_nm": [1.2, 3.0, 3.0, 0.6, 0.5, 0.5],
+    # pushing into something soft: r rises in proportion to the travel (slope N m/rad, straight-line fit
+    # r^2 >= spring_r2 over >= spring_travel_rad), by at least spring_rise_frac of rise_nm.
+    "spring_nm_per_rad": [8.0, 10.0, 10.0, 3.0, 3.0, 3.0],
+    "spring_travel_rad": 0.010,
+    "spring_r2": 0.85,
+    "spring_rise_frac": 0.5,
+    "window_s": 1.5,
+}
 RES_LIMIT_MARGIN = math.radians(3.0)
 RES_ALPHA = 0.3             # smoothing of the motor torque reading
+
+
+class ContactMonitor:
+    """Per move. step() -> fault text when some joint's resistance keeps growing (see CONTACT_DEFAULTS).
+
+    Pure (no bus): run/arm_trace_last.jsonl can be replayed through it (rebot/contact_replay.py)."""
+
+    def __init__(self, p: dict) -> None:
+        self.p = p
+        self.ext = None
+        self.seg = [[] for _ in range(6)]          # per joint: (t, r, travel) since the direction last changed
+        self.dir = np.zeros(6)
+        self.res_now = [0.0] * 6
+        self.peak = [0.0] * 6                       # largest rise / its limit seen in this move (for tuning)
+
+    def step(self, t: float, tq: np.ndarray, ff: np.ndarray, qm: np.ndarray, vdir: np.ndarray,
+             active: np.ndarray) -> str | None:
+        p = self.p
+        e = tq - ff
+        self.ext = e if self.ext is None else (1 - RES_ALPHA) * self.ext + RES_ALPHA * e
+        d = np.where(np.abs(vdir) > 1e-3, np.sign(vdir), 0.0)
+        for i, n in enumerate(ARM):
+            if not active[i] or d[i] == 0 or d[i] != self.dir[i]:
+                self.seg[i] = []
+            self.dir[i] = d[i] if active[i] else 0.0
+            if self.dir[i] == 0:
+                self.res_now[i] = 0.0
+                continue
+            r = float(self.ext[i] * d[i])
+            self.res_now[i] = r
+            sg = self.seg[i] = [x for x in self.seg[i] if t - x[0] <= p["window_s"]] + [(t, r, float(qm[i] * d[i]))]
+            rs = [x[1] for x in sg]
+            k = int(np.argmin(rs))
+            rise = r - max(rs[k], 0.0)
+            lim = p["rise_nm"][i]
+            self.peak[i] = max(self.peak[i], rise / lim)
+            # still rising: the newest value is (close to) the largest since the minimum
+            if rise > lim and r >= max(rs[k:]) - 0.1 * rise:
+                return f"衝突の疑い: {n} の抵抗が {t - sg[k][0]:.2f} s で {rise:.2f} N m 増え続けた（上限 {lim} N m）"
+            tail = sg[k:]
+            if len(tail) >= 5 and rise > lim * p["spring_rise_frac"]:
+                s_ = np.array([x[2] for x in tail]); y = np.array([x[1] for x in tail])
+                if s_.max() - s_.min() >= p["spring_travel_rad"]:
+                    A = np.c_[s_ - s_[0], np.ones(len(s_))]
+                    (slope, b0), *_ = np.linalg.lstsq(A, y, rcond=None)
+                    ss = float(np.sum((y - y.mean()) ** 2))
+                    r2 = 1.0 - float(np.sum((y - A @ [slope, b0]) ** 2)) / ss if ss > 0 else 0.0
+                    if slope >= p["spring_nm_per_rad"][i] and r2 >= p["spring_r2"]:
+                        return (f"衝突の疑い: {n} の抵抗が進むほど増えている（{slope:.0f} N m/rad で {rise:.2f} N m、"
+                                f"{(s_.max() - s_.min()) * 1000:.0f} mrad）")
+        return None
+
+
 CAN_LOSS_S = 0.3            # s without fresh feedback while engaged = CAN / bus fault
 ENGAGE_GRACE_S = 0.5
 # Motor-internal POS_VEL gains that differ from the SDK yaml (written at engage). joint6 (light wrist
@@ -239,9 +300,13 @@ class FakeBus:
             self.q.update(q0)
         self.target, self.vlim, self.enabled, self.t = dict(self.q), 0.0, set(), time.monotonic()
         self.log = []
-        self.inject = {"no_feedback": False, "status": {}}     # test hooks (fake only)
+        # test hooks (fake only). wall: {joint: motor angle} the joint cannot pass (a rigid obstacle); the
+        # reported torque then includes the position loop's push kp (target - q) like a real MIT motor.
+        self.inject = {"no_feedback": False, "status": {}, "wall": {}}
         self.speed = speed                                     # <1: motors slower than commanded (lag)
         self.tau = {}                                          # last MIT feedforward, reported as the motor torque
+        self.kp = {}
+        self.wall_side = {}
 
     def read_params(self):
         return {n: {"can_timeout": 0, "ctrl_mode": 2, "fake": True} for n in self.q}
@@ -250,7 +315,13 @@ class FakeBus:
         dt, self.t = time.monotonic() - self.t, time.monotonic()
         for n in self.enabled:
             e = self.target[n] + self.sag.get(n, 0.0) - self.q[n]
-            self.q[n] += math.copysign(min(abs(e), self.vlim * self.speed * dt), e)
+            q_new = self.q[n] + math.copysign(min(abs(e), self.vlim * self.speed * dt), e)
+            w = self.inject["wall"].get(n)
+            if w is not None:
+                side = self.wall_side.setdefault((n, w), math.copysign(1.0, self.q[n] - w))   # side it started on
+                if (q_new - w) * side < 0:                                   # would cross the wall: stop on it
+                    q_new = float(w)
+            self.q[n] = q_new
 
     def poll(self, settle_s=0.0):
         self._advance()
@@ -260,6 +331,8 @@ class FakeBus:
         for n, v in self.q.items():
             s = FakeState(v + np.random.normal(0, 1e-5))
             s.torq = self.tau.get(n, 0.0) + np.random.normal(0, 0.02)
+            if n in self.inject["wall"] and n in self.kp:
+                s.torq += self.kp[n] * (self.target[n] - v)
             s.status_code = self.inject["status"].get(n, 1 if n in self.enabled else 0)
             out[n] = s
         return out
@@ -284,7 +357,7 @@ class FakeBus:
         self._check(); self._advance(); self.target.update(q); self.vlim = vlim
 
     def send_mit(self, name, pos, kp, kd, vel=0.0, tau=0.0):
-        self._check(); self._advance(); self.target[name] = pos; self.vlim = 1.0; self.tau[name] = float(tau)
+        self._check(); self._advance(); self.target[name] = pos; self.vlim = 1.0; self.tau[name] = float(tau); self.kp[name] = float(kp)
         self.log.append(("mit_cmd", name, round(float(pos), 4), round(float(vel), 4), round(float(tau), 3))) \
             if len(self.log) < 5000 else None
 
@@ -363,6 +436,7 @@ class ArmService:
         self.joint_hi = np.array([lims.get(n, (-math.pi, math.pi))[1] for n in ARM])
         self.ff = {}                 # last MIT feedforward sent (shown on the page)
         self.tuning, self.tuning_error = self.load_tuning()
+        self.contact = None              # (motion dict, ContactMonitor) of the current move
         self.offsets, self.offsets_error = self.load_offsets()
         self.last_rows = []
         self.trace = None            # open trace file while a move (and TRACE_AFTER_S after it) is recorded
@@ -411,7 +485,7 @@ class ArmService:
     def load_tuning() -> tuple[dict, str | None]:
         """rebot/mit_tuning.yaml -> {"friction": {joint: N m}, "friction_v": rad/s, "kp": {...}, "kd": {...}}."""
         t = {"friction": {n: 0.0 for n in ARM}, "friction_v": 0.02, "kp": {}, "kd": {}, "file": str(TUNING_PATH),
-             "gripper": dict(GRIPPER_DEFAULTS)}
+             "gripper": dict(GRIPPER_DEFAULTS), "contact": dict(CONTACT_DEFAULTS)}
         try:
             raw = yaml.safe_load(TUNING_PATH.read_text()) or {}
         except FileNotFoundError:
@@ -438,6 +512,16 @@ class ArmService:
                 if k not in GRIPPER_DEFAULTS:
                     return t, f"gripper.{k} は不明な項目"
                 t["gripper"][k] = float(v)
+            for k, v in (raw.get("contact") or {}).items():
+                if k not in CONTACT_DEFAULTS:
+                    return t, f"contact.{k} は不明な項目"
+                if isinstance(CONTACT_DEFAULTS[k], list):
+                    v = [float(x) for x in v]
+                    if len(v) != 6 or min(v) <= 0:
+                        return t, f"contact.{k} は正の値 6 個（joint1〜6）"
+                elif float(v) <= 0:
+                    return t, f"contact.{k} は正の値"
+                t["contact"][k] = v if isinstance(v, list) else float(v)
             g = t["gripper"]
             if not (g["full_open_rad"] < -1.0 and 0.03 <= g["max_gap_m"] <= 0.2 and 0.0 < g["grip_torque_nm"] <= 1.0
                     and 0.1 <= g["speed_rad_s"] <= 6.0):
@@ -461,6 +545,8 @@ class ArmService:
                "plan": [round(float(v), 5) for v in qp], "q": [round(float(v), 5) for v in qm],
                "vel": [by.get(n, {}).get("vel") for n in ARM], "torq": [by.get(n, {}).get("torq") for n in ARM],
                "cmd": [round(float(v), 5) for v in q_cmd], "ff": self.ff, "rate": (c.get("motion") or {}).get("rate")}
+        if self.contact is not None and self.contact[0] is c.get("motion"):
+            rec["res"] = [round(v, 3) for v in self.contact[1].res_now]       # resistance seen by ContactMonitor
         self.trace["f"].write(json.dumps(rec) + "\n")
 
     def audit(self, what: str, src: str) -> None:
@@ -698,36 +784,15 @@ class ArmService:
                      message=f"移動完了（最大偏差 {fb['max_err']:.3f} rad / 手先 {fb['max_tcp_dev'] * 1000:.0f} mm）。保持中もフィードバック継続")
 
     def _contact_check(self, mv, qp, qm, vdir) -> str | None:
-        """Resistance against the planned motion (see RES_*). Returns the fault text on contact."""
+        """Resistance that keeps growing against the planned motion (ContactMonitor). Fault text on contact."""
         by = {r["name"]: r for r in self.last_rows}
         tq = np.array([by.get(n, {}).get("torq") or 0.0 for n in ARM])
         ff = np.array([self.ff.get(n, {}).get("tau_ff", 0.0) + self.ff.get(n, {}).get("fric", 0.0) for n in ARM])
-        cs = mv.setdefault("contact", {"ext": None, "base": [], "hist": []})
-        ext = tq - ff
-        cs["ext"] = ext if cs["ext"] is None else (1 - RES_ALPHA) * np.array(cs["ext"]) + RES_ALPHA * ext
-        if len(cs["base"]) < 10:                         # first 0.2 s of the move: baseline (model error at the start)
-            cs["base"].append(np.array(cs["ext"]).tolist())
-            return None
-        base = np.mean(cs["base"], axis=0)
-        lo, hi = self.joint_lo, self.joint_hi
-        active = (np.abs(vdir) > 1e-3) & (qp - lo > RES_LIMIT_MARGIN) & (hi - qp > RES_LIMIT_MARGIN)
-        res = np.where(active, (np.array(cs["ext"]) - base) * np.sign(vdir), 0.0)
-        now = time.monotonic()
-        cs["hist"] = [h for h in cs["hist"] if now - h[0] <= RES_WIN_S] + [(now, res.tolist(), qm.tolist())]
-        cs["res_now"] = res.tolist()
-        t0, r0, q0 = cs["hist"][0]
-        grow = res - np.array(r0)
-        travel = np.abs(qm - np.array(q0))
-        slope = np.where(travel > 1e-3, grow / np.maximum(travel, 1e-3), 0.0)
-        for i, n in enumerate(ARM):
-            if not active[i]:
-                continue
-            if res[i] > RES_ABS[i]:
-                return f"衝突の疑い: {n} が進む向きと逆に {res[i]:.2f} N m の抵抗（上限 {RES_ABS[i]} N m）"
-            if grow[i] > RES_GROW[i] and slope[i] > RES_SLOPE[i] and now - t0 > 0.5 * RES_WIN_S:
-                return (f"衝突の疑い: {n} の抵抗が {now - t0:.2f} s で {grow[i]:.2f} N m 増加（{slope[i]:.0f} N m/rad、"
-                        f"押し込みで増えている）")
-        return None
+        if self.contact is None or self.contact[0] is not mv:          # one monitor per move
+            self.contact = (mv, ContactMonitor(self.tuning["contact"]))
+        cm = self.contact[1]
+        active = (qp - self.joint_lo > RES_LIMIT_MARGIN) & (self.joint_hi - qp > RES_LIMIT_MARGIN)
+        return cm.step(time.monotonic(), tq, ff, qm, vdir, active)
 
     def _send(self, bus, qd: dict, vlim: float, qm: dict | None = None, vd: dict | None = None,
               vdir: dict | None = None) -> None:
