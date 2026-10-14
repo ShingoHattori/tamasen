@@ -110,6 +110,10 @@
     <button id="previewPath">シミュレーション結果をツインで再生</button></div>
    <div id="pathres" class="dim"></div>
    <div>2. <button id="execPath" disabled>シミュレーションで妥当だった経路を実機で実行</button><button id="graspReal">把持を実機で実行</button></div>
+   <div>3. グリッパー（アームが保持中のときだけ）: 隙間 <input id="gripGap" size="4" value="45"> mm <button id="gripOpen">開く</button>
+    挟む物の幅 <input id="gripWidth" size="4" value="31"> mm <button id="gripGrip">挟む（力を制限）</button>
+    <button id="gripRelease">離す（隙間まで開く）</button> <span class="dim">幅・隙間は把持計画の先頭の候補から自動で入る（手で変えてもよい）</span></div>
+   <div id="gripState" class="dim"></div>
    <div id="ctlstate"></div>
   </div></section>
  <section><h2>保存したファイル</h2><div id="files"></div></section>

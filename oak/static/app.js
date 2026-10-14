@@ -259,6 +259,7 @@ function renderCtl(a) {
   $("ctlstate").innerHTML = `状態: <b class="${c.state === "read_only" ? "ok" : "bad"}">${{ read_only: "無効（トルクなし）", holding: "有効・保持中", moving: "移動中" }[c.state] || c.state}</b>
     ${c.motion ? ` ${esc(c.motion.label)} ${Math.round((c.motion.progress || 0) * 100)} %` : ""}<br>${esc(c.message || "")}
     ${c.fault ? `<br><b class="bad">異常: ${esc(c.fault)}</b>` : ""}
+    ${c.gripper && c.gripper.mode ? `<br>グリッパー: ${esc(c.gripper.event || "")}、今の隙間 ${mm(c.gripper.gap_now_m, 1)} mm` : (c.gripper_enabled ? "" : "<br>グリッパー: 無効（最初の操作で有効化）")}
     ${c.fb ? `<br>計画との偏差（フィードバック補正後）: 現在 ${f(c.fb.err_max_now, 3)} rad / 手先 ${mm(c.fb.tcp_dev, 1)} mm、
       最大 ${f(c.fb.max_err, 3)} rad / ${mm(c.fb.max_tcp_dev, 1)} mm、補正の積分項 ${(c.fb.I || []).map(v => f(v, 3)).join(", ")} rad` : ""}
     <br><span class="dim">速度上限 ${a.limits.vmax_rad_s} rad/s。有効中（移動・保持とも）は常に 計画−実測 の PI 補正（Kp ${a.limits.kp.join("/")}, Ki ${a.limits.ki.join("/")}, 不感帯 ${a.limits.deadband_rad} rad）。
@@ -304,6 +305,13 @@ $("execPath").onclick = () => {
     post("/arm/api/execute", { path_id: checkedPath.id });
 };
 $("graspReal").onclick = () => post("/arm/api/grasp");
+let gripFromPlan = null;          // plan time the inputs were last filled from
+function gripCmd(action, extra, what) {
+  if (confirm(`グリッパーを${what}。顎の間に指や物がないことを確認しましたか？`)) post("/arm/api/gripper", Object.assign({ action }, extra));
+}
+$("gripOpen").onclick = () => gripCmd("open", { gap_mm: Number($("gripGap").value) }, `隙間 ${$("gripGap").value} mm まで開きます`);
+$("gripGrip").onclick = () => gripCmd("grip", { width_mm: Number($("gripWidth").value) }, `閉じて幅 ${$("gripWidth").value} mm の物を挟みます（トルク制限）`);
+$("gripRelease").onclick = () => gripCmd("release", { gap_mm: Number($("gripGap").value) }, `隙間 ${$("gripGap").value} mm まで開いて離します`);
 $("previewPath").onclick = () => post("/sim/api/preview");
 
 // ------------------------------------------------------------------ simulator
@@ -337,6 +345,11 @@ function renderSim(s) {
   const j = (s.joints || []).map(x => `<tr><td>${x.name}</td><td>${deg(x.q, 1)}</td><td>${deg(x.lo, 0)} … ${deg(x.hi, 0)}</td><td class="l">${esc(x.source)}</td></tr>`);
   const sync = s.sync || {};
   const plan = s.plan, tr = s.trial;
+  if (plan && plan.t !== gripFromPlan) {          // fill the gripper inputs from the first ok candidate
+    const okc = (plan.candidates || []).find(c => c.ok);
+    if (okc) { $("gripGap").value = Math.round(okc.width_m * 1000); $("gripWidth").value = Math.round((okc.width_m - 0.01) * 1000); }
+    gripFromPlan = plan.t;
+  }
   $("sim").innerHTML = `
     <div class="dim">${(s.notes || []).map(esc).join("<br>")}</div>
     <h2>入力の状態</h2>

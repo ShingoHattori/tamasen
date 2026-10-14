@@ -89,6 +89,12 @@ TAU_FF_MAX = {"joint1": 1.0, "joint2": 18.0, "joint3": 9.0, "joint4": 3.0, "join
 GRAV_RAMP_S = 0.5
 TUNING_PATH = Path(__file__).resolve().parent / "mit_tuning.yaml"   # friction and gain overrides, read at engage
 TRACE_AFTER_S = 2.0         # s of holding still traced after a move ends
+# Gripper (motor "gripper", MIT): position mode for open / release, torque-limited closing for grip.
+# Opening is proportional to the motor angle (2026-10-14, ruler: 0 / 50 / 100 mm at -0.022 / -2.929 / -5.896 rad,
+# ~1 mm backlash); same values as sim/scene.toml [jaw]. Overridable in mit_tuning.yaml "gripper:".
+GRIPPER_DEFAULTS = {"full_open_rad": -5.896, "max_gap_m": 0.100, "grip_torque_nm": 0.25, "speed_rad_s": 2.0,
+                    "kp": 8.0, "kd": 1.0, "grip_kd": 0.3, "miss_margin_m": 0.008}
+GRIP_SETTLE_S, GRIP_STILL_RAD_S, GRIP_TIMEOUT_S = 0.3, 0.05, 6.0
 # Joint zero offsets (software only, never written to the motors): model angle = motor angle + offset.
 # Everything this service publishes and plans with is in model angles; commands are converted back.
 OFFSETS_PATH = Path(__file__).resolve().parent / "joint_offsets.yaml"
@@ -381,7 +387,8 @@ class ArmService:
     @staticmethod
     def load_tuning() -> tuple[dict, str | None]:
         """rebot/mit_tuning.yaml -> {"friction": {joint: N m}, "friction_v": rad/s, "kp": {...}, "kd": {...}}."""
-        t = {"friction": {n: 0.0 for n in ARM}, "friction_v": 0.02, "kp": {}, "kd": {}, "file": str(TUNING_PATH)}
+        t = {"friction": {n: 0.0 for n in ARM}, "friction_v": 0.02, "kp": {}, "kd": {}, "file": str(TUNING_PATH),
+             "gripper": dict(GRIPPER_DEFAULTS)}
         try:
             raw = yaml.safe_load(TUNING_PATH.read_text()) or {}
         except FileNotFoundError:
@@ -404,6 +411,14 @@ class ArmService:
                         if n not in ARM or not 0.0 < float(v) <= lim:
                             return t, f"options.{k} = {v} は不正"
                         t[g][n] = float(v)
+            for k, v in (raw.get("gripper") or {}).items():
+                if k not in GRIPPER_DEFAULTS:
+                    return t, f"gripper.{k} は不明な項目"
+                t["gripper"][k] = float(v)
+            g = t["gripper"]
+            if not (g["full_open_rad"] < -1.0 and 0.03 <= g["max_gap_m"] <= 0.2 and 0.0 < g["grip_torque_nm"] <= 1.0
+                    and 0.1 <= g["speed_rad_s"] <= 6.0):
+                return t, "gripper の値が範囲外（full_open_rad < -1、max_gap_m 0.03〜0.2、grip_torque_nm 0〜1、speed_rad_s 0.1〜6）"
         except (TypeError, ValueError) as e:
             return t, f"{TUNING_PATH.name} の値が不正: {e}"
         return t, None
@@ -556,6 +571,7 @@ class ArmService:
             if c.get("last_cmd"):
                 # keep holding the last commanded point; the gravity term from the last known pose
                 self._send(bus, c["last_cmd"], VMAX, qm=c.get("last_q"))
+                self._gripper_step(bus, {})
             return
         self.lost_since = None
         bad = {n: self.statuses.get(n) for n in ARM if self.statuses.get(n) != 0x1}
@@ -626,6 +642,7 @@ class ArmService:
         # Faults latch: they are cleared only by the user ("ack_fault") once the cause is gone, or by release.
         c["last_cmd"] = dict(zip(ARM, q_cmd))
         self._send(bus, c["last_cmd"], VMAX * 1.5, qm=q, vd=dict(zip(ARM, vp)), vdir=dict(zip(ARM, vdir)))
+        self._gripper_step(bus, q)
         self._trace(c, qp, qm, q_cmd)
         if c["state"] == "moving" and t >= mv["T"] and lag_now < LAG_FREE * 2:
             end = dict(zip(ARM, np.array(mv["q_plan"][-1])))
@@ -657,6 +674,100 @@ class ArmService:
                 kd = self.tuning["kd"].get(n, float(mit.get("kd", 2.0)))
                 bus.send_mit(n, motor(n), kp, kd, vel=v, tau=tau + fr)
                 self.ff[n] = {"tau_ff": round(tau, 3), "fric": round(fr, 3), "v_ff": round(v, 4), "ramp": round(ramp, 2)}
+
+    # ---- gripper
+    def _gap(self, rad: float) -> float:
+        g = self.tuning["gripper"]
+        return float(np.clip(rad / g["full_open_rad"] * g["max_gap_m"], 0.0, g["max_gap_m"]))
+
+    def _rad(self, gap: float) -> float:
+        g = self.tuning["gripper"]
+        return float(np.clip(gap, 0.0, g["max_gap_m"]) / g["max_gap_m"] * g["full_open_rad"])
+
+    def _gripper_cmd(self, bus, q, kw) -> None:
+        c = self.control
+        if c["state"] != "holding" or c.get("fault"):
+            c["message"] = "グリッパー: アームが保持中（異常なし）のときだけ操作する"
+            return
+        if q.get("gripper") is None:
+            c["message"] = "グリッパー: 角度が読めない"
+            return
+        g = c.get("gripper") or {}
+        if not c.get("gripper_enabled"):
+            bus.prepare_mit("gripper")
+            bus.enable(["gripper"])
+            c["gripper_enabled"] = True
+            g = {"cmd_rad": q["gripper"]}
+        act = kw.get("action")
+        tu = self.tuning["gripper"]
+        if act in ("open", "release"):
+            gap = float(np.clip(float(kw.get("gap_mm", 0)) / 1000, 0.0, tu["max_gap_m"]))
+            g.update(mode="position", target_rad=self._rad(gap), target_gap_m=gap, cmd_rad=g.get("cmd_rad", q["gripper"]),
+                     event=f"{'開く' if act == 'open' else '離す'}: 隙間 {gap * 1000:.0f} mm へ")
+        elif act == "grip":
+            expect = float(kw.get("width_mm", 0)) / 1000
+            if not 0.005 <= expect <= tu["max_gap_m"]:
+                c["message"] = "グリッパー: 挟む物の幅 width_mm が範囲外"
+                return
+            g.update(mode="grip", expect_m=expect, t0=time.monotonic(), still_since=None,
+                     event=f"挟み中（予定の幅 {expect * 1000:.0f} mm、トルク {tu['grip_torque_nm']:.2f} N m）")
+        elif act == "hold":
+            g.update(mode="position", target_rad=q["gripper"], target_gap_m=self._gap(q["gripper"]), cmd_rad=q["gripper"],
+                     event="その場で保持")
+        else:
+            c["message"] = f"グリッパー: 不明な操作 {act}"
+            return
+        if act != "hold":
+            g["result"] = None
+        c["gripper"] = g
+        c["message"] = "グリッパー: " + g["event"]
+
+    def _gripper_step(self, bus, q) -> None:
+        """Every cycle while the gripper is enabled: ramp a position target, or close with a torque limit."""
+        c = self.control
+        g = c.get("gripper")
+        if not c.get("gripper_enabled") or not g or "mode" not in g:
+            return
+        tu, dt = self.tuning["gripper"], 1.0 / CTRL_HZ
+        qg = q.get("gripper")
+        if qg is None:                                   # no feedback: repeat the last command
+            if g.get("last_send"):
+                bus.send_mit("gripper", *g["last_send"])
+            return
+        g["gap_now_m"] = self._gap(qg)
+        if g["mode"] == "position":
+            step = tu["speed_rad_s"] * dt
+            g["cmd_rad"] = float(g["cmd_rad"] + np.clip(g["target_rad"] - g["cmd_rad"], -step, step))
+            send = (g["cmd_rad"], tu["kp"], tu["kd"], 0.0, 0.0)
+        else:                                            # grip: no spring, closing torque (towards 0 rad)
+            send = (qg, 0.0, tu["grip_kd"], 0.0, tu["grip_torque_nm"])
+            vel = next((r.get("vel") for r in self.last_rows if r["name"] == "gripper"), None)
+            now = time.monotonic()
+            if vel is not None and abs(vel) < GRIP_STILL_RAD_S and now - g["t0"] > 0.4:
+                g["still_since"] = g.get("still_since") or now
+            else:
+                g["still_since"] = None
+            closed = g["gap_now_m"] < 0.003
+            settled = g["still_since"] is not None and now - g["still_since"] > GRIP_SETTLE_S
+            if g.get("result") is None and (closed or settled or now - g["t0"] > GRIP_TIMEOUT_S):
+                if not closed and g["gap_now_m"] > g["expect_m"] + 0.015:
+                    # stopped well wider than the object: not closing (torque direction, jam) -- do not call it a grip
+                    g.update(result="not_closing", mode="position", target_rad=qg, cmd_rad=qg, target_gap_m=g["gap_now_m"],
+                             event=f"閉じない: 隙間 {g['gap_now_m'] * 1000:.1f} mm で止まった（予定 {g['expect_m'] * 1000:.0f} mm）。"
+                                   "トルクの向き・引っかかりを確認。その場で保持")
+                    send = (qg, tu["kp"], tu["kd"], 0.0, 0.0)
+                elif not closed and g["gap_now_m"] >= g["expect_m"] - tu["miss_margin_m"]:
+                    g.update(result="holding", event=f"把持中: 隙間 {g['gap_now_m'] * 1000:.1f} mm（予定 {g['expect_m'] * 1000:.0f} mm）、トルクを維持")
+                else:
+                    g.update(result="missed", mode="position", target_rad=qg, cmd_rad=qg, target_gap_m=g["gap_now_m"],
+                             event=f"つかみ損ね: 隙間 {g['gap_now_m'] * 1000:.1f} mm まで閉じた（予定 {g['expect_m'] * 1000:.0f} mm）。その場で保持")
+                    send = (qg, tu["kp"], tu["kd"], 0.0, 0.0)
+                c["message"] = "グリッパー: " + g["event"]
+                self.audit("gripper: " + g["event"], "service")
+            elif g.get("result") == "holding" and g["gap_now_m"] < g["expect_m"] - tu["miss_margin_m"]:
+                g["event"] = f"警告: 把持中に隙間が {g['gap_now_m'] * 1000:.1f} mm まで減った（滑り・落下の疑い）"
+        g["last_send"] = send
+        bus.send_mit("gripper", *send)
 
     def _fault(self, why: str, keep_target: bool) -> None:
         """Stop any motion; hold the planned point of this instant (or the last command)."""
@@ -751,7 +862,7 @@ class ArmService:
         elif cmd == "release":
             names = ARM + (["gripper"] if c.get("gripper_enabled") else [])
             bus.disable(names)
-            c.update(state="read_only", motion=None, hold_q=None, gripper_enabled=False, fault=None,
+            c.update(state="read_only", motion=None, hold_q=None, gripper_enabled=False, gripper=None, fault=None,
                      message="トルクを切った（読み取り専用に戻った）")
         elif cmd == "execute":
             if c["state"] != "holding":
@@ -794,6 +905,8 @@ class ArmService:
                 else:
                     self.audit("fault acknowledged: " + c["fault"], "user")
                     c.update(fault=None, message="異常を確認・解除した（保持中）")
+        elif cmd == "gripper":
+            self._gripper_cmd(bus, q, kw)
         elif cmd == "grasp":
             c["message"] = "実機での把持実行は拒否: " + "; ".join(kw.get("blockers") or ["条件未確認"])
 
@@ -852,6 +965,10 @@ class ArmService:
                 if path == "/api/test/inject" and svc.args.fake:
                     svc.bus.inject.update(body)
                     return self._json({"ok": True, "inject": svc.bus.inject})
+                if path == "/api/gripper":
+                    if body.get("action") not in ("open", "release", "grip", "hold"):
+                        return self._json({"ok": False, "message": "action は open / release / grip / hold"})
+                    return self._json(svc.submit("gripper", src, **{k: body[k] for k in ("action", "gap_mm", "width_mm") if k in body}))
                 if path == "/api/grasp":
                     g = fetch_json(f"{svc.args.sim_url}/api/real_grasp_check") or {}
                     return self._json(svc.submit("grasp", src, blockers=g.get("blockers", ["シミュレーターに接続できない"])))

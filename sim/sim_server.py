@@ -797,7 +797,7 @@ class Sim:
             jaw = self.settings["jaw"]
             plan = None
             if self.plan:
-                plan = {"basis": self.plan["basis"], "basis_label": self.plan["basis_label"],
+                plan = {"basis": self.plan["basis"], "basis_label": self.plan["basis_label"], "t": self.plan["t"],
                         "candidates": [c.json() for c in self.plan["candidates"]]}
             mT = d.xmat[ids.end_body].reshape(3, 3)
             return {

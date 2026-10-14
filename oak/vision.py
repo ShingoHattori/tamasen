@@ -633,7 +633,8 @@ def main() -> int:
             if body:
                 hdr["Content-Type"] = "application/json"
             req = urllib.request.Request(base + path, data=body, method=method, headers=hdr)
-            with urllib.request.urlopen(req, timeout=10 if stream else 3) as r:
+            # POSTs run planning / path simulation / pose generation in the simulator (seconds when busy)
+            with urllib.request.urlopen(req, timeout=10 if stream else (60 if method == "POST" else 3)) as r:
                 ctype = r.headers.get("Content-Type", "application/octet-stream")
                 if stream:
                     handler.send_response(200)

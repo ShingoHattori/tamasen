@@ -19,3 +19,15 @@ friction_nm:
 options:
   friction_v: 0.02      # rad/s, 摩擦項の向きを切り替える幅（0 付近をなめらかにする）
   # kp / kd を SDK yaml から変える場合だけ書く（例: kp_joint3: 160.0）。未記入なら yaml の値。
+
+# グリッパー（モーター gripper、MIT）。開く・離す = 位置指令（速さ制限つき）、挟む = 閉じる向きの一定トルク（ばねなし）。
+# 換算は sim/scene.toml [jaw] と同じ実測値（2026-10-14、定規: 0 / 50 / 100 mm = -0.022 / -2.929 / -5.896 rad、遊び約 1 mm）。
+gripper:
+  full_open_rad: -5.896     # 最大開口のモーター角
+  max_gap_m: 0.100          # 最大開口（顎の内側の隙間）
+  grip_torque_nm: 0.25      # 挟むトルク。歯車（m1・16 歯、半径 8 mm）から顎 1 本あたり十数 N の見積もり
+  speed_rad_s: 2.0          # 開く・離すの速さ（約 34 mm/s）
+  kp: 8.0                   # 位置保持のばね（SDK yaml の MIT kp）
+  kd: 1.0
+  grip_kd: 0.3              # 挟むときの減衰
+  miss_margin_m: 0.008      # 予定の幅よりこれ以上閉じたら「つかみ損ね」
