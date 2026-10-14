@@ -21,7 +21,7 @@ model = mujoco.MjModel.from_xml_string(xml)
 data = mujoco.MjData(model); mujoco.mj_forward(model, data)
 r = mujoco.Renderer(model, 700, 900)
 tiles = []
-for az, el, fingers, dist in ((-135, -35, False, 0.22), (-60, 35, False, 0.22), (90, -89, False, 0.2), (-135, -30, True, 0.3)):
+for az, el, fingers, dist in ((-150, -30, False, 0.24), (180, -12, False, 0.22), (90, -60, False, 0.24), (-135, -30, True, 0.3)):
     cam = mujoco.MjvCamera(); cam.lookat[:] = [0.0 if not fingers else -0.005, 0, 0]; cam.distance = dist; cam.azimuth = az; cam.elevation = el
     opt = mujoco.MjvOption(); opt.geomgroup[1] = 1 if fingers else 0
     r.update_scene(data, cam, opt); tiles.append(r.render())

@@ -41,7 +41,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("outdir")
 ap.add_argument("--finger-step", help="wrist_gripper_in_end_link.step (end_link frame) for the fit check")
 ap.add_argument("--depth", type=float, default=40.0, help="jig thickness along the fingers (x)")
-ap.add_argument("--rod", type=float, nargs=2, default=[20.0, 30.0], metavar=("W", "H"), help="rod hole, y x z")
+ap.add_argument("--rod", type=float, nargs=2, default=[30.0, 20.0], metavar=("W", "H"), help="rod hole, y x z (30 along the closing axis; requester 2026-10-14)")
 ap.add_argument("--pocket", type=float, nargs=2, default=[20.0, 32.0], metavar=("W", "H"),
                 help="finger pocket, y x z (finger: 12.7 thick; 27 wide at 40 mm, 30 at 45 mm from the tip)")
 ap.add_argument("--inner", type=float, default=6.0, help="wall between pocket and rod hole (the jaws press it)")
