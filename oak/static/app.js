@@ -321,7 +321,10 @@ async function autoMove(target, label) {
   const p = await post("/sim/api/check_path", { target });
   checkedPath = p;
   if (!p.ok) throw new Error(`${label}: 経路が通らない — ${p.message || ""}`);
-  autoLog(`${label}: 経路シミュレーション OK（${f(p.duration_s, 1)} s、床 ${mm(p.min_floor_clearance_m, 0)} mm、顎 ${mm(p.gap_m, 0)} mm）→ 実行`);
+  await autoExec(p, label);
+}
+async function autoExec(p, label) {
+  autoLog(`${label}: 経路シミュレーション OK（${p.label}、${f(p.duration_s, 1)} s、床 ${mm(p.min_floor_clearance_m, 0)} mm、顎 ${mm(p.gap_m, 0)} mm）→ 実行`);
   const r = await post("/arm/api/execute", { path_id: p.id });
   if (r.ok === false) throw new Error(`${label}: 実行を拒否された — ${r.message || ""}`);
   const t0 = Date.now();
@@ -331,6 +334,8 @@ async function autoMove(target, label) {
     if (c.fault) throw new Error(`${label}: 異常 — ${c.fault}`);
     if (c.state !== "moving" && Date.now() - t0 > 600) {
       if (c.state !== "holding") throw new Error(`${label}: 状態 ${c.state}`);
+      // a move cut short (lost liveness, stop) also ends in "holding": only a completed move goes on
+      if (!String(c.message || "").startsWith("移動完了")) throw new Error(`${label}: 移動が完了していない — ${c.message || ""}`);
       autoLog(`${label}: ${c.message || "完了"}`);
       return;
     }
@@ -355,6 +360,35 @@ async function autoAlign(target, label) {
     await autoMove(target, `${label}（補正後）`);
   }
   throw new Error(`${label}: 位置合わせが ${AUTO_ALIGN_TRIES} 回で収まらない`);
+}
+// Approach in short steps, re-measuring ID 1 before each one (the correction is not accumulated: each
+// measurement replaces the last). A step where ID 1 is not seen keeps the previous correction; a jump of
+// more than AUTO_STEP_JUMP_MM between consecutive corrections stops the sequence (suspect observation).
+const AUTO_STEP_MM = 10, AUTO_STEP_SETTLE_MS = 400, AUTO_STEP_JUMP_MM = 8;
+async function autoApproach(goal, label) {
+  let prev = null;
+  for (let i = 0; i < 20; i++) {
+    autoCheck();
+    await sleep(AUTO_STEP_SETTLE_MS);
+    const r = await post("/sim/api/visual_correct", {});
+    if (r.ok) {
+      const o = r.correction.offset_mm, n = Math.hypot(...o);
+      const jump = prev ? Math.hypot(o[0] - prev[0], o[1] - prev[1], o[2] - prev[2]) : 0;
+      autoLog(`${label} ${i + 1}: ずれ ${n.toFixed(1)} mm（${o.map(v => v.toFixed(1)).join(", ")}）、前回から ${jump.toFixed(1)} mm`);
+      if (n > AUTO_ALIGN_MAX_MM) throw new Error(`${label}: ずれ ${n.toFixed(1)} mm が自動の上限 ${AUTO_ALIGN_MAX_MM} mm を超える`);
+      if (prev && jump > AUTO_STEP_JUMP_MM) throw new Error(`${label}: 補正が前回から ${jump.toFixed(1)} mm 跳んだ（観測を確認）`);
+      prev = o;
+    } else {
+      autoLog(`${label} ${i + 1}: 補正なし（${r.message || ""}）、前回の補正のまま進む`);
+    }
+    autoCheck();
+    const p = await post("/sim/api/check_path", { target: `step:${goal}:${AUTO_STEP_MM}` });
+    checkedPath = p;
+    if (!p.ok) throw new Error(`${label}: 経路が通らない — ${p.message || ""}`);
+    await autoExec(p, `${label} ${i + 1}`);
+    if (p.remaining_mm === 0) return;
+  }
+  throw new Error(`${label}: 20 段で着かない`);
 }
 async function autoGripper(body, label, done, timeout_ms) {
   autoCheck();
@@ -395,9 +429,8 @@ $("autoGrasp").onclick = async () => {
     await autoMove("pre", "接近前");
     await autoAlign("pre", "接近前");
     await autoGripper({ action: "open", gap_mm: open }, `開く（${open} mm）`, g => g.gap_now_m != null && g.gap_now_m * 1000 >= open - 3, 8000);
-    await autoMove("near", "近接");
-    await autoAlign("near", "近接");
-    await autoMove("grasp", "把持姿勢（低速）");
+    await autoApproach("near", "近接");
+    await autoApproach("grasp", "把持姿勢（低速）");
     const res = await autoGripper({ action: "grip", width_mm: width }, "挟む", g => g.result, 10000);
     if (res !== "holding") {
       await autoGripper({ action: "release", gap_mm: open }, `離す（${open} mm まで開く）`, g => g.gap_now_m != null && g.gap_now_m * 1000 >= open - 3, 8000);

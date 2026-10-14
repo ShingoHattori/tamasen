@@ -578,7 +578,7 @@ def main() -> int:
         fps = Ticker()
         try:
             if args.replay:
-                frames = ((f, r["t"], r) for f, r in src)
+                frames = ((f, time.time(), r) for f, r in src)     # stamped as live (the sim drops stale observations)
             else:
                 frames = ((f, t, tf) for f, t, tf in source)
             for color, t, extra in frames:

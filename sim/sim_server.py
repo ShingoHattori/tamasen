@@ -470,7 +470,7 @@ class Sim:
             return {"ok": False, "message": "実機の関節角が読めない: " + str(arm.get("error", "応答なし"))}
         by = {j["name"]: j["pos"] for j in arm["joints"]}
         q_from = np.array([by[n] for n in scene.ARM_JOINTS])
-        cand = None
+        cand, remain = None, None
         if target.startswith("calib:"):
             cp = getattr(self, "calib_poses", None)
             if not cp:
@@ -494,13 +494,46 @@ class Sim:
             cand = self.plan["candidates"][cand_index] if cand_index is not None else (ok[0] if ok else None)
             if cand is None or not cand.ok:
                 return {"ok": False, "message": "条件を満たす候補がない"}
-            q_to = {"pre": cand.q_pre, "near": cand.q_near, "grasp": cand.q_grasp, "lift": cand.q_lift}[target]
+            # "step:<goal>:<mm>": at most <mm> along the straight line from the grip site now (FK) to the
+            # goal's (corrected) grip site, so the visual correction can be redone between short steps
+            step = target.split(":") if target.startswith("step:") else None
+            goal = step[1] if step else target
+            q_to = {"pre": cand.q_pre, "near": cand.q_near, "grasp": cand.q_grasp, "lift": cand.q_lift}[goal]
             if q_to is None:
                 return {"ok": False, "message": "この候補には近接の姿勢がない（計画し直す）"}
             label = f"{cand.name}: " + {"pre": "接近前の姿勢", "near": "近接（把持の 3 cm 手前）", "grasp": "把持姿勢",
-                                        "lift": "持ち上げ姿勢"}[target]
+                                        "lift": "持ち上げ姿勢"}[goal]
+            if step:
+                d_ = mujoco.MjData(self.m)
+                site = []
+                for q_ in (q_from, q_to):
+                    d_.qpos[self.ids.arm_qadr] = q_
+                    mujoco.mj_kinematics(self.m, d_)
+                    site.append(d_.site_xpos[self.ids.grip_site].copy())
+                # step on from the last commanded step point while the arm is near it (the holding loop closes
+                # the remaining lag), so a lagging arm does not shorten every step
+                prev = getattr(self, "step_point", None)
+                start = site[0]
+                if (prev and prev["key"] == (cand.name, goal) and time.time() - prev["t"] < 120
+                        and np.linalg.norm(prev["p"] - site[0]) < 0.02):
+                    start = prev["p"]
+                rest = site[1] - start
+                dist, lim = float(np.linalg.norm(rest)), float(step[2]) / 1000
+                if dist > lim * 1.5:
+                    p_step = start + rest * (lim / dist)
+                    q_to, pe, re = planner.solve_ik(self.m, d_, self.ids, p_step, cand.R_end, q_from)
+                    self.step_point = {"key": (cand.name, goal), "p": p_step, "t": time.time()}
+                    if pe > planner.IK_POS_TOL or re > planner.IK_ROT_TOL:
+                        return {"ok": False, "message": f"途中の点が解けない（IK 残差 {pe * 1000:.1f} mm / {math.degrees(re):.1f}°）"}
+                    label += f"へ {lim * 1000:.0f} mm（残り {(dist - lim) * 1000:.0f} mm）"
+                    remain = (dist - lim) * 1000
+                else:
+                    label += f"へ最後の {dist * 1000:.0f} mm"
+                    self.step_point = None
+                    remain = 0.0
             if cand.correction:
                 label += f"（視覚補正 {np.linalg.norm(cand.correction['offset_mm']):.1f} mm 済み）"
+            target = goal
         vmax = VMAX_FINAL if target == "grasp" else None
         # Jaws as they are on the real arm, and for near / grasp at least as wide as the approach opening.
         jaw = self.settings["jaw"]
@@ -512,7 +545,7 @@ class Sim:
         res = simulate_profile(self.m, self.ids, q_from, np.asarray(q_to, float), self.gap.gap0, vmax, gap, held)
         import uuid
         pid = uuid.uuid4().hex[:12]
-        rec = dict(res, id=pid, label=label, checked_at=time.time(), q_from=q_from.tolist(),
+        rec = dict(res, id=pid, label=label, checked_at=time.time(), q_from=q_from.tolist(), remaining_mm=remain,
                    message=("シミュレーションで問題なし（床との距離・登録済み障害物・自己衝突・関節制限・追従）。"
                             + ("未登録の障害物: " + ", ".join(o["name"] for o in scene.obstacle_report(self.settings) if not o["in_scene"]) + "。" 
                                if any(not o["in_scene"] for o in scene.obstacle_report(self.settings)) else "")

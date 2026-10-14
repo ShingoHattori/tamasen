@@ -72,6 +72,8 @@ ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   # 手元で http:
   hand-eye 採用時は把持候補に傾き（0, ±20, ±35°）を加えて 120 通りにし、接近前・近接（把持の 3 cm 手前）で ID 1 がカメラから見える
   （向き 55° 以内、画面端 40 px 以上内側、一辺 20 px 以上）ものだけを通す。机すき間 17 mm を保つ。近接→把持は 0.10 rad/s。
   「カメラで位置合わせ」（/api/visual_correct）: ID 1 の 10 フレームで FK 把持点との差を求め、残りの目標をずらして IK を解き直す（30 mm 超は拒否、累積しない）。
+  自動シーケンス（「掴んで初期位置へ戻る」）の接近前→近接→把持は 10 mm 刻み（`check_path` の `step:<goal>:<mm>`）で、各段の前に ID 1 で視覚補正し直す
+  （ID 1 が見えない段は前回の補正のまま、補正が前回から 8 mm 超跳んだら停止）。各段も経路シミュレーションを通したものだけ実行。
   2026-10-14 07:42 の事故（真上からの盲目接近で指がブロックに刺さった）を受けた変更。実機の手順: 計画 → 接近前 → 位置合わせ → 近接 → 位置合わせ → 把持（低速）→ 挟む → 持ち上げ。
   ID 1 マーカー台（取り付け済み）を `scene.toml [marker_mount]` で end_link に追加（`check_mount.py` / `render_mount.py`、詳細は `cad/README.md`）。
 - 依存: oak/.venv depthai 3.10.0 / opencv 5.0.0.93 / numpy 2.4.6、rebot venv motorbridge 0.5.6 / pinocchio 3.9.0、sim/.venv は `sim/requirements.txt`。three.js 0.170.0 を `oak/static/vendor` に同梱。
