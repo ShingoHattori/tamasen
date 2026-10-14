@@ -184,7 +184,9 @@ class Sim:
             if grip is not None:
                 gap = float(np.clip(grip / jaw["gripper_rad_full_open"] * jaw["max_gap_m"], 0, jaw["max_gap_m"]))
                 half = float(np.clip((gap - self.gap.gap0) / 2, *self.ids.fl_range))
-                info["gripper"] = f"実機グリッパー角 {grip:+.3f} rad → 隙間 {gap * 1000:.0f} mm（換算式は未検証）"
+                info["gripper"] = (f"実機グリッパー角 {grip:+.3f} rad → 隙間 {gap * 1000:.0f} mm（換算式: "
+                                   + ("実測済み、開閉の向きで約 1 mm ずれる）" if jaw.get("gripper_map_status") in ("measured", "calibrated")
+                                      else "未検証）"))
             else:
                 half = 0.0
                 info["gripper"] = "グリッパー角なし → 閉"
@@ -801,7 +803,7 @@ class Sim:
                 "jaw": {"gap_m": self.gap(fl), "max_gap_model_m": self.gap(ids.fl_range[1]),
                         "max_gap_config": {"value": jaw["max_gap_m"], "status": jaw["max_gap_status"]},
                         "note": "物理的な把持 = 指の衝突メッシュ（front/mid/rear）、表示 = 着色メッシュ。"
-                                "実機グリッパーの形状・開口幅とモデルの対応は未確認。"},
+                                "最大開口はモデル 100 mm・実機 100 mm（2026-10-14 実測）。顎の形状そのものの対応は未確認。"},
                 "fk": {"frame": "end_link（台座座標、MuJoCo）", "p": d.xpos[ids.end_body].tolist(), "R": mT.tolist()},
                 "real_fk": self.real_fk,
                 "fk_vs_vision": self.fk_vs_vision,

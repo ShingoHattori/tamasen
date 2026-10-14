@@ -33,14 +33,17 @@ friction_status = "sample"
 force_limit_n = 20.0              # 片側の顎の最大押し付け力（シミュレーション上の仮定）
 force_limit_status = "sample"
 # 最大開口（両顎の内側の隙間）。公開モデルは指 1 本 0〜0.05 m（隙間 約 0〜100 mm）。
-# 旧版・資料には「実機 0〜57 mm」の記述もあり、実機では未確認。
+# 2026-10-14 実測（依頼者、定規）: 最大 100 mm（モーター角 -5.896 rad）。資料の「0〜57 mm」は当てはまらない。
 max_gap_m = 0.100
-max_gap_status = "sample"
+max_gap_status = "measured"
 clearance_m = 0.010               # 把持前に必要な余裕（必要開口 = 物体幅 + clearance）
-# 実機グリッパーのモーター角 → 隙間の換算（Borot hardware_manager.py の式、実機未確認）:
+# 実機グリッパーのモーター角 → 隙間の換算（Borot hardware_manager.py と同じ比例の式）:
 #   gap = clip(motor_rad / gripper_rad_full_open * max_gap_m, 0, max_gap_m)
-gripper_rad_full_open = -5.0
-gripper_map_status = "sample"
+# 2026-10-14 実測: 全閉 -0.022 rad = 0 mm、-2.929 rad = 50 mm（比例なら 49.5 mm）、-5.896 rad = 100 mm。
+# 歯車の遊び: 閉じる方向と開く方向で隙間が約 1 mm ずれる（依頼者）。換算はその範囲で比例とみなす。
+gripper_rad_full_open = -5.896
+gripper_map_status = "measured"
+gripper_backlash_m = 0.001
 
 [actuators]
 # 試行モードで関節を追従させる位置制御（シミュレーション内だけ。実機の制御パラメータではない）
