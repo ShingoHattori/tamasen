@@ -1,0 +1,6 @@
+cadquery-ocp==8.0.1.1.0
+trimesh==5.1.1
+numpy==2.5.4
+scipy==1.18.1
+rtree==1.4.1
+matplotlib==3.11.2

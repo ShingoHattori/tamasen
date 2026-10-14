@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 
 # Python virtual environments (rebuild from pyproject.toml / requirements.txt / uv.lock)
-.venv/
+.venv
 rebot/rebot/
 oak/venv.tar.gz
 run/
@@ -14,3 +14,7 @@ oak/output/replay_world_ref.json
 oak/calib/world_ref.json
 sim/output/
 oak/calib/grip/
+
+# reBot-DevArm (upstream CAD, ~0.9 GB; see cad/README.md) and generated CAD outputs
+/reBot-DevArm
+cad/out/

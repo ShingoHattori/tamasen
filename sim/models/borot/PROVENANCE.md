@@ -15,3 +15,8 @@ Checked against the control SDK: at the real arm's joint angles, MuJoCo's `end_l
 SDK's Pinocchio FK (`reBot-DevArm_fixend.urdf`) to < 1e-6 mm / 0 deg (`sim/verify_sim.py`).
 Related upstream repos checked on 2026-10-13: Seeed-Projects/reBot-DevArm `9ac6169`,
 Seeed-Projects/reBotArm_control_py `6415d43` (local copy in rebot/ is based on `40ab6ce`).
+
+Mesh check (2026-10-13, see `cad/README.md`): all 41 meshes here are byte-identical to
+`Rebot_Arm_description/DM/meshes/` in Seeed-Projects/reBot-DevArm `9ac6169`, and that repository's
+`ReBot_Arm_DM.urdf` has the same joint origins/axes/limits as the SDK's `reBot-DevArm_fixend.urdf`.
+No reason to replace this model.
