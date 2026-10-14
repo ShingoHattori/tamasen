@@ -67,6 +67,7 @@ class Candidate:
     targets: dict = field(default_factory=dict)      # base-frame grip-site targets (for visual correction)
     vis: dict = field(default_factory=dict)          # predicted ID 1 visibility per pose
     correction: dict | None = None
+    open_gap_m: float = 0.0                          # jaw gap while approaching (scene.toml [jaw] approach_gap_m)
 
     def json(self) -> dict:
         return {"name": self.name, "width_m": self.width_m, "ok": self.ok, "reasons": self.reasons,
@@ -75,7 +76,7 @@ class Candidate:
                 "q_grasp": None if self.q_grasp is None else self.q_grasp.tolist(),
                 "q_lift": None if self.q_lift is None else self.q_lift.tolist(),
                 "q_near": None if self.q_near is None else self.q_near.tolist(),
-                "tilt_deg": self.tilt_deg, "vis": self.vis, "correction": self.correction}
+                "tilt_deg": self.tilt_deg, "vis": self.vis, "correction": self.correction, "open_gap_m": self.open_gap_m}
 
 
 def _axis_rot(axis, ang):
@@ -194,12 +195,18 @@ def floor_clearance(m, d, ids: scene.Ids, q, gap: float) -> float:
                and (m.geom_contype[g] | m.geom_conaffinity[g]))
 
 
+def open_gap(c: Candidate, jaw: dict, model_max: float) -> float:
+    """Jaw gap for the approach: approach_gap_m (wide, so a few mm of position error still lands the block
+    between the jaws; requester 2026-10-14) but at least the required width + 10 mm, within the maximum."""
+    return float(min(max(c.width_m + 0.01, jaw.get("approach_gap_m", 0.0)), jaw["max_gap_m"], model_max))
+
+
 def retarget(m, settings: dict, c: Candidate, offset: np.ndarray, q_seed: np.ndarray) -> list[str]:
     """Shift all of a candidate's grip-site targets by offset (base frame) and re-solve them; returns problems."""
     d = mujoco.MjData(m)
     ids = scene.Ids(m)
     jaw = settings["jaw"]
-    gap = min(c.width_m + 0.01, jaw["max_gap_m"], scene._gap_model(m)(ids.fl_range[1]))
+    gap = c.open_gap_m or open_gap(c, jaw, scene._gap_model(m)(ids.fl_range[1]))
     qs, probs, seed = {}, [], q_seed
     for k in ("pre", "near", "grasp", "lift"):
         q, pe, re = solve_ik(m, d, ids, np.array(c.targets[k]) + offset, c.R_end, seed)
@@ -233,6 +240,7 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray, view: d
             c.reasons.append("下から接近する向き（床を通る）")
         if c.reasons:
             continue
+        c.open_gap_m = open_gap(c, jaw, model_max)
         # Fingertips are GRIP_TO_TIP beyond the grip site. Keep them TIP_MARGIN inside the block
         # along the approach, so a flat block grasped from above does not drive the tips into the floor.
         half_a = 0.5 * float(np.abs(T_base_obj[:3, :3].T @ c.approach) @ size)
@@ -255,10 +263,10 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray, view: d
             continue
         # Table clearance at the grasp pose (jaws open): raise the grasp point until the fingers / arm keep
         # PLAN_FLOOR_CLEARANCE, then require the jaws to still reach MIN_ENGAGE into the block.
-        open_gap = min(c.width_m + 0.01, max_gap, model_max)
+        gap_open = c.open_gap_m
         raised = 0.0
         for _ in range(4):
-            clr = floor_clearance(m, d, ids, c.q_grasp, open_gap)
+            clr = floor_clearance(m, d, ids, c.q_grasp, gap_open)
             if clr >= PLAN_FLOOR_CLEARANCE:
                 break
             dz = PLAN_FLOOR_CLEARANCE - clr + 0.001
@@ -275,7 +283,7 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray, view: d
         pe, re = max(pe, e4), max(re, r4)
         c.targets = {"pre": p_pre.tolist(), "near": p_near.tolist(), "grasp": p_grasp.tolist(),
                      "lift": (p_grasp + np.array([0, 0, LIFT])).tolist()}
-        clr = floor_clearance(m, d, ids, c.q_grasp, open_gap)
+        clr = floor_clearance(m, d, ids, c.q_grasp, gap_open)
         engage = half_a + float((p_grasp + c.approach * GRIP_TO_TIP - centre) @ c.approach)   # tips past the entry face
         note = (f"机とのすき間を保つため把持点を {raised * 1000:.0f} mm 上げた（指先がブロックに {engage * 1000:.0f} mm 入る）"
                 if raised > 0 else None)
@@ -297,8 +305,8 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray, view: d
             at_lim = [scene.ARM_JOINTS[i] for i in range(6) if q[i] - lo[i] < 1e-3 or hi[i] - q[i] < 1e-3]
             if at_lim:
                 c.reasons.append(f"{label}: 関節制限に当たっている（{', '.join(at_lim)}）")
-            open_gap = min(c.width_m + 0.01, max_gap, model_max)
-            k = static_contacts(m, d, ids, q, open_gap, block_away=True)
+            gap_open = c.open_gap_m
+            k = static_contacts(m, d, ids, q, gap_open, block_away=True)
             if k["floor"]:
                 c.reasons.append(f"{label}: 床と干渉（最大貫入 {max(k['floor']) * 1000:.1f} mm）")
             deep = [s for s in k["self"] if s[0] > SELF_PEN_TOL]
@@ -306,7 +314,7 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray, view: d
                 s = max(deep)
                 c.reasons.append(f"{label}: 自己衝突 {s[1]}–{s[2]}（{s[0] * 1000:.1f} mm）")
         # does the open gripper at the grasp pose already collide with the block (jaw not around it)?
-        k = static_contacts(m, d, ids, c.q_grasp, min(c.width_m + 0.01, max_gap, model_max), block_away=False)
+        k = static_contacts(m, d, ids, c.q_grasp, c.open_gap_m, block_away=False)
         if k["block"] and max(k["block"]) > 1e-3:
             c.reasons.append(f"開いた顎・手がブロックに食い込む（{max(k['block']) * 1000:.1f} mm）")
         c.ok = not c.reasons

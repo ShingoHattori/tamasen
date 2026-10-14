@@ -272,7 +272,7 @@ setInterval(() => {               // dead-man: only while this page is visible a
     fetch("/arm/api/heartbeat", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 }, 200);
 $("engage").onclick = () => { const t = prompt("実機の 6 関節を有効化し、現在位置で保持します。アーム周辺に人・物がないことを確認して MOVE と入力"); if (t) post("/arm/api/engage", { confirm: t }); };
-$("stopArm").onclick = () => post("/arm/api/stop");
+$("stopArm").onclick = () => { if (autoRun) autoRun.abort = true; post("/arm/api/stop"); };
 async function simulateAndGo(target, what) {
   const p = await post("/sim/api/check_path", { target });
   checkedPath = p;
@@ -305,6 +305,115 @@ $("execPath").onclick = () => {
     post("/arm/api/execute", { path_id: checkedPath.id });
 };
 $("graspReal").onclick = () => post("/arm/api/grasp");
+
+// ------------------------------------------------------------------ automatic grasp sequence (started by the user)
+// Every move is simulated first (check_path) and only a clean path is executed; any fault, refused path,
+// failed alignment or missed grip ends the sequence with the arm holding where it is.
+const AUTO_ALIGN_MM = 3, AUTO_ALIGN_MAX_MM = 15, AUTO_ALIGN_TRIES = 3;
+let autoRun = null;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const armNow = async () => (await fetch("/arm/state.json", { cache: "no-store" })).json();
+function autoLog(t) { $("autoLog").textContent += `${new Date().toLocaleTimeString()} ${t}\n`; }
+function autoCheck() { if (autoRun.abort) throw new Error("中止した"); }
+async function autoMove(target, label) {
+  autoCheck();
+  const p = await post("/sim/api/check_path", { target });
+  checkedPath = p;
+  if (!p.ok) throw new Error(`${label}: 経路が通らない — ${p.message || ""}`);
+  autoLog(`${label}: 経路シミュレーション OK（${f(p.duration_s, 1)} s、床 ${mm(p.min_floor_clearance_m, 0)} mm、顎 ${mm(p.gap_m, 0)} mm）→ 実行`);
+  const r = await post("/arm/api/execute", { path_id: p.id });
+  if (r.ok === false) throw new Error(`${label}: 実行を拒否された — ${r.message || ""}`);
+  const t0 = Date.now();
+  for (;;) {
+    await sleep(200);
+    const c = (await armNow()).control || {};
+    if (c.fault) throw new Error(`${label}: 異常 — ${c.fault}`);
+    if (c.state !== "moving" && Date.now() - t0 > 600) {
+      if (c.state !== "holding") throw new Error(`${label}: 状態 ${c.state}`);
+      autoLog(`${label}: ${c.message || "完了"}`);
+      return;
+    }
+    if (autoRun.abort) { await post("/arm/api/stop"); throw new Error("中止した（停止を送った）"); }
+  }
+}
+async function autoAlign(target, label) {
+  let applied = null;
+  for (let i = 0; i < AUTO_ALIGN_TRIES; i++) {
+    autoCheck();
+    await sleep(800);                                     // let the arm settle before looking at ID 1
+    const r = await post("/sim/api/visual_correct", {});
+    if (!r.ok) throw new Error(`${label}の位置合わせ: ${r.message || ""}`);
+    const o = r.correction.offset_mm, n = Math.hypot(...o);
+    // the offset is the FK-vs-camera error at this pose; after moving by it, the next measurement should
+    // repeat it (the error of the calibration), so the residual is its change, not its size
+    const resid = applied ? Math.hypot(o[0] - applied[0], o[1] - applied[1], o[2] - applied[2]) : n;
+    autoLog(`${label}の位置合わせ ${i + 1}: ずれ ${n.toFixed(1)} mm（${o.map(v => v.toFixed(1)).join(", ")}）、残り ${resid.toFixed(1)} mm`);
+    if (n > AUTO_ALIGN_MAX_MM) throw new Error(`${label}: ずれ ${n.toFixed(1)} mm が自動の上限 ${AUTO_ALIGN_MAX_MM} mm を超える（校正・観測を確認）`);
+    if (resid < AUTO_ALIGN_MM) return;
+    applied = o;
+    await autoMove(target, `${label}（補正後）`);
+  }
+  throw new Error(`${label}: 位置合わせが ${AUTO_ALIGN_TRIES} 回で収まらない`);
+}
+async function autoGripper(body, label, done, timeout_ms) {
+  autoCheck();
+  const r = await post("/arm/api/gripper", body);
+  if (r.ok === false) throw new Error(`${label}: ${r.message || ""}`);
+  const t0 = Date.now();
+  for (;;) {
+    await sleep(200);
+    const c = (await armNow()).control || {};
+    if (c.fault) throw new Error(`${label}: 異常 — ${c.fault}`);
+    const g = c.gripper || {};
+    const v = done(g);
+    if (v) { autoLog(`${label}: ${g.event || ""}`); return v; }
+    if (Date.now() - t0 > timeout_ms) throw new Error(`${label}: ${timeout_ms / 1000} s で終わらない（${g.event || ""}）`);
+    autoCheck();
+  }
+}
+$("autoGrasp").onclick = async () => {
+  if (autoRun) return;
+  const a = await armNow(), c = a.control || {};
+  if (c.state !== "holding" || c.fault) { $("autoLog").textContent = "アームが有効・保持中（異常なし）のときだけ開始できる"; return; }
+  const t = prompt("ブロックを掴んで有効化時の姿勢へ戻るまでを自動で行います。各移動はシミュレーションで確認してから実行し、"
+    + "異常・位置合わせ失敗・つかみ損ねで止まります。アーム周辺とカメラスタンドを確認して GRASP と入力");
+  if (t !== "GRASP") return;
+  autoRun = { abort: false };
+  $("autoLog").textContent = "";
+  $("autoGrasp").disabled = true;
+  try {
+    await post("/sim/api/placement", { source: "observed" });       // plan from what the camera sees now
+    await sleep(1500);
+    autoLog("把持候補を計算中…");
+    const pl = await post("/sim/api/plan");
+    const st = await (await fetch("/sim/api/state", { cache: "no-store" })).json();
+    const cand = ((st.plan || {}).candidates || []).find(x => x.ok);
+    if (!cand) throw new Error("条件を満たす把持候補がない — " + (pl.message || ""));
+    const width = Math.round((cand.width_m - 0.01) * 1000), open = Math.round(cand.open_gap_m * 1000);
+    autoLog(`候補: ${cand.name}（物の幅 ${width} mm、接近時の開口 ${open} mm）`);
+    await autoMove("pre", "接近前");
+    await autoAlign("pre", "接近前");
+    await autoGripper({ action: "open", gap_mm: open }, `開く（${open} mm）`, g => g.gap_now_m != null && g.gap_now_m * 1000 >= open - 3, 8000);
+    await autoMove("near", "近接");
+    await autoAlign("near", "近接");
+    await autoMove("grasp", "把持姿勢（低速）");
+    const res = await autoGripper({ action: "grip", width_mm: width }, "挟む", g => g.result, 10000);
+    if (res !== "holding") {
+      await autoGripper({ action: "release", gap_mm: open }, `離す（${open} mm まで開く）`, g => g.gap_now_m != null && g.gap_now_m * 1000 >= open - 3, 8000);
+      throw new Error(`挟む: ${res === "missed" ? "つかみ損ね" : "閉じない"}。顎を開いてその場で保持（位置を確かめてやり直す）`);
+    }
+    await autoMove("lift", "持ち上げ");
+    const g2 = ((await armNow()).control || {}).gripper || {};
+    if (g2.result !== "holding") throw new Error("持ち上げ後に把持していない（落とした疑い）");
+    await autoMove("engage_pose", "有効化時の姿勢へ");
+    autoLog("完了: ブロックを把持したまま有効化時の姿勢で保持中");
+  } catch (e) {
+    autoLog("停止: " + e.message);
+  } finally {
+    autoRun = null;
+    $("autoGrasp").disabled = false;
+  }
+};
 $("visCorrect").onclick = async () => {
   $("pathres").innerHTML = '<span class="info">ID 1 を観測中（約 1 秒、動かさないで）…</span>';
   const r = await post("/sim/api/visual_correct", {});

@@ -302,11 +302,13 @@ class FakeBus:
         self.log = []
         # test hooks (fake only). wall: {joint: motor angle} the joint cannot pass (a rigid obstacle); the
         # reported torque then includes the position loop's push kp (target - q) like a real MIT motor.
-        self.inject = {"no_feedback": False, "status": {}, "wall": {}}
+        # grip_stop_rad: where a torque-closing gripper (kp 0) stops on an object (default: fully closed).
+        self.inject = {"no_feedback": False, "status": {}, "wall": {}, "grip_stop_rad": 0.0}
         self.speed = speed                                     # <1: motors slower than commanded (lag)
         self.tau = {}                                          # last MIT feedforward, reported as the motor torque
         self.kp = {}
         self.wall_side = {}
+        self.v = {}
 
     def read_params(self):
         return {n: {"can_timeout": 0, "ctrl_mode": 2, "fake": True} for n in self.q}
@@ -315,12 +317,14 @@ class FakeBus:
         dt, self.t = time.monotonic() - self.t, time.monotonic()
         for n in self.enabled:
             e = self.target[n] + self.sag.get(n, 0.0) - self.q[n]
-            q_new = self.q[n] + math.copysign(min(abs(e), self.vlim * self.speed * dt), e)
+            vl = 4.0 if n == "gripper" else self.vlim * self.speed
+            q_new = self.q[n] + math.copysign(min(abs(e), vl * dt), e)
             w = self.inject["wall"].get(n)
             if w is not None:
                 side = self.wall_side.setdefault((n, w), math.copysign(1.0, self.q[n] - w))   # side it started on
                 if (q_new - w) * side < 0:                                   # would cross the wall: stop on it
                     q_new = float(w)
+            self.v[n] = (q_new - self.q[n]) / dt if dt > 0 else 0.0
             self.q[n] = q_new
 
     def poll(self, settle_s=0.0):
@@ -330,6 +334,7 @@ class FakeBus:
         out = {}
         for n, v in self.q.items():
             s = FakeState(v + np.random.normal(0, 1e-5))
+            s.vel = self.v.get(n, 0.0)
             s.torq = self.tau.get(n, 0.0) + np.random.normal(0, 0.02)
             if n in self.inject["wall"] and n in self.kp:
                 s.torq += self.kp[n] * (self.target[n] - v)
@@ -358,6 +363,8 @@ class FakeBus:
 
     def send_mit(self, name, pos, kp, kd, vel=0.0, tau=0.0):
         self._check(); self._advance(); self.target[name] = pos; self.vlim = 1.0; self.tau[name] = float(tau); self.kp[name] = float(kp)
+        if name == "gripper" and kp == 0.0 and tau != 0.0:          # closing on torque: runs until the object
+            self.target[name] = float(self.inject.get("grip_stop_rad", 0.0))
         self.log.append(("mit_cmd", name, round(float(pos), 4), round(float(vel), 4), round(float(tau), 3))) \
             if len(self.log) < 5000 else None
 

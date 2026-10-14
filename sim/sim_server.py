@@ -335,7 +335,7 @@ class Sim:
                 self._log(f"ブロックの最下点 z={zmin * 1000:+.1f} mm → 床に接地させた（補正 {-zmin * 1000:+.1f} mm）")
             q_now = d.qpos[ids.arm_qadr].copy()
             d.ctrl[ids.act_arm] = q_now
-            open_half = float(np.clip((min(cand.width_m + 0.01, max_gap) - self.gap.gap0) / 2, *ids.fl_range))
+            open_half = float(np.clip((min(cand.open_gap_m or cand.width_m + 0.01, max_gap) - self.gap.gap0) / 2, *ids.fl_range))
             d.ctrl[ids.act_grip] = d.qpos[ids.fl_q]
             z0 = float(d.qpos[ids.block_q + 2])
         self._log(f"候補: {cand.name}、必要開口 {cand.width_m * 1000:.0f} mm、開く量 {2 * open_half * 1000 + self.gap.gap0 * 1000:.0f} mm")
@@ -452,24 +452,25 @@ class Sim:
     # ------------------------------------------------------------------ real-arm path checks
     # The arm service executes only paths stored here, fetched by id; the browser never sends raw
     # joint targets to the arm. The check covers the floor, self-collision (beyond the hull
-    # tolerance) and joint limits along the straight joint-space path. The block and the camera
-    # stand are NOT checked: their positions relative to the base are not calibrated.
+    # tolerance), the registered obstacle boxes and joint limits along the straight joint-space path, with
+    # the jaws as open as they are (near / grasp: the approach opening) and a block held in them.
     def check_path(self, target: str, cand_index: int | None) -> dict:
         """Simulate the move the real arm would make, and accept it only if the simulation is clean.
 
         The profile (times, joint targets) computed here is exactly what the arm service executes:
         straight joint-space path, max joint speed VMAX. The simulation runs the model's dynamics
-        with gravity and the sim position actuators tracking that profile (block removed: its real
-        position is unknown until calibrated). Checks: floor clearance >= FLOOR_CLEARANCE for every
-        arm / jaw geom (so a real arm that sags or lags inside the execution corridor still clears
-        it), self-collision beyond the hull tolerance, joint limits, and the simulated tracking error.
-        Not checked: the block and the camera stand (positions relative to the base not calibrated).
+        with gravity and the sim position actuators tracking that profile. Checks: floor clearance >=
+        FLOOR_CLEARANCE for every arm / jaw geom (so a real arm that sags or lags inside the execution
+        corridor still clears it), registered obstacles, self-collision beyond the hull tolerance, joint
+        limits, the simulated tracking error, and a block held in the jaws (_held). The block lying on the
+        table is not in this check (the grasp planner checks the poses against it).
         """
         arm = fetch(self.args.arm_url + "/state.json")
         if not arm.get("ok"):
             return {"ok": False, "message": "実機の関節角が読めない: " + str(arm.get("error", "応答なし"))}
         by = {j["name"]: j["pos"] for j in arm["joints"]}
         q_from = np.array([by[n] for n in scene.ARM_JOINTS])
+        cand = None
         if target.startswith("calib:"):
             cp = getattr(self, "calib_poses", None)
             if not cp:
@@ -486,6 +487,7 @@ class Sim:
                 return {"ok": False, "message": "有効化時の姿勢が記録されていない"}
             q_to, label = np.array([qe[n] for n in scene.ARM_JOINTS]), "有効化時の姿勢へ戻る"
         else:
+            cand = None
             if not self.plan:
                 return {"ok": False, "message": "把持候補が未計算"}
             ok = [c for c in self.plan["candidates"] if c.ok]
@@ -500,14 +502,21 @@ class Sim:
             if cand.correction:
                 label += f"（視覚補正 {np.linalg.norm(cand.correction['offset_mm']):.1f} mm 済み）"
         vmax = VMAX_FINAL if target == "grasp" else None
-        res = simulate_profile(self.m, self.ids, q_from, np.asarray(q_to, float), self.gap.gap0, vmax)
+        # Jaws as they are on the real arm, and for near / grasp at least as wide as the approach opening.
+        jaw = self.settings["jaw"]
+        g = by.get("gripper")
+        gap = 0.0 if g is None else float(np.clip(g / jaw["gripper_rad_full_open"] * jaw["max_gap_m"], 0, jaw["max_gap_m"]))
+        if target in ("near", "grasp") and cand is not None:
+            gap = max(gap, cand.open_gap_m)
+        held, held_note = self._held(arm, q_from)
+        res = simulate_profile(self.m, self.ids, q_from, np.asarray(q_to, float), self.gap.gap0, vmax, gap, held)
         import uuid
         pid = uuid.uuid4().hex[:12]
         rec = dict(res, id=pid, label=label, checked_at=time.time(), q_from=q_from.tolist(),
                    message=("シミュレーションで問題なし（床との距離・登録済み障害物・自己衝突・関節制限・追従）。"
                             + ("未登録の障害物: " + ", ".join(o["name"] for o in scene.obstacle_report(self.settings) if not o["in_scene"]) + "。" 
                                if any(not o["in_scene"] for o in scene.obstacle_report(self.settings)) else "")
-                            + "実ブロックは camera↔base 未校正のため未確認"
+                            + f"顎の隙間 {gap * 1000:.0f} mm で確認。" + held_note + "置いてあるブロックとの干渉は経路では見ていない（把持候補の計算で確認済み）"
                             if res["ok"] else "実行不可: " + "; ".join(res["reasons"])))
         with self.lock:
             self.paths = {k: v for k, v in getattr(self, "paths", {}).items() if time.time() - v["checked_at"] < 600}
@@ -516,6 +525,30 @@ class Sim:
             self.last_path = rec
             self.preview = {"traj": res["sim_q"], "dt": res["sim_dt"], "t0": time.monotonic()}
         return {k: v for k, v in rec.items() if k not in ("sim_q",)}
+
+    def _held(self, arm: dict, q_from) -> tuple:
+        """T_end_block of the block in the real jaws (gripper reports a grip), else None.
+
+        Fixed at the first path check after the grip (the arm is still at the grasp pose then): the block is
+        where the plan saw it, shifted by the visual correction (the arm went there in the FK frame)."""
+        g = (arm.get("control") or {}).get("gripper") or {}
+        if g.get("result") != "holding":
+            self.held = None
+            return None, ""
+        if getattr(self, "held", None) is None:
+            if not self.plan:
+                return None, "把持中の物は計画がないため経路の確認に入っていない。"
+            T_obj = np.array(self.plan["T_base_obj"])
+            ok = [c for c in self.plan["candidates"] if c.ok]
+            if ok and ok[0].correction:
+                T_obj[:3, 3] += np.array(ok[0].correction["offset_mm"]) / 1000
+            d = mujoco.MjData(self.m)
+            d.qpos[self.ids.arm_qadr] = q_from
+            mujoco.mj_kinematics(self.m, d)
+            T_end = np.eye(4)
+            T_end[:3, :3], T_end[:3, 3] = d.xmat[self.ids.end_body].reshape(3, 3), d.xpos[self.ids.end_body]
+            self.held = np.linalg.inv(T_end) @ T_obj
+        return self.held, "把持中のブロック（計画時の位置）も一緒に確認。"
 
     def _grip_ok(self) -> bool:
         import tomllib
@@ -788,7 +821,21 @@ class Sim:
         m, ids = self.m, self.ids
         site_local = np.r_[m.site_pos[ids.grip_site], 1.0]           # grip site in end_link coordinates
         obs, qs = [], []
+        synth = self._synthetic_id1()
+        if isinstance(synth, str):
+            return {"ok": False, "message": synth}
         for _ in range(10):
+            if synth is not None:                                        # test only (fake arm): FK shifted
+                with self.lock:
+                    q_ = self.d.qpos[ids.arm_qadr].copy()
+                d_ = mujoco.MjData(m)
+                d_.qpos[ids.arm_qadr] = q_
+                mujoco.mj_kinematics(m, d_)
+                T = np.eye(4)
+                T[:3, :3], T[:3, 3] = d_.xmat[ids.end_body].reshape(3, 3), d_.xpos[ids.end_body] - synth + np.random.normal(0, 3e-4, 3)
+                obs.append(T)
+                qs.append(q_)
+                continue
             vs = fetch(self.args.vision_url + "/state.json")
             m1 = next((mk for mk in (vs or {}).get("markers", []) if mk.get("id") == 1), None)
             if m1 and m1.get("status") == "ok" and time.time() - vs.get("t", 0) < 0.3:
@@ -821,6 +868,15 @@ class Sim:
                                        f"(x {o[0] * 1000:+.1f}, y {o[1] * 1000:+.1f}, z {o[2] * 1000:+.1f})、向き {rot:.1f}°、"
                                        f"{len(obs)} フレーム（ばらつき {spread:.1f} mm）。接近前・近接・把持・持ち上げの目標を直した。"
                                        "次の移動は経路シミュレーションから", "correction": cand.correction}
+
+    def _synthetic_id1(self):
+        """--synthetic-id1-mm (tests with a fake arm only): ID 1 'seen' where FK puts it minus this offset."""
+        if not self.args.synthetic_id1_mm:
+            return None
+        arm = fetch(self.args.arm_url + "/state.json")
+        if not str((arm or {}).get("mode", "")).startswith("fake"):
+            return "合成の ID 1 観測（--synthetic-id1-mm）は模擬アーム（--fake）でだけ使える"
+        return np.array([float(v) for v in self.args.synthetic_id1_mm.split(",")]) / 1000
 
     def preview_calib(self) -> dict:
         cp = getattr(self, "calib_poses", None)
@@ -914,6 +970,7 @@ CAM_CLEAR_M = 0.25            # workspace calibration poses: end_link and ID 1 a
 VMAX = 0.25                  # rad/s — the same profile is executed by rebot/arm_state.py
 VMAX_FINAL = 0.10            # rad/s for the last approach (near -> grasp): shallower stop if the jaws hit something
 FLOOR_CLEARANCE = 0.015      # m, every arm / jaw geom along the simulated motion
+HELD_ARM_CLEARANCE = 0.010   # m, a held block from the links (end_link and the jaws excluded)
 SIM_TRACK_MAX = 0.05         # rad, the simulated arm must follow the profile this closely
 
 
@@ -929,26 +986,45 @@ def profile(q_from, q_to, dt=0.02, vmax=None):
     return t, q_from + np.outer(s, q_to - q_from)
 
 
-def simulate_profile(m, ids, q_from, q_to, gap0, vmax=None) -> dict:
+def simulate_profile(m, ids, q_from, q_to, gap0, vmax=None, gap=None, held=None) -> dict:
     # Obstacles are judged by distance below; in this dynamics run they must not push the arm around
     # (a path that starts inside an inflated box would otherwise be blocked by it).
-    saved = [(g, m.geom_contype[g], m.geom_conaffinity[g]) for g in ids.obstacle_geoms]
+    saved = [(g, m.geom_contype[g], m.geom_conaffinity[g]) for g in ids.obstacle_geoms + [ids.block_geom]]
     for g, _, _ in saved:
         m.geom_contype[g] = m.geom_conaffinity[g] = 0
     try:
-        return _simulate_profile(m, ids, q_from, q_to, gap0, vmax)
+        return _simulate_profile(m, ids, q_from, q_to, gap0, vmax, gap, held)
     finally:
         for g, ct, ca in saved:
             m.geom_contype[g], m.geom_conaffinity[g] = ct, ca
 
 
-def _simulate_profile(m, ids, q_from, q_to, gap0, vmax=None) -> dict:
+def _simulate_profile(m, ids, q_from, q_to, gap0, vmax=None, gap=None, held=None) -> dict:
+    """gap: jaw gap during the move (None = closed). held: T_end_block (4x4) of a block held in the jaws; it is
+    carried kinematically and must keep FLOOR_CLEARANCE from the floor (or not get closer than at the start,
+    e.g. when lifting it off the table), stay out of the obstacle boxes and HELD_ARM_CLEARANCE from the links."""
     lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
     d = mujoco.MjData(m)
     d.qpos[ids.arm_qadr] = q_from
     d.qpos[ids.block_q:ids.block_q + 7] = [10, 10, 1, 1, 0, 0, 0]
     d.ctrl[ids.act_arm] = q_from
+    half = float(np.clip(((gap or gap0) - gap0) / 2, *ids.fl_range))
+    d.qpos[ids.fl_q], d.qpos[ids.fr_q] = half, -half
+    d.ctrl[ids.act_grip] = half
     mujoco.mj_forward(m, d)
+    link_geoms = [g for g in range(m.ngeom) if m.geom_bodyid[g] in ids.arm_bodies and m.geom_bodyid[g] != ids.end_body
+                  and m.geom_bodyid[g] not in ids.finger_left | ids.finger_right and (m.geom_contype[g] | m.geom_conaffinity[g])]
+    held_floor, held_floor0, held_arm, held_arm0, held_obst, held_obst0, held_where = math.inf, None, math.inf, None, math.inf, None, None
+
+    def place_held():
+        T = np.eye(4)
+        T[:3, :3], T[:3, 3] = d.xmat[ids.end_body].reshape(3, 3), d.xpos[ids.end_body]
+        T = T @ held
+        quat = np.zeros(4)
+        mujoco.mju_mat2Quat(quat, T[:3, :3].ravel())
+        d.qpos[ids.block_q:ids.block_q + 3], d.qpos[ids.block_q + 3:ids.block_q + 7] = T[:3, 3], quat
+        d.qvel[ids.block_d:ids.block_d + 6] = 0
+        mujoco.mj_kinematics(m, d)
     base = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base_link")   # stands on the floor by design
     arm_geoms = [g for g in range(m.ngeom) if m.geom_bodyid[g] in ids.arm_bodies and m.geom_bodyid[g] != base
                  and m.geom_contype[g] | m.geom_conaffinity[g]]
@@ -969,6 +1045,17 @@ def _simulate_profile(m, ids, q_from, q_to, gap0, vmax=None) -> dict:
             mujoco.mj_step(m, d)
         q = d.qpos[ids.arm_qadr].copy()
         sim_q.append(q.tolist())
+        if held is not None:
+            place_held()
+            bg = ids.block_geom
+            df = mujoco.mj_geomDistance(m, d, bg, ids.floor_geom, 0.2, None)
+            da = min(mujoco.mj_geomDistance(m, d, bg, g, 0.2, None) for g in link_geoms)
+            do = min([mujoco.mj_geomDistance(m, d, bg, g, 0.2, None) for g in ids.obstacle_geoms] or [math.inf])
+            if k == 0:
+                held_floor0, held_arm0, held_obst0 = df, da, do
+            if df < held_floor or da < held_arm or do < held_obst:
+                held_where = f"t={k * 0.02:.1f} s"
+            held_floor, held_arm, held_obst = min(held_floor, df), min(held_arm, da), min(held_obst, do)
         track = max(track, float(np.max(np.abs(q - qp[min(k, len(t) - 1)]))))
         for g in arm_geoms:
             dist = mujoco.mj_geomDistance(m, d, g, ids.floor_geom, 0.05, None)
@@ -996,12 +1083,20 @@ def _simulate_profile(m, ids, q_from, q_to, gap0, vmax=None) -> dict:
                        + (f"、始点 {start_obst * 1000:.1f} mm より深い" if start_obst is not None and start_obst < 0 else "") + "）")
     if track > SIM_TRACK_MAX:
         reasons.append(f"シミュレーション上の追従誤差 {track:.3f} rad > {SIM_TRACK_MAX}")
+    if held is not None:
+        if held_floor < min(FLOOR_CLEARANCE, held_floor0) - 0.001:
+            reasons.append(f"持っているブロックが床に近づく（{held_floor * 1000:.1f} mm、{held_where}）")
+        if held_arm < min(HELD_ARM_CLEARANCE, held_arm0) - 0.001:
+            reasons.append(f"持っているブロックがアームに当たる（{held_arm * 1000:.1f} mm、{held_where}）")
+        if held_obst < min(0.0, held_obst0) - 0.001:
+            reasons.append(f"持っているブロックが障害物の箱に入る（{held_obst * 1000:.1f} mm）")
     return {"ok": not reasons, "reasons": reasons, "times": t.tolist(), "q_plan": qp.tolist(),
             "duration_s": float(t[-1]), "max_step_rad": float(np.max(np.abs(q_to - q_from))),
             "min_floor_clearance_m": float(min_clear), "sim_track_max_rad": track,
             "min_obstacle_clearance_m": None if not math.isfinite(min_obst) else float(min_obst),
             "obstacles_checked": [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) for g in ids.obstacle_geoms],
-            "sim_q": sim_q, "sim_dt": 0.02, "vmax": VMAX}
+            "sim_q": sim_q, "sim_dt": 0.02, "vmax": VMAX, "gap_m": gap,
+            "held": None if held is None else {"min_floor_m": float(held_floor), "min_arm_m": float(held_arm)}}
 
 
 def planner_rot(axis: str, a: float) -> np.ndarray:
@@ -1133,6 +1228,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--arm-url", default="http://127.0.0.1:8091")
     ap.add_argument("--vision-url", default="http://127.0.0.1:8090")
+    ap.add_argument("--synthetic-id1-mm", default=None,
+                    help="tests with a fake arm only: visual correction sees ID 1 at FK minus this offset, e.g. 4,-3,6")
     ap.add_argument("--rate", type=float, default=20.0, help="sync rate (Hz)")
     args = ap.parse_args()
 

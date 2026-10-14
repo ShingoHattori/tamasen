@@ -112,6 +112,10 @@
     <span class="dim">関節角による把持点と、カメラで見た把持点のずれを測り、残りの目標を直す。アームは動かない。直した後は経路のシミュレートから</span></div>
    <div id="pathres" class="dim"></div>
    <div>2. <button id="execPath" disabled>シミュレーションで妥当だった経路を実機で実行</button><button id="graspReal">把持を実機で実行</button></div>
+   <div>自動: <button id="autoGrasp" style="background:#2d4a6a;font-weight:bold">掴んで初期位置へ戻る（一連の操作を自動で）</button>
+    <span class="dim">把持候補を計算 → 接近前 → カメラで位置合わせ（収束まで）→ 最大まで開く → 近接 → 位置合わせ → 把持姿勢（低速）→ 挟む → 持ち上げ → 有効化時の姿勢。
+     各移動の前に経路をシミュレートし、通らなければそこで止める。「停止」で中止。このページを表示したままにする（生存確認）</span></div>
+   <div id="autoLog" class="dim" style="white-space:pre-line"></div>
    <div>3. グリッパー（アームが保持中のときだけ）: 隙間 <input id="gripGap" size="4" value="45"> mm <button id="gripOpen">開く</button>
     挟む物の幅 <input id="gripWidth" size="4" value="31"> mm <button id="gripGrip">挟む（力を制限）</button>
     <button id="gripRelease">離す（隙間まで開く）</button> <span class="dim">幅・隙間は把持計画の先頭の候補から自動で入る（手で変えてもよい）</span></div>

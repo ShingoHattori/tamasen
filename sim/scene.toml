@@ -37,6 +37,9 @@ force_limit_status = "sample"
 max_gap_m = 0.100
 max_gap_status = "measured"
 clearance_m = 0.010               # 把持前に必要な余裕（必要開口 = 物体幅 + clearance）
+# 接近中の開口。最大まで開いてから閉じれば、数 mm の位置ずれがあっても顎の間に入る（依頼者 2026-10-14）。
+# 計画（把持姿勢の机すき間・ブロックとの干渉）と経路確認（近接・把持）はこの開口で行う。必要開口 + 10 mm より狭くはしない。
+approach_gap_m = 0.100
 # 実機グリッパーのモーター角 → 隙間の換算（Borot hardware_manager.py と同じ比例の式）:
 #   gap = clip(motor_rad / gripper_rad_full_open * max_gap_m, 0, max_gap_m)
 # 2026-10-14 実測: 全閉 -0.022 rad = 0 mm、-2.929 rad = 50 mm（比例なら 49.5 mm）、-5.896 rad = 100 mm。
