@@ -10,8 +10,8 @@ reBot Arm B601-DM と OAK カメラで、ArUco マーカー付きの直方体ブ
 | 接続 | `ssh win10.hpcs-sb1124.sec.llhi.org`（user `cely`、192.168.32.20 / DHCP） | — |
 | OS | Ubuntu Server 24.04.3、kernel 6.8.0-147-generic | macOS |
 | GPU | RTX 2080 SUPER、`nvidia-driver-595-open`（ubuntu-drivers 推奨版、ビルド済み署名モジュール、DKMS なし）。CUDA Toolkit は未導入 | — |
-| アーム | USB-CAN が `/dev/ttyACM0`（HDSC CDC `2e88:4603`） | — |
-| カメラ | **未接続**。OAK-D-Lite を Mac から付け替える必要あり | OAK-D-Lite `1844301091A70A1300` |
+| アーム | USB-CAN が `/dev/ttyACM0`（HDSC CDC `2e88:4603`、本体ポートに直結） | — |
+| カメラ | OAK-D-Lite `1844301091A70A1300`（ハブ経由 USB3、30 fps。起動前に `03e7:2485` の USB2 で見えるのは正常） | — |
 
 - robot1 はデュアルブート（Windows あり）。起動順と GRUB の既定は Ubuntu。Secure Boot は無効。
 - GPU ドライバ作業の記録: robot1 の `/var/log/gpu-driver-work/install-20261013-080453.log`。
@@ -36,7 +36,8 @@ reBot Arm B601-DM と OAK カメラで、ArUco マーカー付きの直方体ブ
   Claude は `--allow-motion` 付きで arm サービスを起動しない。実機の `/arm/api/*`（POST）を呼ばない。テストでも呼ばない（試験は `--fake` を別ポートで）。
 - 実機を動かすときは、必ず事前に経路を MuJoCo でシミュレートしてチェックし、妥当だったものだけを実行する。
   実行中・保持中は常に「計画 − 実測」のフィードバック補正をかける（重力補正の差でずれるため）。
-- カメラスタンドが映像の下端にある。不用意な動作でぶつかる（シミュレーターには未登録 = 台座⇔カメラ未校正のため）。
+- カメラスタンドが映像の下端にある。不用意な動作でぶつかる（シミュレーターには `scene.toml` の camera_stand / camera_head として概略の箱で登録）。
+- カメラは動かさない（hand-eye 校正が壊れる）。vision・sim の再起動はできればアームのトルクが切れているときに行う。
 
 ## 起動・停止（robot1）
 ```
@@ -57,13 +58,20 @@ ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   # 手元で http:
   全 6 関節を MIT モード（kp・kd は SDK yaml）で保持し、SDK の公式 dynamics の重力 g(q) をフィードフォワード（有効化後 0.5 s で立ち上げ）、移動中は計画速度も加える。
   POS_VEL だと保持中に joint4・joint5 が 11 mrad のスティックスリップ、joint6 がハンチング（2026-10-14 実測）。joint4・6 は MIT 化で静止を確認済み、全関節化は依頼者の判断。
   移動中は `rebot/mit_tuning.yaml` のクーロン摩擦（joint2 0.90 / joint3 1.71 N m）を進む向きに加える。このファイルは有効化のたびに読み直す（再起動不要）。
+  衝突停止（`_contact_check`）: 抵抗 = モーター実測トルク − 重力 ff − 摩擦 ff − 移動開始 0.2 s の基準、の運動と逆向きの成分。
+  RES_ABS を超える、または 0.3 s で RES_GROW 以上増え、かつ増え方が RES_SLOPE（N m/rad）以上なら停止して今の位置で保持し、fault にする（要確認解除）。
+  可動端 3° 以内の関節は判定から外す。実機トレースの再生で誤検出なし、合成した押し込みで 0.2〜0.3 s で停止（実機での衝突試験はまだ）。
   移動ごとの 50 Hz 記録（計画・実測・速度・トルク・指令）が `run/arm_trace_last.jsonl` に残る。
   関節の零点補正（ソフトウェアのみ）: `rebot/joint_offsets.yaml`（モデル角 = モーター角 + offset）。2026-10-14 の hand-eye 校正で推定した値
   （joint2 −0.79、joint3 +1.01、joint4 −0.36、**joint5 −5.97 deg**。joint5 は定規の手合わせでも約 −7 deg を確認）。state.json の pos はモデル角、pos_motor が生の値。
   校正サンプルは記録時の offset を `joint_offsets_rad` に残し、handeye.py はモーター角に戻して解く。
 - `sim/` — MuJoCo 3.15.0（`sim/.venv`、EGL でオフスクリーン描画）。公開モデル Borot-Arm_Mujoco `3f3e98d` をそのまま取り込み、`scene.py` で床・ブロック・凸包衝突・アクチュエータを追加。
-  現実同期（物理なし）/ シミュレーション試行（接近・閉じる・持ち上げ）、把持候補 24 通りの判定、実機経路の動的シミュレーション。`verify_sim.py` で検証。
-  ID 1 マーカー台（設計値・未製作）を `scene.toml [marker_mount]` で end_link に追加（`check_mount.py` / `render_mount.py`、詳細は `cad/README.md`）。
+  現実同期（物理なし）/ シミュレーション試行（接近・閉じる・持ち上げ）、把持候補の判定、実機経路の動的シミュレーション。`verify_sim.py` で検証。
+  hand-eye 採用時は把持候補に傾き（0, ±20, ±35°）を加えて 120 通りにし、接近前・近接（把持の 3 cm 手前）で ID 1 がカメラから見える
+  （向き 55° 以内、画面端 40 px 以上内側、一辺 20 px 以上）ものだけを通す。机すき間 17 mm を保つ。近接→把持は 0.10 rad/s。
+  「カメラで位置合わせ」（/api/visual_correct）: ID 1 の 10 フレームで FK 把持点との差を求め、残りの目標をずらして IK を解き直す（30 mm 超は拒否、累積しない）。
+  2026-10-14 07:42 の事故（真上からの盲目接近で指がブロックに刺さった）を受けた変更。実機の手順: 計画 → 接近前 → 位置合わせ → 近接 → 位置合わせ → 把持（低速）→ 挟む → 持ち上げ。
+  ID 1 マーカー台（取り付け済み）を `scene.toml [marker_mount]` で end_link に追加（`check_mount.py` / `render_mount.py`、詳細は `cad/README.md`）。
 - 依存: oak/.venv depthai 3.10.0 / opencv 5.0.0.93 / numpy 2.4.6、rebot venv motorbridge 0.5.6 / pinocchio 3.9.0、sim/.venv は `sim/requirements.txt`。three.js 0.170.0 を `oak/static/vendor` に同梱。
 
 ## 確定したこと
@@ -75,8 +83,9 @@ ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   # 手元で http:
 
 ## 未確定・次の段階
 1. ID 2 カードの物理的固定と厚み測定 → 「基準を登録」。
-2. カメラ⇔アーム台座の位置合わせ（`sim/scene.toml [placement]`）。ID 1 を付けたアームを複数姿勢に動かす必要がある → 動作は依頼者が Web UI から。
-3. ID 1 → 把持中心の校正（`markers.toml [marker.1.grip]`）。
-4. グリッパーのモーター角 ↔ 開口の対応と最大開口の実測（`sim/scene.toml [jaw]`。モデルは 0〜100 mm、資料に 57 mm の記述あり）。
+2. 済: カメラ⇔アーム台座（`oak/calib/handeye_active.json`。sim はこれを使い、`scene.toml [placement]` は未使用のまま）。
+3. 済: ID 1 → 把持中心（`markers.toml [marker.1.grip]`）。
+4. 済: グリッパー開口（最大 100 mm、比例、遊び約 1 mm）。済: hand-eye 校正（位置中央値 3.7 mm）・把持中心・関節零点補正。
 5. ブロック質量・摩擦の実測。カメラスタンドをシミュレーターへ登録。
-6. 把持精度の検証（検出・シミュレーション成功とは別に報告する）。
+6. 把持精度の検証（検出・シミュレーション成功とは別に報告する）。視認性つき計画・視覚補正・衝突停止は実機で未試験。
+7. 保留: ステレオ深度をブロック推定に足すか（実機のずれを見てから決める）。

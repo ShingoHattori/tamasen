@@ -258,7 +258,7 @@ class Sim:
             T = self.block_T()
             q0 = self.d.qpos[self.ids.arm_qadr].copy()
             basis = self.block_basis
-        cands = planner.plan(self.m, self.settings, T, q0)
+        cands = planner.plan(self.m, self.settings, T, q0, view=self.view_model())
         with self.lock:
             self.plan = {"basis": basis, "basis_label": BASIS_LABEL[basis], "T_base_obj": T.tolist(),
                          "candidates": cands, "t": time.time()}
@@ -492,9 +492,15 @@ class Sim:
             cand = self.plan["candidates"][cand_index] if cand_index is not None else (ok[0] if ok else None)
             if cand is None or not cand.ok:
                 return {"ok": False, "message": "条件を満たす候補がない"}
-            q_to = {"pre": cand.q_pre, "grasp": cand.q_grasp, "lift": cand.q_lift}[target]
-            label = f"{cand.name}: " + {"pre": "接近前の姿勢", "grasp": "把持姿勢", "lift": "持ち上げ姿勢"}[target]
-        res = simulate_profile(self.m, self.ids, q_from, np.asarray(q_to, float), self.gap.gap0)
+            q_to = {"pre": cand.q_pre, "near": cand.q_near, "grasp": cand.q_grasp, "lift": cand.q_lift}[target]
+            if q_to is None:
+                return {"ok": False, "message": "この候補には近接の姿勢がない（計画し直す）"}
+            label = f"{cand.name}: " + {"pre": "接近前の姿勢", "near": "近接（把持の 3 cm 手前）", "grasp": "把持姿勢",
+                                        "lift": "持ち上げ姿勢"}[target]
+            if cand.correction:
+                label += f"（視覚補正 {np.linalg.norm(cand.correction['offset_mm']):.1f} mm 済み）"
+        vmax = VMAX_FINAL if target == "grasp" else None
+        res = simulate_profile(self.m, self.ids, q_from, np.asarray(q_to, float), self.gap.gap0, vmax)
         import uuid
         pid = uuid.uuid4().hex[:12]
         rec = dict(res, id=pid, label=label, checked_at=time.time(), q_from=q_from.tolist(),
@@ -748,6 +754,74 @@ class Sim:
                                        f"移動経路の確認で外した目標 {len(dropped)}、予測: {src}）。"
                                        "各姿勢へは経路シミュレーション → 実機実行（依頼者）→ サンプル記録の順。自分の腕による遮蔽は予測しない"}
 
+    def view_model(self) -> dict | None:
+        """Adopted camera calibration + intrinsics + ID 1 size, for predicting where ID 1 is seen."""
+        he = self.handeye()
+        vs = fetch(self.args.vision_url + "/state.json")
+        intr = (vs or {}).get("intrinsics") or {}
+        size = (((vs or {}).get("config") or {}).get("markers", {}).get("1", {}).get("size") or {}).get("value")
+        if he is None or not intr.get("K") or not size:
+            return None
+        return {"X": np.array(he["T_cam_base"]), "Y": np.array(he["T_ee_m1"]), "K": np.array(intr["K"]),
+                "dist": np.array(intr.get("dist_coeffs") or np.zeros(5)), "image": intr["image"], "size": float(size)}
+
+    def visual_correct(self, cand_index=None) -> dict:
+        """Measure where the grip site really is (ID 1 seen now) against where the joints say it is, and shift
+        the candidate's remaining targets by that difference.
+
+        The block was located through the same camera and calibration as ID 1 is now, so the calibration's
+        position error cancels: offset o = FK(q_now) grip site - observed grip site (base frame), and every
+        target t is commanded as t + o. Uses 10 frames; only ID 1 seen "ok". Nothing is sent to the arm."""
+        if not self.plan:
+            return {"ok": False, "message": "把持計画がない"}
+        ok = [c for c in self.plan["candidates"] if c.ok]
+        cand = self.plan["candidates"][cand_index] if cand_index is not None else (ok[0] if ok else None)
+        if cand is None or not cand.ok or not cand.targets:
+            return {"ok": False, "message": "補正できる候補がない（計画し直す）"}
+        he = self.handeye()
+        if he is None:
+            return {"ok": False, "message": "カメラ⇔台座の校正が採用されていない"}
+        if not str(self.sync_info.get("joints", "")).startswith("実機の関節角を反映中"):
+            return {"ok": False, "message": "実機の関節角が読めていない: " + str(self.sync_info.get("joints"))}
+        X, Y = np.array(he["T_cam_base"]), np.array(he["T_ee_m1"])
+        Xi, Yi = np.linalg.inv(X), np.linalg.inv(Y)
+        m, ids = self.m, self.ids
+        site_local = np.r_[m.site_pos[ids.grip_site], 1.0]           # grip site in end_link coordinates
+        obs, qs = [], []
+        for _ in range(10):
+            vs = fetch(self.args.vision_url + "/state.json")
+            m1 = next((mk for mk in (vs or {}).get("markers", []) if mk.get("id") == 1), None)
+            if m1 and m1.get("status") == "ok" and time.time() - vs.get("t", 0) < 0.3:
+                T = Xi @ np.array(m1["T_cam_marker"]) @ Yi                # end_link as seen
+                obs.append(T)
+                with self.lock:
+                    qs.append(self.d.qpos[ids.arm_qadr].copy())
+            time.sleep(0.06)
+        if len(obs) < 6:
+            return {"ok": False, "message": f"ID 1 が ok で見えたのは {len(obs)} / 10 フレーム。見える姿勢で行う"}
+        q_now = np.mean(qs, axis=0)
+        d = mujoco.MjData(m)
+        d.qpos[ids.arm_qadr] = q_now
+        mujoco.mj_kinematics(m, d)
+        fk_site = d.site_xpos[ids.grip_site].copy()
+        R_fk = d.xmat[ids.end_body].reshape(3, 3)
+        seen = np.mean([(T @ site_local)[:3] for T in obs], axis=0)
+        spread = float(np.max([np.linalg.norm((T @ site_local)[:3] - seen) for T in obs]) * 1000)
+        o = fk_site - seen
+        R_obs = obs[len(obs) // 2][:3, :3]
+        rot = math.degrees(math.acos(np.clip((np.trace(R_fk.T @ R_obs) - 1) / 2, -1, 1)))
+        if np.linalg.norm(o) > 0.03:
+            return {"ok": False, "message": f"関節角と観測の差が {np.linalg.norm(o) * 1000:.0f} mm と大きすぎるので補正しない（校正・観測を確認）"}
+        probs = planner.retarget(m, self.settings, cand, o, q_now)
+        if probs:
+            return {"ok": False, "message": "補正後の目標が解けない: " + "; ".join(probs)}
+        cand.correction = {"offset_mm": (o * 1000).round(1).tolist(), "rot_err_deg": round(rot, 1), "frames": len(obs),
+                           "spread_mm": round(spread, 1), "t": time.time()}
+        return {"ok": True, "message": f"視覚補正: 関節角による把持点と観測のずれ {np.linalg.norm(o) * 1000:.1f} mm "
+                                       f"(x {o[0] * 1000:+.1f}, y {o[1] * 1000:+.1f}, z {o[2] * 1000:+.1f})、向き {rot:.1f}°、"
+                                       f"{len(obs)} フレーム（ばらつき {spread:.1f} mm）。接近前・近接・把持・持ち上げの目標を直した。"
+                                       "次の移動は経路シミュレーションから", "correction": cand.correction}
+
     def preview_calib(self) -> dict:
         cp = getattr(self, "calib_poses", None)
         if not cp:
@@ -838,36 +912,37 @@ CALIB_MAX_JOINT_DEG = 60      # calibration poses must stay near the current pos
 CALIB_STEP_MAX_DEG = 100      # workspace calibration poses: largest joint change of one move (each move is simulated)
 CAM_CLEAR_M = 0.25            # workspace calibration poses: end_link and ID 1 at least this far from the camera
 VMAX = 0.25                  # rad/s — the same profile is executed by rebot/arm_state.py
+VMAX_FINAL = 0.10            # rad/s for the last approach (near -> grasp): shallower stop if the jaws hit something
 FLOOR_CLEARANCE = 0.015      # m, every arm / jaw geom along the simulated motion
 SIM_TRACK_MAX = 0.05         # rad, the simulated arm must follow the profile this closely
 
 
-def profile(q_from, q_to, dt=0.02):
+def profile(q_from, q_to, dt=0.02, vmax=None):
     """Straight joint-space path, all joints arriving together, smooth (cosine) start and stop.
 
     The cosine profile peaks at pi/2 times the mean speed, so T is chosen to keep that peak <= VMAX.
     """
-    T = max(math.pi / 2 * float(np.max(np.abs(q_to - q_from))) / VMAX, 0.5)
+    T = max(math.pi / 2 * float(np.max(np.abs(q_to - q_from))) / (vmax or VMAX), 0.5)
     n = int(np.ceil(T / dt)) + 1
     t = np.linspace(0, T, n)
     s = 0.5 - 0.5 * np.cos(np.pi * t / T)
     return t, q_from + np.outer(s, q_to - q_from)
 
 
-def simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
+def simulate_profile(m, ids, q_from, q_to, gap0, vmax=None) -> dict:
     # Obstacles are judged by distance below; in this dynamics run they must not push the arm around
     # (a path that starts inside an inflated box would otherwise be blocked by it).
     saved = [(g, m.geom_contype[g], m.geom_conaffinity[g]) for g in ids.obstacle_geoms]
     for g, _, _ in saved:
         m.geom_contype[g] = m.geom_conaffinity[g] = 0
     try:
-        return _simulate_profile(m, ids, q_from, q_to, gap0)
+        return _simulate_profile(m, ids, q_from, q_to, gap0, vmax)
     finally:
         for g, ct, ca in saved:
             m.geom_contype[g], m.geom_conaffinity[g] = ct, ca
 
 
-def _simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
+def _simulate_profile(m, ids, q_from, q_to, gap0, vmax=None) -> dict:
     lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
     d = mujoco.MjData(m)
     d.qpos[ids.arm_qadr] = q_from
@@ -886,7 +961,7 @@ def _simulate_profile(m, ids, q_from, q_to, gap0) -> dict:
     if np.any(q_to < lo - LIMIT_TOL) or np.any(q_to > hi + LIMIT_TOL):
         reasons.append("目標が関節制限の外")
     q_to = np.clip(q_to, lo, hi)
-    t, qp = profile(q_from, q_to)
+    t, qp = profile(q_from, q_to, vmax=vmax)
     steps = int(round((t[1] - t[0]) / m.opt.timestep)) if len(t) > 1 else 1
     for k in range(len(t) + 25):                       # +0.5 s settle
         d.ctrl[ids.act_arm] = qp[min(k, len(t) - 1)]
@@ -1161,6 +1236,8 @@ def main() -> int:
                 return self._json({"message": sim.start_trial(body.get("candidate"))})
             if path == "/api/reset":
                 return self._json({"message": sim.reset()})
+            if path == "/api/visual_correct":
+                return self._json(sim.visual_correct(body.get("candidate")))
             if path == "/api/check_path":
                 return self._json(sim.check_path(body.get("target", "pre"), body.get("candidate")))
             if path == "/api/preview":

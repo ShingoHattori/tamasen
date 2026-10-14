@@ -63,6 +63,19 @@ CORRIDOR_M = 0.020          # m, end_link deviation (FK) that stops the motion
 LAG_FREE, LAG_STOP = 0.01, 0.04   # rad: plan runs at full speed below LAG_FREE lag, stops at LAG_STOP
 STALL_S = 2.0               # s the plan may stand still before it is a fault
 LAG_KI_GAIN = 3.0           # integral gain multiplier while the plan clock is fully held back by lag
+# Contact detection while moving (2026-10-14: the gripper was driven into the block and tore it without any
+# deviation limit tripping). Per joint, resistance = (motor torque - gravity ff - friction ff - its value at the
+# start of the move) in the direction that opposes the planned motion. Free motion (lift -> rest, 14 s) stayed
+# within 0.7 / 1.3 / 1.3 / 0.4 / 0.3 / 0.3 N m. Stop when it exceeds RES_ABS, or grows by RES_GROW within
+# RES_WIN_S while growing steeply with the travel (RES_SLOPE N m/rad, contact stiffness; the gravity-model
+# error changes by only ~1-2 N m/rad). Joints whose plan is within RES_LIMIT_MARGIN of a joint limit are
+# skipped (the folded rest pose leans on the end stops).
+RES_ABS = np.array([1.5, 3.0, 3.0, 1.0, 0.8, 0.6])
+RES_GROW = np.array([0.8, 1.5, 1.5, 0.4, 0.4, 0.25])
+RES_SLOPE = np.array([30.0, 30.0, 30.0, 10.0, 10.0, 10.0])
+RES_WIN_S = 0.3
+RES_LIMIT_MARGIN = math.radians(3.0)
+RES_ALPHA = 0.3             # smoothing of the motor torque reading
 CAN_LOSS_S = 0.3            # s without fresh feedback while engaged = CAN / bus fault
 ENGAGE_GRACE_S = 0.5
 # Motor-internal POS_VEL gains that differ from the SDK yaml (written at engage). joint6 (light wrist
@@ -228,6 +241,7 @@ class FakeBus:
         self.log = []
         self.inject = {"no_feedback": False, "status": {}}     # test hooks (fake only)
         self.speed = speed                                     # <1: motors slower than commanded (lag)
+        self.tau = {}                                          # last MIT feedforward, reported as the motor torque
 
     def read_params(self):
         return {n: {"can_timeout": 0, "ctrl_mode": 2, "fake": True} for n in self.q}
@@ -245,6 +259,7 @@ class FakeBus:
         out = {}
         for n, v in self.q.items():
             s = FakeState(v + np.random.normal(0, 1e-5))
+            s.torq = self.tau.get(n, 0.0) + np.random.normal(0, 0.02)
             s.status_code = self.inject["status"].get(n, 1 if n in self.enabled else 0)
             out[n] = s
         return out
@@ -269,7 +284,7 @@ class FakeBus:
         self._check(); self._advance(); self.target.update(q); self.vlim = vlim
 
     def send_mit(self, name, pos, kp, kd, vel=0.0, tau=0.0):
-        self._check(); self._advance(); self.target[name] = pos; self.vlim = 1.0
+        self._check(); self._advance(); self.target[name] = pos; self.vlim = 1.0; self.tau[name] = float(tau)
         self.log.append(("mit_cmd", name, round(float(pos), 4), round(float(vel), 4), round(float(tau), 3))) \
             if len(self.log) < 5000 else None
 
@@ -339,6 +354,13 @@ class ArmService:
         self.joints = load_joints(args.hw_yaml)
         self.fk = FK()
         self.gravity = Gravity()
+        lims = {}
+        if not self.gravity.error:
+            for i, n in enumerate(self.gravity.names):
+                jid = self.gravity.model.joints[i + 1].idx_q
+                lims[n] = (float(self.gravity.model.lowerPositionLimit[jid]), float(self.gravity.model.upperPositionLimit[jid]))
+        self.joint_lo = np.array([lims.get(n, (-math.pi, math.pi))[0] for n in ARM])
+        self.joint_hi = np.array([lims.get(n, (-math.pi, math.pi))[1] for n in ARM])
         self.ff = {}                 # last MIT feedforward sent (shown on the page)
         self.tuning, self.tuning_error = self.load_tuning()
         self.offsets, self.offsets_error = self.load_offsets()
@@ -655,6 +677,16 @@ class ArmService:
                 c.update(state="holding", motion=None, hold_q=dict(zip(ARM, qp)),
                          fault=why, message="停止（異常）: " + why + "。計画上の位置を保持目標に固定。停止・トルク切りで対処")
                 self.audit("fault: " + why, "service")
+        if c["state"] == "moving":
+            hit = self._contact_check(mv, qp, qm, vdir)
+            if hit:
+                # Stop where the arm IS (not at the planned point, which lies inside the obstacle), drop the
+                # integral, and send the measured pose so nothing keeps pushing.
+                fb["I"] = [0.0] * 6
+                q_cmd, vp, vdir = qm.copy(), np.zeros(6), np.zeros(6)
+                c.update(state="holding", motion=None, hold_q=dict(zip(ARM, qm)), fault=hit,
+                         message="停止（異常）: " + hit + "。今の位置で保持（押し込まない）。周りを確認して解除")
+                self.audit("fault: " + hit, "service")
         # Faults latch: they are cleared only by the user ("ack_fault") once the cause is gone, or by release.
         c["last_cmd"] = dict(zip(ARM, q_cmd))
         self._send(bus, c["last_cmd"], VMAX * 1.5, qm=q, vd=dict(zip(ARM, vp)), vdir=dict(zip(ARM, vdir)))
@@ -664,6 +696,38 @@ class ArmService:
             end = dict(zip(ARM, np.array(mv["q_plan"][-1])))
             c.update(state="holding", motion=None, hold_q=end,
                      message=f"移動完了（最大偏差 {fb['max_err']:.3f} rad / 手先 {fb['max_tcp_dev'] * 1000:.0f} mm）。保持中もフィードバック継続")
+
+    def _contact_check(self, mv, qp, qm, vdir) -> str | None:
+        """Resistance against the planned motion (see RES_*). Returns the fault text on contact."""
+        by = {r["name"]: r for r in self.last_rows}
+        tq = np.array([by.get(n, {}).get("torq") or 0.0 for n in ARM])
+        ff = np.array([self.ff.get(n, {}).get("tau_ff", 0.0) + self.ff.get(n, {}).get("fric", 0.0) for n in ARM])
+        cs = mv.setdefault("contact", {"ext": None, "base": [], "hist": []})
+        ext = tq - ff
+        cs["ext"] = ext if cs["ext"] is None else (1 - RES_ALPHA) * np.array(cs["ext"]) + RES_ALPHA * ext
+        if len(cs["base"]) < 10:                         # first 0.2 s of the move: baseline (model error at the start)
+            cs["base"].append(np.array(cs["ext"]).tolist())
+            return None
+        base = np.mean(cs["base"], axis=0)
+        lo, hi = self.joint_lo, self.joint_hi
+        active = (np.abs(vdir) > 1e-3) & (qp - lo > RES_LIMIT_MARGIN) & (hi - qp > RES_LIMIT_MARGIN)
+        res = np.where(active, (np.array(cs["ext"]) - base) * np.sign(vdir), 0.0)
+        now = time.monotonic()
+        cs["hist"] = [h for h in cs["hist"] if now - h[0] <= RES_WIN_S] + [(now, res.tolist(), qm.tolist())]
+        cs["res_now"] = res.tolist()
+        t0, r0, q0 = cs["hist"][0]
+        grow = res - np.array(r0)
+        travel = np.abs(qm - np.array(q0))
+        slope = np.where(travel > 1e-3, grow / np.maximum(travel, 1e-3), 0.0)
+        for i, n in enumerate(ARM):
+            if not active[i]:
+                continue
+            if res[i] > RES_ABS[i]:
+                return f"衝突の疑い: {n} が進む向きと逆に {res[i]:.2f} N m の抵抗（上限 {RES_ABS[i]} N m）"
+            if grow[i] > RES_GROW[i] and slope[i] > RES_SLOPE[i] and now - t0 > 0.5 * RES_WIN_S:
+                return (f"衝突の疑い: {n} の抵抗が {now - t0:.2f} s で {grow[i]:.2f} N m 増加（{slope[i]:.0f} N m/rad、"
+                        f"押し込みで増えている）")
+        return None
 
     def _send(self, bus, qd: dict, vlim: float, qm: dict | None = None, vd: dict | None = None,
               vdir: dict | None = None) -> None:

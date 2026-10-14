@@ -305,6 +305,12 @@ $("execPath").onclick = () => {
     post("/arm/api/execute", { path_id: checkedPath.id });
 };
 $("graspReal").onclick = () => post("/arm/api/grasp");
+$("visCorrect").onclick = async () => {
+  $("pathres").innerHTML = '<span class="info">ID 1 を観測中（約 1 秒、動かさないで）…</span>';
+  const r = await post("/sim/api/visual_correct", {});
+  checkedPath = null;
+  $("pathres").innerHTML = r.ok ? `<span class="ok">${esc(r.message)}</span>` : `<span class="bad">${esc(r.message || "")}</span>`;
+};
 let gripFromPlan = null;          // plan time the inputs were last filled from
 function gripCmd(action, extra, what) {
   if (confirm(`グリッパーを${what}。顎の間に指や物がないことを確認しましたか？`)) post("/arm/api/gripper", Object.assign({ action }, extra));
