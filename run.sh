@@ -6,7 +6,7 @@
 #   ./run.sh status
 #   ./run.sh log   vision|arm|sim
 #
-# vision (8090) serves the LAN 192.168.32.0/24 (allow-list in VISION_ARGS); arm (8091) and sim (8092)
+# vision (8090) serves the LAN 192.168.32.0/24 and the private 172.16.0.0/12 (allow-list in VISION_ARGS); arm (8091) and sim (8092)
 # bind to 127.0.0.1 only and are reached through the vision page. Open http://192.168.32.20:8090/
 # from a machine on that subnet, or use an SSH forward:
 #   ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   then open http://127.0.0.1:8090/
@@ -23,7 +23,7 @@ mkdir -p "$RUN"
 declare -A DIR=([vision]="$ROOT/oak" [arm]="$ROOT/rebot" [sim]="$ROOT/sim")
 declare -A PY=([vision]="$ROOT/oak/.venv/bin/python" [arm]="$ROOT/rebot/reBotArm_control_py/.venv/bin/python" [sim]="$ROOT/sim/.venv/bin/python")
 declare -A SCRIPT=([vision]="vision.py" [arm]="arm_state.py" [sim]="sim_server.py")
-declare -A ARGS=([vision]="${VISION_ARGS:---device 18443 --host 0.0.0.0 --allow-from 127.0.0.1/32,192.168.32.0/24}" [arm]="${ARM_ARGS:---port /dev/ttyACM0}" [sim]="${SIM_ARGS:-}")
+declare -A ARGS=([vision]="${VISION_ARGS:---device 18443 --host 0.0.0.0 --allow-from 127.0.0.1/32,192.168.32.0/24,172.16.0.0/12}" [arm]="${ARM_ARGS:---port /dev/ttyACM0}" [sim]="${SIM_ARGS:-}")
 declare -A PORT=([vision]=8090 [arm]=8091 [sim]=8092)
 # numpy's OpenBLAS starts one busy thread per core (24) for every matrix call; the simulator's grasp
 # planning / pose generation then took all cores and the arm service missed its 50 Hz feedback for
