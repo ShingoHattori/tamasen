@@ -128,7 +128,9 @@ def main() -> int:
                                          "lift_mm": sim.trial.get("lift_mm")}
     sim.reset()
 
-    # 4c. floor interference: put the grasp point at the block centre (tips 9.5 mm below the floor)
+    # 4c. floor interference: put the grasp point at the block centre (tips 9.5 mm below the floor).
+    # The planner must not accept the tips in the table: since 2026-10-14 it raises the grasp point until the
+    # fingers keep PLAN_FLOOR_CLEARANCE (or rejects the candidate); "clearance_mm" records what it kept.
     keep = planner.TIP_MARGIN
     planner.TIP_MARGIN = -0.02
     try:
@@ -136,7 +138,15 @@ def main() -> int:
         sim.placement_source = "mock"
         sim.sync_tick()
         sim.do_plan()
-        report["floor_check"] = {"per_candidate": [(c.name, c.ok, c.reasons) for c in sim.plan["candidates"] if "+Z 面から" in c.name]}
+        dd = mujoco.MjData(sim.m)
+        rows = []
+        for c in sim.plan["candidates"]:
+            if "+Z 面から" in c.name:
+                clr = (planner.floor_clearance(sim.m, dd, sim.ids, c.q_grasp, min(c.width_m + 0.01, 0.1))
+                       if c.q_grasp is not None else None)
+                rows.append((c.name, c.ok, None if clr is None else round(clr * 1000, 1), c.reasons))
+        report["floor_check"] = {"per_candidate": rows,
+                                 "ok_all_clear": all(r[2] is not None and r[2] >= planner.PLAN_FLOOR_CLEARANCE * 1000 - 1 for r in rows if r[1])}
     finally:
         planner.TIP_MARGIN = keep
 

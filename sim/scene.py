@@ -189,6 +189,13 @@ def build_xml(s: dict) -> str:
                 h.attrib.update(name=g.get("name").replace("_visual", "_hull"), type="mesh", mesh=g.get("mesh"),
                                 group="4", contype="2", conaffinity="3", condim="3", rgba="0.2 0.6 1.0 0.35",
                                 mass="0")
+    # Gravity compensation on the arm (links, gripper, fingers; not the block). The real arm holds and moves
+    # with the SDK's gravity term as MIT feedforward (rebot/arm_state.py, since 2026-10-14) and barely sags;
+    # without this the sim's position actuators sagged 15-20 mm at the hand, so path checks judged the
+    # floor clearance on an arm far lower than the real one.
+    for body in root.iter("body"):
+        if body.get("name") in LINK_BODIES + ["end_link"] or (body.get("name") or "").startswith("finger_"):
+            body.set("gravcomp", "1")
     # grip site midway along the pads (end_link x: pads span about -0.065..0, fingertips at 0)
     end = next(b for b in root.iter("body") if b.get("name") == "end_link")
     ET.SubElement(end, "site", name="grip", pos="-0.025 0 0", size="0.006", rgba="0 1 0 1", group="1")

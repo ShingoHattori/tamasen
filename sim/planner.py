@@ -29,6 +29,15 @@ LIFT = 0.08                 # m, straight up
 IK_POS_TOL = 2e-3
 IK_ROT_TOL = math.radians(2.0)
 SELF_PEN_TOL = 3e-3
+# Fingers / arm vs the table at the grasp pose. The path check before execution (sim_server
+# FLOOR_CLEARANCE) wants >= 15 mm along the simulated motion; the plan keeps 17 mm so a candidate it
+# accepts also passes there (2026-10-14: a top grasp of the standing block put the fingertips 8.5 mm above
+# the table and the path check refused the move). The simulated arm is gravity-compensated like the real one
+# (scene.py gravcomp), so it barely sags; the calibration error (~4 mm vertical) still leaves >= 11 mm.
+PLAN_FLOOR_CLEARANCE = 0.017
+# Fingertips at least this far past the block face they enter through. The jaw faces are 13 mm wide and 63 mm
+# long; a flat block (31 mm tall) grasped from above with 17 mm under the tips leaves 14 mm.
+MIN_ENGAGE = 0.010
 GRIP_TO_TIP = 0.025         # grip site sits this far behind the fingertip plane (scene.py)
 TIP_MARGIN = 0.003
 AXIS_NAMES = ["X", "Y", "Z"]
@@ -129,6 +138,18 @@ def static_contacts(m, d, ids: scene.Ids, q, gap: float, block_away: bool) -> di
     return {"floor": floor, "self": self_, "block": block}
 
 
+def floor_clearance(m, d, ids: scene.Ids, q, gap: float) -> float:
+    """Smallest distance from any arm / jaw collision geom (not the base) to the floor, jaws open to gap."""
+    d.qpos[ids.arm_qadr] = q
+    half = max(0.0, (gap - scene._gap_model(m).gap0) / 2)
+    d.qpos[ids.fl_q], d.qpos[ids.fr_q] = half, -half
+    mujoco.mj_kinematics(m, d)
+    base = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+    return min(mujoco.mj_geomDistance(m, d, g, ids.floor_geom, 0.2, None) for g in range(m.ngeom)
+               if m.geom_bodyid[g] in ids.arm_bodies and m.geom_bodyid[g] != base
+               and (m.geom_contype[g] | m.geom_conaffinity[g]))
+
+
 def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray) -> list[Candidate]:
     d = mujoco.MjData(m)
     ids = scene.Ids(m)
@@ -167,6 +188,34 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray) -> list
         if pe > IK_POS_TOL or re > IK_ROT_TOL:
             c.reasons.append(f"IK 解なし（残差 {pe * 1000:.1f} mm / {math.degrees(re):.1f}°）")
             continue
+        # Table clearance at the grasp pose (jaws open): raise the grasp point until the fingers / arm keep
+        # PLAN_FLOOR_CLEARANCE, then require the jaws to still reach MIN_ENGAGE into the block.
+        open_gap = min(c.width_m + 0.01, max_gap, model_max)
+        raised = 0.0
+        for _ in range(4):
+            clr = floor_clearance(m, d, ids, c.q_grasp, open_gap)
+            if clr >= PLAN_FLOOR_CLEARANCE:
+                break
+            dz = PLAN_FLOOR_CLEARANCE - clr + 0.001
+            raised += dz
+            p_grasp = p_grasp + np.array([0, 0, dz])
+            p_pre = p_grasp - c.approach * PREGRASP_BACKOFF
+            c.q_pre, e1, r1 = solve_ik(m, d, ids, p_pre, c.R_end, c.q_pre)
+            c.q_grasp, e2, r2 = solve_ik(m, d, ids, p_grasp, c.R_end, c.q_pre)
+            c.q_lift, e3, r3 = solve_ik(m, d, ids, p_grasp + np.array([0, 0, LIFT]), c.R_end, c.q_grasp)
+            pe, re = max(e1, e2, e3), max(r1, r2, r3)
+        c.grasp_point = p_grasp
+        clr = floor_clearance(m, d, ids, c.q_grasp, open_gap)
+        engage = half_a + float((p_grasp + c.approach * GRIP_TO_TIP - centre) @ c.approach)   # tips past the entry face
+        note = (f"机とのすき間を保つため把持点を {raised * 1000:.0f} mm 上げた（指先がブロックに {engage * 1000:.0f} mm 入る）"
+                if raised > 0 else None)
+        if pe > IK_POS_TOL or re > IK_ROT_TOL:
+            c.reasons.append(f"把持点を上げたら IK 解なし（残差 {pe * 1000:.1f} mm / {math.degrees(re):.1f}°）")
+            continue
+        if clr < PLAN_FLOOR_CLEARANCE - 1e-3:
+            c.reasons.append(f"把持姿勢で机とのすき間が {clr * 1000:.1f} mm（{PLAN_FLOOR_CLEARANCE * 1000:.0f} mm 未満）")
+        if engage < MIN_ENGAGE:
+            c.reasons.append(f"顎がブロックに十分かからない（指先の入り込み {engage * 1000:.0f} mm < {MIN_ENGAGE * 1000:.0f} mm）")
         lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
         for label, q in (("接近前", c.q_pre), ("把持", c.q_grasp), ("持ち上げ", c.q_lift)):
             at_lim = [scene.ARM_JOINTS[i] for i in range(6) if q[i] - lo[i] < 1e-3 or hi[i] - q[i] < 1e-3]
@@ -188,5 +237,7 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray) -> list
         c.score = float(np.abs(c.q_grasp - q_start).sum() + 2.0 * (1 + c.approach[2]))  # prefer top-down
         if c.ok:
             c.reasons.append("条件を満たす")
+        if note:
+            c.reasons.append(note)          # information only (after the ok decision)
     out.sort(key=lambda c: (not c.ok, c.score))
     return out
