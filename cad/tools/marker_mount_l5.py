@@ -73,6 +73,8 @@ ap.add_argument("--fit", type=float, default=0.2, help="clearance of the groove 
 ap.add_argument("--two-piece", action="store_true",
                 help="base plate + slid-on marker block (default: one piece with screw bores through to the marker faces)")
 ap.add_argument("--bore", type=float, default=6.8, help="one piece: bore from each screw seat out through the faces (head 6.0)")
+ap.add_argument("--lift", type=float, default=0.0, help="raise every marker face this much further from the base, mm")
+ap.add_argument("--base-margin", type=float, default=0.0, help="extend the base plate around the face footprints, mm")
 ap.add_argument("--gap", type=float, default=1.0, help="gap between neighbouring face footprints (default layout), mm")
 ap.add_argument("--boss-clearance", type=float, default=0.1)
 ap.add_argument("--boss-height", type=float, default=0.8)
@@ -161,7 +163,7 @@ for k, (tilt, az, fy, fz, spin) in enumerate(specs):
     if fz is None:
         fz = (z0 + z1) / 2
     centre_plate = np.array([xBf, fy, fz])
-    c_bottom = centre_plate + out_n * (S / 2 * math.sin(T_) + 0.3)
+    c_bottom = centre_plate + out_n * (S / 2 * math.sin(T_) + 0.3 + a.lift)
     corners = [c_bottom + sx * S / 2 * e_x + sy * S / 2 * e_y for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
     sq = poly_face(corners)
     plate = BRepPrimAPI_MakePrism(sq, gp_Vec(*(n * a.plate))).Shape()
@@ -179,7 +181,8 @@ zs = [z0, z1] + [v for f_ in foot for v in f_[2:]]
 if not a.two_piece:
     # one piece: base under every footprint, wedges on it; each screw seat is a 90 deg countersink with a bore of the
     # head's size straight out through the wedges and the marker face (the sticker covers it); bosses on the back
-    P = box(X_PLATE, min(ys), z0, xA, max(ys), max(zs))
+    bm = a.base_margin
+    P = box(X_PLATE, min(ys) - bm, z0, xA, max(ys) + bm, max(zs) + bm)
     for fc in faces:
         P = fuse(P, fc["solid"])
     P = cut(P, box(X_PLATE, -200, -200, X_PLATE + 50, 200, 200))
