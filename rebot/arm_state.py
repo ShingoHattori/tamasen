@@ -50,6 +50,7 @@ sys.path.insert(0, str(SDK))
 DAMIAO_STATUS = {0x0: "無効（トルクなし）", 0x1: "有効", 0x8: "過電圧", 0x9: "低電圧", 0xA: "過電流",
                  0xB: "MOS 過熱", 0xC: "ロータ過熱", 0xD: "通信断", 0xE: "過負荷"}
 STALE_S = 0.5
+STATIC_VEL = 0.01           # rad/s: an unchanged reading this slow is a motor held still, not a lost one
 VMAX = 0.25                 # rad/s, joint speed limit (the simulator builds the profile with the same value)
 # Outer feedback loop on (plan - measured), per joint. Wrist joints carry little gravity load, and
 # correcting them made joint6 hunt on the real arm (2026-10-13): lower gains on 4/5, none on 6.
@@ -501,9 +502,24 @@ class ArmService:
             rows.append({"name": j["name"], "pos": pos, "pos_motor": s.pos, "vel": s.vel, "torq": s.torq,
                          "status": f"{s.status_code:#x} {DAMIAO_STATUS.get(s.status_code, '不明')}",
                          "status_code": s.status_code, "t_mos": s.t_mos, "t_rotor": s.t_rotor, "age_s": age})
-            if age < STALE_S:
-                q[j["name"]] = pos
-        ok = all(r["age_s"] is not None and r["age_s"] < STALE_S for r in rows)
+        # Freshness. motorbridge keeps no receive time, so a reading counts as fresh when it changed within
+        # STALE_S. A motor held perfectly still in MIT mode (joint6: no gravity, no hunting) reports identical
+        # values for seconds, which read as a CAN loss every ~15 s (2026-10-14). So an unchanged reading is
+        # also accepted while the bus is alive (another joint changed within STALE_S) and the motor reports
+        # ~zero velocity. Limit: one motor that stops answering with a zero-velocity reading is not detected
+        # while holding; during a move the corridor check (plan - measured) catches it.
+        ages = [r["age_s"] for r in rows if r["age_s"] is not None]
+        bus_alive = bool(ages) and min(ages) < STALE_S
+        for r in rows:
+            if r["age_s"] is None:
+                r["fresh"] = False
+                continue
+            static_ok = bus_alive and r["vel"] is not None and abs(r["vel"]) < STATIC_VEL
+            r["fresh"] = r["age_s"] < STALE_S or static_ok
+            r["fresh_by"] = "変化" if r["age_s"] < STALE_S else ("静止（通信は生存）" if static_ok else "古い")
+            if r["fresh"]:
+                q[r["name"]] = r["pos"]
+        ok = all(r.get("fresh") for r in rows)
         self.last_rows = rows
         self.statuses = {r["name"]: r.get("status_code") for r in rows}
         c = self.control
