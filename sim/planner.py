@@ -108,8 +108,21 @@ def candidates(T_base_obj: np.ndarray, size: np.ndarray, clearance: float, tilts
     return out
 
 
+RAY_GROUPS = np.array([1, 0, 1, 0, 0, 1], np.uint8)   # block / floor, visual meshes, registered obstacles
+RAY_CAM_SKIP_M = 0.18
+VIS_STEP_M = 0.01           # approach sampled at this spacing for the visibility check (= the 10 mm steps)
+
+
+def place_block(d, ids: scene.Ids, T_base_obj) -> None:
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, np.asarray(T_base_obj, float)[:3, :3].ravel())
+    d.qpos[ids.block_q:ids.block_q + 3], d.qpos[ids.block_q + 3:ids.block_q + 7] = T_base_obj[:3, 3], quat
+
+
 def marker_view(m, d, ids: scene.Ids, q, view: dict) -> dict:
-    """Predicted ID 1 view at joint angles q: angle to the camera, image position, side length."""
+    """Predicted ID 1 view at joint angles q: angle to the camera, image position, side length, and
+    occlusion: rays from the centre and four inner corner points of the square (3 mm off its face) to the
+    camera, against the block, floor, the arm's visual meshes (not end_link's) and registered obstacles."""
     import cv2
     d.qpos[ids.arm_qadr] = q
     mujoco.mj_kinematics(m, d)
@@ -126,8 +139,33 @@ def marker_view(m, d, ids: scene.Ids, q, view: dict) -> dict:
     W, H = view["image"]
     inside = bool(uv[:, 0].min() > VIS_MARGIN_PX and uv[:, 1].min() > VIS_MARGIN_PX
                   and uv[:, 0].max() < W - VIS_MARGIN_PX and uv[:, 1].max() < H - VIS_MARGIN_PX)
-    ok = facing <= VIS_MAX_DEG and inside and side >= VIS_MIN_SIDE_PX and P[2, 3] > 0
-    return {"ok": bool(ok), "facing_deg": round(facing, 1), "side_px": round(side, 1), "uv": np.round(uv.mean(0)).tolist()}
+    B = F @ view["Y"]                                       # marker in base
+    cam = np.linalg.inv(view["X"])[:3, 3]
+    blocked, gid, hits = 0, np.zeros(1, np.int32), set()
+    pts = [np.zeros(3)] + [p_ * 0.7 for p_ in C[:, :3]]
+    for p_ in pts:
+        a = (B @ np.r_[p_, 1.0])[:3] + B[:3, 2] * 0.003
+        # end_link's own geoms (mount, square) are skipped: the calibrated marker origin sits a few mm off the
+        # modelled square. The ray stops RAY_CAM_SKIP_M short of the camera (inside the camera_head box).
+        dist = mujoco.mj_ray(m, d, a, cam - a, RAY_GROUPS, 1, ids.end_body, gid)
+        if 0 <= dist < 1 - RAY_CAM_SKIP_M / np.linalg.norm(cam - a):
+            blocked += 1
+            hits.add(mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, int(gid[0])) or f"geom{int(gid[0])}")
+    ok = facing <= VIS_MAX_DEG and inside and side >= VIS_MIN_SIDE_PX and P[2, 3] > 0 and blocked == 0
+    return {"ok": bool(ok), "facing_deg": round(facing, 1), "side_px": round(side, 1), "uv": np.round(uv.mean(0)).tolist(),
+            "blocked": blocked, "hit": sorted(hits)}
+
+
+def approach_view(m, d, ids: scene.Ids, qs: list, view: dict) -> list[dict]:
+    """marker_view along pre -> near -> grasp, sampled every VIS_STEP_M (joint-space interpolation of the
+    short legs); each entry tagged with its leg."""
+    out = []
+    for leg, qa, qb, dist in (("pre-near", qs[0], qs[1], PREGRASP_BACKOFF - NEAR_BACKOFF), ("near-grasp", qs[1], qs[2], NEAR_BACKOFF)):
+        n = max(1, int(round(dist / VIS_STEP_M)))
+        for i in range(n + 1 if leg == "near-grasp" else n):
+            v = marker_view(m, d, ids, qa + (qb - qa) * (i / n), view)
+            out.append(dict(v, leg=leg))
+    return out
 
 
 def solve_ik(m, d, ids: scene.Ids, p_target, R_target, q0, iters=300) -> tuple[np.ndarray, float, float]:
@@ -296,11 +334,22 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray, view: d
             c.reasons.append(f"顎がブロックに十分かからない（指先の入り込み {engage * 1000:.0f} mm < {MIN_ENGAGE * 1000:.0f} mm）")
         lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
         if view:
+            place_block(d, ids, T_base_obj)
+            half = max(0.0, (c.open_gap_m - scene._gap_model(m).gap0) / 2)
+            d.qpos[ids.fl_q], d.qpos[ids.fr_q] = half, -half
             c.vis = {k: marker_view(m, d, ids, q, view) for k, q in (("pre", c.q_pre), ("near", c.q_near), ("grasp", c.q_grasp))}
-            bad = [k for k in ("pre", "near") if not c.vis[k]["ok"]]
+            path = approach_view(m, d, ids, [c.q_pre, c.q_near, c.q_grasp], view)
+            c.vis["path"] = {"n": len(path), "visible": sum(v["ok"] for v in path),
+                             "visible_near_grasp": sum(v["ok"] for v in path if v["leg"] == "near-grasp"),
+                             "n_near_grasp": sum(v["leg"] == "near-grasp" for v in path),
+                             "occluded": sum(v["blocked"] > 0 for v in path),
+                             "facing_mean_deg": round(float(np.mean([v["facing_deg"] for v in path])), 1),
+                             "facing_max_deg": max(v["facing_deg"] for v in path)}
+            bad = [v for v in path if v["leg"] == "pre-near" and not v["ok"]] + [v for k in ("pre", "near") if not (v := c.vis[k])["ok"]]
             if bad:
-                c.reasons.append("ID 1 が見えない（" + "、".join(f"{ {'pre': '接近前', 'near': '近接'}[k] } {c.vis[k]['facing_deg']:.0f}°"
-                                                           for k in bad) + f"、上限 {VIS_MAX_DEG:.0f}°）")
+                w = max(bad, key=lambda v: (v["blocked"], v["facing_deg"]))
+                c.reasons.append(f"接近前→近接で ID 1 が見えない点がある（{len(bad)} 点、例: 向き {w['facing_deg']:.0f}°"
+                                 + (f"、遮蔽 {w['blocked']}/5 本" if w["blocked"] else "") + f"、上限 {VIS_MAX_DEG:.0f}°）")
         for label, q in (("接近前", c.q_pre), ("近接", c.q_near), ("把持", c.q_grasp), ("持ち上げ", c.q_lift)):
             at_lim = [scene.ARM_JOINTS[i] for i in range(6) if q[i] - lo[i] < 1e-3 or hi[i] - q[i] < 1e-3]
             if at_lim:
@@ -320,7 +369,9 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray, view: d
         c.ok = not c.reasons
         c.score = float(np.abs(c.q_grasp - q_start).sum() + 2.0 * (1 + c.approach[2])   # prefer top-down
                         + 0.5 * math.radians(abs(c.tilt_deg))
-                        + (0.02 * c.vis["near"]["facing_deg"] if c.vis else 0.0))      # and ID 1 well in view
+                        # and ID 1 in view along the whole approach: the steps re-measure it before each move
+                        + (0.08 * c.vis["path"]["facing_mean_deg"]
+                           + 1.0 * (c.vis["path"]["n_near_grasp"] - c.vis["path"]["visible_near_grasp"]) if c.vis else 0.0))
         if c.ok:
             c.reasons.append("条件を満たす")
         if note:
