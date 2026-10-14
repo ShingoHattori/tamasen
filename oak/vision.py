@@ -421,7 +421,8 @@ def main() -> int:
             role = body.get("role") or ("eval" if idx % 4 == 3 else "calib")
             rec = {"id": idx, "role": role, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "label": body.get("label", ""),
                    "q": q1.tolist(), "T_base_ee": np.vstack([np.column_stack([np.array(a1["fk"]["R"]), a1["fk"]["p"]]), [0, 0, 0, 1]]).tolist(),
-                   "fk_model": a1.get("fk_model"), "corners_px": cm.tolist(), "corner_std_px": cstd,
+                   "fk_model": a1.get("fk_model"), "joint_offsets_rad": (a1.get("joint_offsets") or {}).get("rad"),
+                   "corners_px": cm.tolist(), "corner_std_px": cstd,
                    "n_frames": len(cap["corners"]), "status_counts": {k: cap["status"].count(k) for k in set(cap["status"])},
                    "status": max(set(cap["status"]), key=cap["status"].count),
                    "T_cam_m1": sols[0][1].tolist(), "T_cam_m1_alt": sols[1][1].tolist() if len(sols) > 1 else None,

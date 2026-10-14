@@ -28,11 +28,16 @@ import cv2
 import numpy as np
 
 import pose
+import urdf_fk
 
 MIN_SAMPLES = 6
 MIN_AXIS_SPREAD = 0.25          # 2nd singular value of the unit rotation axes of relative motions
 MIN_REL_ROT_DEG = 15.0
-HOLDOUT_MAX_PX = 2.0
+# Held-out corner reprojection limit. 2.0 px (first setting) was not reachable with this arm: with joint zero
+# offsets estimated, 16-17 samples leave 2-7 px on held-out poses (3.7 mm median / 4.8 mm max position), from
+# gearbox backlash and link deflection that the model does not contain. Raised to 8 px (requester, 2026-10-14);
+# the achieved numbers are kept in the result.
+HOLDOUT_MAX_PX = 8.0
 
 
 def rt_to_T(r, t):
@@ -198,13 +203,28 @@ def evaluate(X, Y, samples, dq=None) -> dict:
             "rot_err_deg_median": float(np.median(a("rot_err_deg"))), "rot_err_deg_max": float(np.max(a("rot_err_deg")))}
 
 
+def _fk_motor(q):
+    global _chain
+    if _chain is None:
+        _chain = urdf_fk.Chain()
+    return _chain(np.asarray(q))
+
+
 def load_samples(d: Path):
     out = []
     for line in (d / "samples.jsonl").read_text().splitlines():
         if not line.strip():
             continue
         r = json.loads(line)
-        out.append({"id": r["id"], "F": np.array(r["T_base_ee"]), "O": np.array(r["T_cam_m1"]),
+        F = np.array(r["T_base_ee"])
+        off = r.get("joint_offsets_rad")
+        if off and r.get("q") is not None and any(abs(off.get(n, 0.0)) > 0 for n in urdf_fk.ARM):
+            # Recorded with the arm service's software zero offsets (q, T_base_ee in model angles). The fit
+            # works in motor angles throughout (its joint offsets are estimated relative to those), so
+            # convert back: q_motor = q - offset, F = FK(q_motor).
+            r["q"] = [qi - off.get(n, 0.0) for qi, n in zip(r["q"], urdf_fk.ARM)]
+            F = _fk_motor(r["q"])
+        out.append({"id": r["id"], "F": F, "O": np.array(r["T_cam_m1"]),
                     "corners": np.array(r["corners_px"]), "sigma": max(r.get("corner_std_px", 0.1), 0.05),
                     "size": r["marker_size_m"], "K": np.array(r["K"]), "dist": np.array(r["dist"]),
                     "role": r.get("role", "calib"), "status": r.get("status"), "q": r.get("q")})

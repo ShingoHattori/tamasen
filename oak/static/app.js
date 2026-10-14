@@ -10,7 +10,8 @@ const esc = (s) => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;"
 const STATUS_CLASS = { ok: "ok", pair: "info", ambiguous: "warn", flip: "bad", rejected: "bad" };
 const STATUS_JA = { ok: "ok", pair: "もう一方のマーカーとの剛体関係で解を選択", ambiguous: "曖昧", flip: "反転疑い", rejected: "不採用" };
 const VALUE_JA = { unset: '<span class="tag no">未入力</span>', sample: '<span class="tag prov">サンプル値・仮定</span>',
-  measured: '<span class="tag cal">実測済み</span>', calibrated: '<span class="tag cal">校正済み</span>' };
+  measured: '<span class="tag cal">実測済み</span>', calibrated: '<span class="tag cal">校正済み</span>',
+  design: '<span class="tag prov">CAD 設計値・未製作</span>', built: '<span class="tag prov">取り付け済み・未実測</span>' };
 
 async function post(url, body = {}) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -383,6 +384,7 @@ loadFiles();
 const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
 $("heSession").value = today;
 $("genPoses").onclick = () => post("/sim/api/calib_poses");
+$("genPosesWS").onclick = async () => { const r = await post("/sim/api/calib_poses", { mode: "workspace" }); $("heMsg").innerHTML = r.ok ? `<span class="ok">${esc(r.message)}</span>` : `<span class="bad">${esc(r.message || "")}</span>`; };
 $("previewPoses").onclick = () => post("/sim/api/preview_calib");
 $("heSolve").onclick = async () => { await post("/api/handeye/solve", { session: $("heSession").value }); loadHE(); };
 $("heAdopt").onclick = async () => { if (confirm("この校正結果を採用し、シミュレーターの配置を校正済みにします。よろしいですか？")) { await post("/api/handeye/adopt", { session: $("heSession").value }); loadHE(); } };

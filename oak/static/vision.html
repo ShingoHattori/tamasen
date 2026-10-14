@@ -83,7 +83,7 @@
  <section class="full"><h2>座標校正（固定カメラ: camera↔base と end_link↔ID 1）</h2>
   <div class="dim">手順: (1) ID 2 を固定して「基準を登録」 (2) 校正姿勢を生成しツインで確認 (3) 各姿勢について「経路をシミュレート」→ 実機パネルで実行（依頼者）→ 静止後に「サンプル記録」
    (4) 解く → 評価用姿勢（校正に使わない）の誤差を確認 → 採用。ID 1 の姿勢を end_link の姿勢とは見なさない（取り付け変換も同時に推定）。たわみ・関節零点誤差は補償しない（残差に出る）。</div>
-  <div>セッション <input id="heSession" size="12"> <button id="genPoses">校正姿勢を生成</button><button id="previewPoses">全姿勢をツインで巡回再生</button>
+  <div>セッション <input id="heSession" size="12"> <button id="genPoses">校正姿勢を生成</button><button id="genPosesWS" title="作業範囲から、ID 1 が見えると予測される姿勢を選ぶ（直近の hand-eye 推定を使う）">作業範囲で生成（見え方を予測）</button><button id="previewPoses">全姿勢をツインで巡回再生</button>
    <button id="heSolve">解く</button><button id="heAdopt">評価合格の結果を採用</button></div>
   <div id="heMsg" style="font-size:15px;font-weight:bold;margin:4px 0"></div>
   <div id="heSamples"></div>
