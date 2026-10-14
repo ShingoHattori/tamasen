@@ -92,8 +92,8 @@ TRACE_AFTER_S = 2.0         # s of holding still traced after a move ends
 # Gripper (motor "gripper", MIT): position mode for open / release, torque-limited closing for grip.
 # Opening is proportional to the motor angle (2026-10-14, ruler: 0 / 50 / 100 mm at -0.022 / -2.929 / -5.896 rad,
 # ~1 mm backlash); same values as sim/scene.toml [jaw]. Overridable in mit_tuning.yaml "gripper:".
-GRIPPER_DEFAULTS = {"full_open_rad": -5.896, "max_gap_m": 0.100, "grip_torque_nm": 0.25, "speed_rad_s": 2.0,
-                    "kp": 8.0, "kd": 1.0, "grip_kd": 0.3, "miss_margin_m": 0.008}
+GRIPPER_DEFAULTS = {"full_open_rad": -5.896, "max_gap_m": 0.100, "grip_torque_nm": 0.5, "speed_rad_s": 2.0,
+                    "kp": 8.0, "kd": 1.0, "grip_kd": 0.3, "miss_margin_m": 0.004}
 GRIP_SETTLE_S, GRIP_STILL_RAD_S, GRIP_TIMEOUT_S = 0.3, 0.05, 6.0
 # Joint zero offsets (software only, never written to the motors): model angle = motor angle + offset.
 # Everything this service publishes and plans with is in model angles; commands are converted back.
