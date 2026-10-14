@@ -21,7 +21,7 @@ Writes rod_jig.step / .stl / .json and, with the finger STEP, checks the fingers
 import argparse, json, math
 from pathlib import Path
 from OCP.gp import gp_Pnt, gp_Dir, gp_Ax1, gp_Ax2, gp_Trsf, gp_Vec
-from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeCone
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse, BRepAlgoAPI_Common
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
 from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
@@ -49,7 +49,9 @@ ap.add_argument("--outer", type=float, default=4.0, help="outer wall of each poc
 ap.add_argument("--wall-z", type=float, nargs=2, default=[5.0, 8.0], metavar=("MINUS", "PLUS"),
                 help="walls below / above the holes along z (+z carries the screws)")
 ap.add_argument("--chamfer", type=float, default=2.5, help="45 deg entry chamfer of the pockets (+x face)")
-ap.add_argument("--screw-pilot", type=float, default=2.5, help="pilot hole for 3 mm tapping screws")
+ap.add_argument("--screw-pilot", type=float, nargs=2, default=[2.7, 2.4], metavar=("ENTRY", "END"),
+                help="tapered pilot hole for 3 mm tapping screws: diameter at the entry and at the rod hole")
+ap.add_argument("--screw-csk", type=float, default=5.0, help="90 deg entry countersink diameter on the +z face")
 ap.add_argument("--screws", type=int, default=2)
 ap.add_argument("--marker", type=float, default=30.0, help="ArUco black square, mm")
 ap.add_argument("--marker-margin", type=float, default=2.0, help="white margin of the sticker inside the rim")
@@ -111,9 +113,14 @@ for s in (-1, 1):
         body = cut(body, frustum(D / 2, pw, ph, a.chamfer, yc))
 # screws: pilot holes along -z from the +z face into the rod hole, spread along x
 xs = [-D / 2 + D * (i + 1) / (a.screws + 1) for i in range(a.screws)]
+# tapered pilot (the tapping screw starts easily and bites harder towards the rod) + 90 deg entry countersink
 for x in xs:
-    cyl = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x, 0, zh + 1), gp_Dir(0, 0, -1)), a.screw_pilot / 2, zh - rh / 2 + 2).Shape()
-    body = cut(body, cyl)
+    Lp = zh - rh / 2
+    pil = BRepPrimAPI_MakeCone(gp_Ax2(gp_Pnt(x, 0, zh + 0.01), gp_Dir(0, 0, -1)), a.screw_pilot[0] / 2, a.screw_pilot[1] / 2, Lp + 0.02).Shape()
+    body = cut(body, pil)
+    body = cut(body, BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(x, 0, rh / 2 + 0.5), gp_Dir(0, 0, -1)), a.screw_pilot[1] / 2, 1.0).Shape())
+    hc = (a.screw_csk - a.screw_pilot[0]) / 2                     # 90 deg: depth = radial step
+    body = cut(body, BRepPrimAPI_MakeCone(gp_Ax2(gp_Pnt(x, 0, zh + 0.01), gp_Dir(0, 0, -1)), a.screw_csk / 2 + 0.01, a.screw_pilot[0] / 2, hc + 0.01).Shape())
 # marker area on the -z face: raised rim around a square of marker + 2 margins
 inner = a.marker + 2 * a.marker_margin
 rwid, rhgt = a.rim
@@ -133,8 +140,9 @@ info = {
     "entry_gap_mm": {"min": grip_w, "max": 2 * (y_pocket + pw / 2) - 2 * 12.7,
                      "suggested": round(2 * (rw / 2 + a.inner) + (pw - 12.7), 1),
                      "note": "jaw gap (inner faces) while entering: inner faces between the inner walls and outer walls minus the 12.7 mm finger"},
-    "screws": {"pilot_mm": a.screw_pilot, "x_mm": xs, "axis": "-z from the +z face", "length_into_wall_mm": zh - rh / 2,
-               "screw": "3 mm tapping screw (e.g. 3 x 12), tip presses the rod"},
+    "screws": {"pilot_mm": {"entry": a.screw_pilot[0], "end": a.screw_pilot[1], "taper": "linear over the wall"},
+               "entry_countersink_mm": {"diameter": a.screw_csk, "angle_deg": 90}, "x_mm": xs, "axis": "-z from the +z face", "length_into_wall_mm": zh - rh / 2,
+               "screw": "countersunk 3 mm tapping screw, 3 x 16 to 3 x 20 (wall 14 mm): the tip presses the rod"},
     "marker": {"face": "-z", "centre_mm": [0, 0, zl - rhgt], "black_square_mm": a.marker, "sticker_area_mm": inner,
                "rim_mm": {"width": rwid, "height": rhgt}, "normal": [0, 0, -1]},
     "volume_cm3": round(volume(body) / 1000, 1),
