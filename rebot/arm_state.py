@@ -61,6 +61,7 @@ CORRIDOR_RAD = 0.08         # rad, per-joint deviation from the simulated plan t
 CORRIDOR_M = 0.020          # m, end_link deviation (FK) that stops the motion
 LAG_FREE, LAG_STOP = 0.01, 0.04   # rad: plan runs at full speed below LAG_FREE lag, stops at LAG_STOP
 STALL_S = 2.0               # s the plan may stand still before it is a fault
+LAG_KI_GAIN = 3.0           # integral gain multiplier while the plan clock is fully held back by lag
 CAN_LOSS_S = 0.3            # s without fresh feedback while engaged = CAN / bus fault
 ENGAGE_GRACE_S = 0.5
 # Motor-internal POS_VEL gains that differ from the SDK yaml (written at engage). joint6 (light wrist
@@ -69,7 +70,29 @@ ENGAGE_GRACE_S = 0.5
 PV_OVERRIDE = {"joint6": {"pos_ki": 0.0}}
 # joint6 still hunted ~0.02 rad in POS_VEL with pos_ki = 0 (velocity loop vs wrist friction). It is held
 # in MIT mode instead: torque = kp (q_cmd - q) - kd q_dot, no integrator. kp / kd from the SDK yaml.
-MIT_JOINTS = {"joint6"}        # after enabling, status 0x1 must be reported within this time
+# joint4 (wrist pitch, carries ~2 Nm of gravity) stick-slipped in POS_VEL: 11 mrad jumps every ~3.3 s while
+# holding (2026-10-14, the motor's own position integral against friction). It is held in MIT mode too,
+# with the gravity torque g(q) of the SDK's URDF as feedforward (the official SDK's gravity-compensation
+# method, examples 9/10). Checked on the real arm at one pose: model -1.88 Nm vs motor -1.69 Nm (joint4),
+# -6.69 vs -7.18 (joint3). The outer feedback loop removes the remaining static error.
+# joint5 then showed the same stick-slip at a pose where its gravity torque crosses zero (11.8 mrad jumps every
+# ~3 s at calibration pose 17, torque -0.20..+0.16 N m). Rather than finding the next joint/pose one at a
+# time, every arm joint is held this way (requester, 2026-10-14). kp / kd per joint from the SDK yaml
+# (joint1-3: 120 / 8, joint4-6: 18 / 2).
+MIT_JOINTS = {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"}
+# N m, clamp of the gravity feedforward: |g| over 20000 random poses inside the limits is at most
+# 0 / 15.5 / 7.2 / 1.9 / 0.7 / 0 (joint1 and joint6 axes carry no gravity torque).
+TAU_FF_MAX = {"joint1": 1.0, "joint2": 18.0, "joint3": 9.0, "joint4": 3.0, "joint5": 1.5, "joint6": 0.5}
+# s, the gravity feedforward fades in after engage. At the folded rest pose gravity pushes joint2/3 onto their
+# 0 rad stops, so the arm rests there until the term is in; an unsupported joint3 would sag at most
+# g/kp = 7 / 120 = 0.06 rad during the ramp (kept short for that reason).
+GRAV_RAMP_S = 0.5
+TUNING_PATH = Path(__file__).resolve().parent / "mit_tuning.yaml"   # friction and gain overrides, read at engage
+TRACE_AFTER_S = 2.0         # s of holding still traced after a move ends
+# Joint zero offsets (software only, never written to the motors): model angle = motor angle + offset.
+# Everything this service publishes and plans with is in model angles; commands are converted back.
+OFFSETS_PATH = Path(__file__).resolve().parent / "joint_offsets.yaml"
+OFFSET_MAX = math.radians(10.0)
 FAULT_POLICY = {
     "ページ切断（生存確認なし）": "移動中なら停止し、その場で保持（トルクは維持）。保持中はそのまま保持。",
     "サービス終了要求（SIGTERM）": "有効中は 1 回目を拒否し記録。5 s 以内の 2 回目で終了 — その場合モーターは最後の指令を保持したまま有効で残る"
@@ -168,9 +191,9 @@ class Bus:
         for n, v in q.items():
             self._m[n].send_pos_vel(float(v), float(vlim))
 
-    def send_mit(self, name, pos, kp, kd) -> None:
+    def send_mit(self, name, pos, kp, kd, vel=0.0, tau=0.0) -> None:
         self._check()
-        self._m[name].send_mit(float(pos), 0.0, float(kp), float(kd), 0.0)
+        self._m[name].send_mit(float(pos), float(vel), float(kp), float(kd), float(tau))
 
     def close(self) -> None:
         try:
@@ -238,8 +261,10 @@ class FakeBus:
     def send_pos_vel(self, q, vlim):
         self._check(); self._advance(); self.target.update(q); self.vlim = vlim
 
-    def send_mit(self, name, pos, kp, kd):
+    def send_mit(self, name, pos, kp, kd, vel=0.0, tau=0.0):
         self._check(); self._advance(); self.target[name] = pos; self.vlim = 1.0
+        self.log.append(("mit_cmd", name, round(float(pos), 4), round(float(vel), 4), round(float(tau), 3))) \
+            if len(self.log) < 5000 else None
 
     def close(self):
         pass
@@ -276,11 +301,42 @@ class FK:
         return {"frame": "end_link", "p": M.translation.tolist(), "R": M.rotation.tolist()}
 
 
+class Gravity:
+    """g(q) of the SDK's URDF via the SDK's own dynamics module (official gravity-compensation examples)."""
+
+    def __init__(self) -> None:
+        self.error = None
+        try:
+            from reBotArm_control_py.dynamics import load_dynamics_model, compute_generalized_gravity
+            self.model = load_dynamics_model()
+            self.data = self.model.createData()
+            self._g = compute_generalized_gravity
+            self.names = [self.model.names[i] for i in range(1, self.model.njoints)]
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+
+    def __call__(self, q_by_name: dict) -> dict | None:
+        if self.error:
+            return None
+        q = np.zeros(self.model.nq)
+        for i, n in enumerate(self.names):
+            if n in q_by_name:
+                q[self.model.joints[i + 1].idx_q] = q_by_name[n]
+        g = np.asarray(self._g(self.model, q, self.data)).ravel()
+        return {n: float(g[self.model.joints[i + 1].idx_v]) for i, n in enumerate(self.names)}
+
+
 class ArmService:
     def __init__(self, args) -> None:
         self.args = args
         self.joints = load_joints(args.hw_yaml)
         self.fk = FK()
+        self.gravity = Gravity()
+        self.ff = {}                 # last MIT feedforward sent (shown on the page)
+        self.tuning, self.tuning_error = self.load_tuning()
+        self.offsets, self.offsets_error = self.load_offsets()
+        self.last_rows = []
+        self.trace = None            # open trace file while a move (and TRACE_AFTER_S after it) is recorded
         self.lock = threading.Lock()
         self.cmds: list[tuple] = []
         self.stop_evt = threading.Event()
@@ -301,6 +357,73 @@ class ArmService:
             "関節 0 rad とモデルの 0 rad の一致は、Pinocchio と MuJoCo の FK 一致までは確認済み。実機の零点位置そのものは未検証。",
             "グリッパーのモーター角と顎の開口の対応は未確認。",
         ]
+
+    @staticmethod
+    def load_offsets() -> tuple[dict, str | None]:
+        """rebot/joint_offsets.yaml -> {joint: rad} (model = motor + offset). Missing file = all 0."""
+        off = {n: 0.0 for n in ARM}
+        try:
+            raw = yaml.safe_load(OFFSETS_PATH.read_text()) or {}
+        except FileNotFoundError:
+            return off, None
+        except Exception as e:
+            return off, f"{OFFSETS_PATH.name} を読めない: {e}"
+        try:
+            for n, v in (raw.get("offsets_deg") or {}).items():
+                r = math.radians(float(v))
+                if n not in ARM or abs(r) > OFFSET_MAX:
+                    return {k: 0.0 for k in ARM}, f"offsets_deg.{n} = {v} は不正（関節名、|値| <= 10 deg）"
+                off[n] = r
+        except (TypeError, ValueError) as e:
+            return {k: 0.0 for k in ARM}, f"{OFFSETS_PATH.name} の値が不正: {e}"
+        return off, None
+
+    @staticmethod
+    def load_tuning() -> tuple[dict, str | None]:
+        """rebot/mit_tuning.yaml -> {"friction": {joint: N m}, "friction_v": rad/s, "kp": {...}, "kd": {...}}."""
+        t = {"friction": {n: 0.0 for n in ARM}, "friction_v": 0.02, "kp": {}, "kd": {}, "file": str(TUNING_PATH)}
+        try:
+            raw = yaml.safe_load(TUNING_PATH.read_text()) or {}
+        except FileNotFoundError:
+            return t, None
+        except Exception as e:
+            return t, f"{TUNING_PATH.name} を読めない: {e}"
+        try:
+            for n, v in raw.get("friction_nm", {}).items():
+                if n not in ARM or not 0.0 <= float(v) <= 5.0:
+                    return t, f"friction_nm.{n} = {v} は不正（関節名、0〜5 N m）"
+                t["friction"][n] = float(v)
+            opt = raw.get("options", {})
+            t["friction_v"] = float(opt.get("friction_v", 0.02))
+            if not 0.001 <= t["friction_v"] <= 0.5:
+                return t, "options.friction_v は 0.001〜0.5 rad/s"
+            for k, v in opt.items():
+                for g, lim in (("kp", 500.0), ("kd", 50.0)):
+                    if k.startswith(g + "_"):
+                        n = k[len(g) + 1:]
+                        if n not in ARM or not 0.0 < float(v) <= lim:
+                            return t, f"options.{k} = {v} は不正"
+                        t[g][n] = float(v)
+        except (TypeError, ValueError) as e:
+            return t, f"{TUNING_PATH.name} の値が不正: {e}"
+        return t, None
+
+    def _trace(self, c, qp, qm, q_cmd) -> None:
+        """One line per control cycle while moving and TRACE_AFTER_S after: run/arm_trace_last.jsonl."""
+        if self.trace is None:
+            return
+        if c["state"] != "moving" and time.monotonic() - self.trace["end"] > TRACE_AFTER_S:
+            self.trace["f"].close()
+            self.trace = None
+            return
+        if c["state"] == "moving":
+            self.trace["end"] = time.monotonic()
+        by = {r["name"]: r for r in self.last_rows}
+        rec = {"t": round(time.monotonic() - self.trace["t0"], 3), "state": c["state"],
+               "plan": [round(float(v), 5) for v in qp], "q": [round(float(v), 5) for v in qm],
+               "vel": [by.get(n, {}).get("vel") for n in ARM], "torq": [by.get(n, {}).get("torq") for n in ARM],
+               "cmd": [round(float(v), 5) for v in q_cmd], "ff": self.ff, "rate": (c.get("motion") or {}).get("rate")}
+        self.trace["f"].write(json.dumps(rec) + "\n")
 
     def audit(self, what: str, src: str) -> None:
         with self.log_path.open("a") as f:
@@ -325,7 +448,7 @@ class ArmService:
             while not self.stop_evt.is_set():
                 if bus is None:
                     try:
-                        bus = (FakeBus(self.joints, self.args.allow_motion, {"joint1": -1.7, "joint2": 0.0}, self.args.fake_sag, self.args.fake_speed)
+                        bus = (FakeBus(self.joints, self.args.allow_motion, {"joint1": -1.7, "joint2": 0.004, "joint3": -0.021}, self.args.fake_sag, self.args.fake_speed)
                                if self.args.fake else Bus(self.args.port, self.joints, self.args.allow_motion))
                         self.bus = bus
                         self.motor_params = bus.read_params()
@@ -359,17 +482,22 @@ class ArmService:
             if self.last_vals.get(j["name"]) != vals:
                 self.last_vals[j["name"]], self.last_change[j["name"]] = vals, now
             age = now - self.last_change[j["name"]]
-            rows.append({"name": j["name"], "pos": s.pos, "vel": s.vel, "torq": s.torq,
+            pos = s.pos + self.offsets.get(j["name"], 0.0)          # model angle
+            rows.append({"name": j["name"], "pos": pos, "pos_motor": s.pos, "vel": s.vel, "torq": s.torq,
                          "status": f"{s.status_code:#x} {DAMIAO_STATUS.get(s.status_code, '不明')}",
                          "status_code": s.status_code, "t_mos": s.t_mos, "t_rotor": s.t_rotor, "age_s": age})
             if age < STALE_S:
-                q[j["name"]] = s.pos
+                q[j["name"]] = pos
         ok = all(r["age_s"] is not None and r["age_s"] < STALE_S for r in rows)
+        self.last_rows = rows
         self.statuses = {r["name"]: r.get("status_code") for r in rows}
         c = self.control
         self.publish({"mode": ("fake" if self.args.fake else "serial") + ("+motion" if self.args.allow_motion else " read-only"),
                       "motion_allowed": self.args.allow_motion, "port": self.args.port, "ok": ok, "t": now, "joints": rows,
                       "fk": self.fk(q) if ok else None, "fk_model": "SDK reBot-DevArm_fixend.urdf (Pinocchio)",
+                      "joint_offsets": {"deg": {n: round(math.degrees(v), 3) for n, v in self.offsets.items()},
+                                        "rad": self.offsets, "error": self.offsets_error, "file": str(OFFSETS_PATH),
+                                        "note": "pos = モーター角 + offset（モデルの角度）。pos_motor が生の値。モーターには書き込まない"},
                       "control": {k: v for k, v in c.items() if k not in ("last_heartbeat",)} | {
                           "heartbeat_age_s": (time.monotonic() - c["last_heartbeat"]) if c["last_heartbeat"] else None},
                       "limits": {"vmax_rad_s": VMAX, "corridor_rad": CORRIDOR_RAD, "corridor_m": CORRIDOR_M,
@@ -378,6 +506,11 @@ class ArmService:
                       "motor_params": self.motor_params, "pv_override": PV_OVERRIDE,
                       "compensation": {
                           "joint_feedback": "関節角（エンコーダ）の追従補正: 有効中は常時（joint1-3 強め、joint4-5 弱め、joint6 なし、不感帯 0.003 rad）。モーター軸の角度を計画に合わせるだけ。",
+                          "mit_gravity": (f"{', '.join(sorted(MIT_JOINTS))}: MIT 保持（kp・kd は SDK yaml）＋ 重力 g(q)（SDK URDF、公式 dynamics）の"
+                                          f"フィードフォワード（有効化後 {GRAV_RAMP_S} s で立ち上げ、上限 {TAU_FF_MAX} N m）＋ 移動中は計画速度。"
+                                          + (f" 重力モデルの読み込み失敗: {self.gravity.error}" if self.gravity.error else "")),
+                          "mit_ff_now": self.ff,
+                          "mit_tuning": dict(self.tuning, error=self.tuning_error),
                           "visual_tcp_correction": "視覚（ID 1）による手先誤差補正: 未実装（camera↔base と 手先リンク↔ID 1 の校正後に検討）。",
                           "deflection": "リンク・減速機・取り付けのたわみ: 補償していない（関節角が計画どおりでも手先はずれ得る）。"},
                       "faults_policy": FAULT_POLICY,
@@ -390,7 +523,7 @@ class ArmService:
     def _hold(self, bus, q, why):
         """Hold where the arm IS now (never return to an older hold target)."""
         here = {n: q[n] for n in ARM}
-        self._send(bus, here, VMAX)
+        self._send(bus, here, VMAX, qm=q)
         self.control.update(state="holding", motion=None, message=why, hold_q=here)
 
     def control_step(self, bus, q: dict) -> None:
@@ -421,7 +554,8 @@ class ArmService:
             if lost > CAN_LOSS_S:
                 self._fault(f"フィードバックなし {lost:.1f} s（CAN 断 / 電源断の可能性）", keep_target=True)
             if c.get("last_cmd"):
-                self._send(bus, c["last_cmd"], VMAX)        # keep holding the last commanded point
+                # keep holding the last commanded point; the gravity term from the last known pose
+                self._send(bus, c["last_cmd"], VMAX, qm=c.get("last_q"))
             return
         self.lost_since = None
         bad = {n: self.statuses.get(n) for n in ARM if self.statuses.get(n) != 0x1}
@@ -431,6 +565,7 @@ class ArmService:
             self._fault(f"モーター状態の異常（{desc}）。無効化された関節は支えがない", keep_target=True)
         dt = 1.0 / CTRL_HZ
         qm = np.array([q[n] for n in ARM])
+        c["last_q"] = {n: q[n] for n in ARM}
         if c["state"] == "moving":
             mv = c["motion"]
             hb = time.monotonic() - c["last_heartbeat"]
@@ -455,16 +590,24 @@ class ArmService:
                 return
             t = mv["tp"]
             qp = self._plan_at(mv, t)
+            vdir = (self._plan_at(mv, min(mv["T"], t + dt)) - qp) / dt     # planned velocity (direction of travel)
+            vp = vdir * rate                                                   # ... as the slowed plan clock runs
             mv["progress"] = min(1.0, t / mv["T"])
         else:
             qp = np.array([c["hold_q"][n] for n in ARM])
+            vp = vdir = np.zeros(6)
         e = qp - qm
         fb = c.setdefault("fb", {"I": [0.0] * 6, "max_err": 0.0, "max_tcp_dev": 0.0})
         active = np.abs(e) > DEADBAND
         e_ctl = np.where(active, e - np.sign(e) * DEADBAND, 0.0)
-        # Integrate only while holding (static gravity sag). During motion the lag is handled by the
+        # Integrate while holding (static gravity / cable / friction error), and while moving only as far as
+        # the plan clock is held back by lag (weight 1 - rate, up to LAG_KI_GAIN x faster). A free-running
+        # plan is not integrated: under POS_VEL that wound up and overshot the end of the path. In MIT, the
+        # gravity model is off by ~1-2 N m at some poses (2026-10-14, calibration pose "作業範囲 4"), which
+        # stalled the plan with a frozen integral.
         # time scaling above; integrating it wound up and overshot the end of the path.
-        I = np.array(fb["I"]) if c["state"] == "moving" else np.clip(np.array(fb["I"]) + KI * e_ctl * dt, -I_MAX, I_MAX)
+        w_i = (1.0 - mv["rate"]) * LAG_KI_GAIN if c["state"] == "moving" else 1.0
+        I = np.clip(np.array(fb["I"]) + KI * e_ctl * dt * w_i, -I_MAX, I_MAX)
         q_cmd = qp + np.clip(KP * e_ctl + I, -CORR_MAX, CORR_MAX)
         tcp_dev = self._tcp_dev(qp, qm)
         fb.update(I=I.tolist(), err=e.tolist(), err_max_now=float(np.max(np.abs(e))), tcp_dev=tcp_dev,
@@ -482,20 +625,38 @@ class ArmService:
                 self.audit("fault: " + why, "service")
         # Faults latch: they are cleared only by the user ("ack_fault") once the cause is gone, or by release.
         c["last_cmd"] = dict(zip(ARM, q_cmd))
-        self._send(bus, c["last_cmd"], VMAX * 1.5)
+        self._send(bus, c["last_cmd"], VMAX * 1.5, qm=q, vd=dict(zip(ARM, vp)), vdir=dict(zip(ARM, vdir)))
+        self._trace(c, qp, qm, q_cmd)
         if c["state"] == "moving" and t >= mv["T"] and lag_now < LAG_FREE * 2:
             end = dict(zip(ARM, np.array(mv["q_plan"][-1])))
             c.update(state="holding", motion=None, hold_q=end,
                      message=f"移動完了（最大偏差 {fb['max_err']:.3f} rad / 手先 {fb['max_tcp_dev'] * 1000:.0f} mm）。保持中もフィードバック継続")
 
-    def _send(self, bus, qd: dict, vlim: float) -> None:
-        """POS_VEL targets, except MIT_JOINTS which get a spring-damper command to the same target."""
-        bus.send_pos_vel({n: v for n, v in qd.items() if n not in MIT_JOINTS}, vlim)
+    def _send(self, bus, qd: dict, vlim: float, qm: dict | None = None, vd: dict | None = None,
+              vdir: dict | None = None) -> None:
+        """POS_VEL targets, except MIT_JOINTS: tau = kp (q_cmd - q) + kd (v_plan - v) + g(q_measured)
+        + friction * tanh(v_dir / friction_v). The gravity term fades in over GRAV_RAMP_S after engage and is
+        clamped to TAU_FF_MAX; friction (mit_tuning.yaml) is applied only while a path is followed."""
+        motor = lambda n: float(qd[n]) - self.offsets.get(n, 0.0)     # model -> motor angle
+        bus.send_pos_vel({n: motor(n) for n in qd if n not in MIT_JOINTS}, vlim)
         by = {j["name"]: j for j in self.joints}
+        g = self.gravity(qm) if qm else None
+        ramp = float(np.clip((time.monotonic() - self.control.get("engaged_mono", 0.0)) / GRAV_RAMP_S, 0.0, 1.0))
         for n in MIT_JOINTS:
             if n in qd:
                 mit = by[n]["mit"]
-                bus.send_mit(n, qd[n], float(mit.get("kp", 18.0)), float(mit.get("kd", 2.0)))
+                if g is not None:
+                    tau = float(np.clip(ramp * g[n], -TAU_FF_MAX[n], TAU_FF_MAX[n]))
+                else:                                   # no pose (feedback lost): keep the last gravity term
+                    tau = float(self.ff.get(n, {}).get("tau_ff", 0.0))
+                fr = 0.0
+                if vdir and g is not None:
+                    fr = self.tuning["friction"][n] * math.tanh(float(vdir.get(n, 0.0)) / self.tuning["friction_v"])
+                v = 0.0 if not vd else float(vd.get(n, 0.0))
+                kp = self.tuning["kp"].get(n, float(mit.get("kp", 18.0)))
+                kd = self.tuning["kd"].get(n, float(mit.get("kd", 2.0)))
+                bus.send_mit(n, motor(n), kp, kd, vel=v, tau=tau + fr)
+                self.ff[n] = {"tau_ff": round(tau, 3), "fric": round(fr, 3), "v_ff": round(v, 4), "ramp": round(ramp, 2)}
 
     def _fault(self, why: str, keep_target: bool) -> None:
         """Stop any motion; hold the planned point of this instant (or the last command)."""
@@ -554,13 +715,31 @@ class ArmService:
             if not all(n in q for n in ARM):
                 c["message"] = "関節角が読めないため有効化しない"
                 return
+            off, off_err = self.load_offsets()
+            if off_err:
+                c["message"] = "零点補正ファイルの誤りのため有効化しない: " + off_err
+                return
+            if off != self.offsets:
+                # offsets changed while torque was off: re-read the pose in the new model angles first
+                self.offsets, self.offsets_error = off, None
+                c["message"] = "零点補正ファイルが変わったので読み直した。もう一度「有効化」する"
+                self.audit("joint offsets reloaded: " + json.dumps({n: round(math.degrees(v), 3) for n, v in off.items()}), "service")
+                return
+            self.tuning, self.tuning_error = self.load_tuning()
+            if self.tuning_error:
+                c["message"] = "調整値ファイルの誤りのため有効化しない: " + self.tuning_error
+                return
+            if self.gravity.error:
+                c["message"] = f"重力モデルが読めないため有効化しない（{', '.join(sorted(MIT_JOINTS))} は重力補償つき MIT 保持）: {self.gravity.error}"
+                return
             bus.prepare_pos_vel([n for n in ARM if n not in MIT_JOINTS])     # while still disabled
             for n in MIT_JOINTS:
                 bus.prepare_mit(n)
             hold = {n: q[n] for n in ARM}
+            c["engaged_mono"] = time.monotonic()           # gravity ramp starts here (tau_ff = 0 at enable)
             bus.enable(ARM)                                # the six arm motors only
-            self._send(bus, hold, VMAX)
-            c.update(state="holding", engaged_at=time.strftime("%H:%M:%S"), engaged_mono=time.monotonic(),
+            self._send(bus, hold, VMAX, qm=q)
+            c.update(state="holding", engaged_at=time.strftime("%H:%M:%S"), engaged_mono=c["engaged_mono"],
                      q_engage=hold, hold_q=hold, fault=None, last_cmd=hold,
                      fb={"I": [0.0] * 6, "max_err": 0.0, "max_tcp_dev": 0.0},
                      message="有効化した（現在位置で保持）。グリッパーは無効のまま")
@@ -588,8 +767,16 @@ class ArmService:
                 c["message"] = (f"経路の始点と現在の姿勢が {np.max(np.abs(start - q_now)):.3f} rad ずれている"
                                 "（シミュレーション後に動いた）。シミュレートし直す")
                 return
-            c["fb"] = {"I": c.get("fb", {}).get("I", [0.0] * 6), "max_err": 0.0, "max_tcp_dev": 0.0}
+            # The integral belongs to the previous pose (gravity-model error there); start the move with half of it
+            # (zeroing it would step the command).
+            c["fb"] = {"I": (0.5 * np.array(c.get("fb", {}).get("I", [0.0] * 6))).tolist(), "max_err": 0.0, "max_tcp_dev": 0.0}
             offset = (q_now - start).tolist()
+            if self.trace is not None:
+                self.trace["f"].close()
+            tp = self.log_path.parent / ("arm_trace_last_fake.jsonl" if self.args.fake else "arm_trace_last.jsonl")
+            self.trace = {"f": tp.open("w"), "t0": time.monotonic(), "end": time.monotonic()}
+            self.trace["f"].write(json.dumps({"path": path["label"], "path_id": path["id"], "time": time.strftime("%H:%M:%S"),
+                                              "joints": ARM, "tuning": self.tuning}) + "\n")
             c.update(state="moving", message=f"移動中: {path['label']}",
                      motion={"label": path["label"], "path_id": path["id"], "times": path["times"],
                              "q_plan": path["q_plan"], "T": float(path["times"][-1]), "t0": time.monotonic(), "tp": 0.0,

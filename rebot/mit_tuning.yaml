@@ -1,0 +1,21 @@
+# MIT 保持の調整値（rebot/arm_state.py が「有効化」のたびに読み直す。サービスの再起動は不要）。
+# 書き換えたら、ページで「トルクを切る」→「有効化」で反映される。単位: N m・rad・s。
+#
+# 指令: tau = kp (q_cmd - q) + kd (v_plan - v) + g(q) + friction * tanh(v_dir / friction_v)
+#   g(q): SDK の URDF の重力（公式 dynamics）。v_dir: 計画経路の進む向き（経路の時計が遅れても向きは保つ）。
+#   保持中は v_dir = 0 なので摩擦項は入らない（静止摩擦は外側の PI 補正が扱う）。
+
+# クーロン摩擦（移動中だけ、進む向きに加える）。joint2/3 は rebot/reBotArm_control_py/example/grav_params.json の fc
+# （このアームで auto_gravity_calib.py が当てはめた値）。ほかは未測定のため 0。
+# 2026-10-14: MIT 化後、休止姿勢 → 校正姿勢 17 の移動で joint3 が 0.033 rad 遅れ、手先 20 mm で停止した対策。
+friction_nm:
+  joint1: 0.0
+  joint2: 0.90
+  joint3: 1.71
+  joint4: 0.0
+  joint5: 0.0
+  joint6: 0.0
+
+options:
+  friction_v: 0.02      # rad/s, 摩擦項の向きを切り替える幅（0 付近をなめらかにする）
+  # kp / kd を SDK yaml から変える場合だけ書く（例: kp_joint3: 160.0）。未記入なら yaml の値。
