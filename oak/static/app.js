@@ -309,7 +309,8 @@ $("graspReal").onclick = () => post("/arm/api/grasp");
 // ------------------------------------------------------------------ automatic grasp sequence (started by the user)
 // Every move is simulated first (check_path) and only a clean path is executed; any fault, refused path,
 // failed alignment or missed grip ends the sequence with the arm holding where it is.
-const AUTO_ALIGN_MM = 3, AUTO_ALIGN_MAX_MM = 15, AUTO_ALIGN_TRIES = 3;
+// The server refuses offsets over 30 mm; below that the correction is applied and repeated until it settles.
+const AUTO_ALIGN_MM = 3, AUTO_ALIGN_MAX_MM = 30, AUTO_ALIGN_TRIES = 4;
 let autoRun = null;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const armNow = async () => (await fetch("/arm/state.json", { cache: "no-store" })).json();
@@ -347,7 +348,7 @@ async function autoAlign(target, label) {
     // the offset is the FK-vs-camera error at this pose; after moving by it, the next measurement should
     // repeat it (the error of the calibration), so the residual is its change, not its size
     const resid = applied ? Math.hypot(o[0] - applied[0], o[1] - applied[1], o[2] - applied[2]) : n;
-    autoLog(`${label}の位置合わせ ${i + 1}: ずれ ${n.toFixed(1)} mm（${o.map(v => v.toFixed(1)).join(", ")}）、残り ${resid.toFixed(1)} mm`);
+    autoLog(`${label}の位置合わせ ${i + 1}: ずれ ${n.toFixed(1)} mm（${o.map(v => v.toFixed(1)).join(", ")}、ばらつき ${r.correction.spread_mm} mm）、前回からの変化 ${resid.toFixed(1)} mm`);
     if (n > AUTO_ALIGN_MAX_MM) throw new Error(`${label}: ずれ ${n.toFixed(1)} mm が自動の上限 ${AUTO_ALIGN_MAX_MM} mm を超える（校正・観測を確認）`);
     if (resid < AUTO_ALIGN_MM) return;
     applied = o;

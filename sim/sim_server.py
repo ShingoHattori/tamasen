@@ -803,8 +803,11 @@ class Sim:
         the candidate's remaining targets by that difference.
 
         The block was located through the same camera and calibration as ID 1 is now, so the calibration's
-        position error cancels: offset o = FK(q_now) grip site - observed grip site (base frame), and every
-        target t is commanded as t + o. Uses 10 frames; only ID 1 seen "ok". Nothing is sent to the arm."""
+        position error cancels: offset o = FK(q_now) ID 1 position - observed ID 1 position (base frame), and
+        every target t is commanded as t + o. Only the marker POSITION is used: its orientation from a 30 mm
+        marker seen at ~50 deg is off by ~5 deg, which the 6-8 cm lever to the grip site turned into 10 mm of
+        false offset (2026-10-14 18:46: 21 mm via the site vs 11 mm via the marker). The end_link orientation
+        is taken from the joints. Uses 10 frames; only ID 1 seen "ok". Nothing is sent to the arm."""
         if not self.plan:
             return {"ok": False, "message": "把持計画がない"}
         ok = [c for c in self.plan["candidates"] if c.ok]
@@ -820,7 +823,7 @@ class Sim:
         Xi, Yi = np.linalg.inv(X), np.linalg.inv(Y)
         m, ids = self.m, self.ids
         site_local = np.r_[m.site_pos[ids.grip_site], 1.0]           # grip site in end_link coordinates
-        obs, qs = [], []
+        obs, qs, mpos = [], [], []
         synth = self._synthetic_id1()
         if isinstance(synth, str):
             return {"ok": False, "message": synth}
@@ -835,12 +838,14 @@ class Sim:
                 T[:3, :3], T[:3, 3] = d_.xmat[ids.end_body].reshape(3, 3), d_.xpos[ids.end_body] - synth + np.random.normal(0, 3e-4, 3)
                 obs.append(T)
                 qs.append(q_)
+                mpos.append((T @ Y)[:3, 3])
                 continue
             vs = fetch(self.args.vision_url + "/state.json")
             m1 = next((mk for mk in (vs or {}).get("markers", []) if mk.get("id") == 1), None)
             if m1 and m1.get("status") == "ok" and time.time() - vs.get("t", 0) < 0.3:
                 T = Xi @ np.array(m1["T_cam_marker"]) @ Yi                # end_link as seen
                 obs.append(T)
+                mpos.append((Xi @ np.array(m1["T_cam_marker"]))[:3, 3])    # ID 1 position as seen
                 with self.lock:
                     qs.append(self.d.qpos[ids.arm_qadr].copy())
             time.sleep(0.06)
@@ -850,11 +855,15 @@ class Sim:
         d = mujoco.MjData(m)
         d.qpos[ids.arm_qadr] = q_now
         mujoco.mj_kinematics(m, d)
-        fk_site = d.site_xpos[ids.grip_site].copy()
         R_fk = d.xmat[ids.end_body].reshape(3, 3)
-        seen = np.mean([(T @ site_local)[:3] for T in obs], axis=0)
-        spread = float(np.max([np.linalg.norm((T @ site_local)[:3] - seen) for T in obs]) * 1000)
-        o = fk_site - seen
+        T_end_fk = np.eye(4)
+        T_end_fk[:3, :3], T_end_fk[:3, 3] = R_fk, d.xpos[ids.end_body]
+        fk_m1 = (T_end_fk @ Y)[:3, 3]
+        seen = np.mean(mpos, axis=0)
+        spread = float(np.max([np.linalg.norm(p_ - seen) for p_ in mpos]) * 1000)
+        o = fk_m1 - seen
+        fk_site = d.site_xpos[ids.grip_site].copy()
+        o_site = fk_site - np.mean([(T @ site_local)[:3] for T in obs], axis=0)     # old (orientation-sensitive) value, reported only
         R_obs = obs[len(obs) // 2][:3, :3]
         rot = math.degrees(math.acos(np.clip((np.trace(R_fk.T @ R_obs) - 1) / 2, -1, 1)))
         if np.linalg.norm(o) > 0.03:
@@ -863,8 +872,9 @@ class Sim:
         if probs:
             return {"ok": False, "message": "補正後の目標が解けない: " + "; ".join(probs)}
         cand.correction = {"offset_mm": (o * 1000).round(1).tolist(), "rot_err_deg": round(rot, 1), "frames": len(obs),
-                           "spread_mm": round(spread, 1), "t": time.time()}
-        return {"ok": True, "message": f"視覚補正: 関節角による把持点と観測のずれ {np.linalg.norm(o) * 1000:.1f} mm "
+                           "spread_mm": round(spread, 1), "t": time.time(),
+                           "via_site_mm": round(float(np.linalg.norm(o_site)) * 1000, 1)}
+        return {"ok": True, "message": f"視覚補正（ID 1 の位置、向きは関節角）: 関節角による位置と観測のずれ {np.linalg.norm(o) * 1000:.1f} mm "
                                        f"(x {o[0] * 1000:+.1f}, y {o[1] * 1000:+.1f}, z {o[2] * 1000:+.1f})、向き {rot:.1f}°、"
                                        f"{len(obs)} フレーム（ばらつき {spread:.1f} mm）。接近前・近接・把持・持ち上げの目標を直した。"
                                        "次の移動は経路シミュレーションから", "correction": cand.correction}
