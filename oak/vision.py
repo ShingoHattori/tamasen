@@ -18,6 +18,7 @@ Units in state.json: metres and radians. T_a_b maps frame-b points into frame a.
 import argparse
 import json
 import math
+import os
 import signal
 import sys
 import threading
@@ -390,6 +391,9 @@ def main() -> int:
     ap.add_argument("--sim-url", default="http://127.0.0.1:8092")
     ap.add_argument("--seconds", type=float, help="stop automatically after N seconds")
     args = ap.parse_args()
+    # OpenCV's own thread pool ignores OMP_NUM_THREADS: with one thread per core it kept ~6 cores busy
+    # (mostly spinning) on the table fit's many small projectPoints calls (2026-10-14).
+    cv2.setNumThreads(int(os.environ.get("OPENCV_NUM_THREADS", "2")))
 
     vision = Vision(args.config, args.world_file if not args.replay else args.output / "replay_world_ref.json")
     shared, latest = Shared(), Latest()

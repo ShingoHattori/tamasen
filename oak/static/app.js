@@ -462,7 +462,7 @@ function renderSim(s) {
   const plan = s.plan, tr = s.trial;
   if (plan && plan.t !== gripFromPlan) {          // fill the gripper inputs from the first ok candidate
     const okc = (plan.candidates || []).find(c => c.ok);
-    if (okc) { $("gripGap").value = Math.round(okc.width_m * 1000); $("gripWidth").value = Math.round((okc.width_m - 0.01) * 1000); }
+    if (okc) { $("gripGap").value = Math.round((okc.open_gap_m || okc.width_m) * 1000); $("gripWidth").value = Math.round((okc.width_m - 0.01) * 1000); }
     gripFromPlan = plan.t;
   }
   $("sim").innerHTML = `
@@ -483,8 +483,11 @@ function renderSim(s) {
     <h2>接触</h2><div>${(s.contacts || []).map(esc).join("<br>") || '<span class="dim">なし</span>'}</div>`;
 }
 function planTable(p) {
-  const rows = p.candidates.map(c => `<tr><td>${c.name}</td><td>${mm(c.width_m)}</td><td class="${c.ok ? "ok" : "bad"}">${c.ok ? "可" : "不可"}</td><td class="l">${c.reasons.map(esc).join("; ")}</td></tr>`);
-  return `<div>配置: ${esc(p.basis_label)}</div><table><tr><th>候補</th><th>必要開口 mm</th><th>判定</th><th class="l">理由</th></tr>${rows.join("")}</table>`;
+  // only the usable candidates and a few rejected ones: rebuilding 120 rows every poll made the page slow
+  const ok = p.candidates.filter(c => c.ok), bad = p.candidates.filter(c => !c.ok);
+  const rows = ok.concat(bad.slice(0, 6)).map(c => `<tr><td>${c.name}</td><td>${mm(c.width_m)}</td><td>${c.open_gap_m ? mm(c.open_gap_m, 0) : "—"}</td><td class="${c.ok ? "ok" : "bad"}">${c.ok ? "可" : "不可"}</td><td class="l">${c.reasons.map(esc).join("; ")}</td></tr>`);
+  return `<div>配置: ${esc(p.basis_label)}。可 ${ok.length} 件 / 全 ${p.candidates.length} 件（不可は先頭 ${Math.min(6, bad.length)} 件だけ表示）</div>
+    <table><tr><th>候補</th><th>必要開口 mm</th><th>接近時の開口 mm</th><th>判定</th><th class="l">理由</th></tr>${rows.join("")}</table>`;
 }
 function trialView(t) {
   return `<div>${t.running ? '<span class="info">実行中</span>' : ""} 段階: ${esc(t.phase)} — 結果: <b class="${t.success ? "ok" : t.done ? "bad" : ""}">${esc(t.result || "")}</b></div>
@@ -497,7 +500,7 @@ function physTable(p) {
 }
 async function pollSim() {
   try { renderSim(await (await fetch("/sim/api/state", { cache: "no-store" })).json()); } catch (e) { $("sim").textContent = String(e); }
-  setTimeout(pollSim, 400);
+  setTimeout(pollSim, 1000);
 }
 pollSim();
 
