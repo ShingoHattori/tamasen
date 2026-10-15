@@ -39,7 +39,7 @@ function editPart(label: string, part: Part, fn: (pt: Part) => void): void {
 }
 
 export function buildShapePanel(el: HTMLElement, readonly: boolean): void {
-  const extrudeState = { open: false, contour: "", plane: "XY", offset: 0, thickness: 3, symmetric: false, op: "add" as Part["op"], name: "" };
+  const extrudeState = { open: false, touched: false, contour: "", plane: "XY", offset: 0, thickness: 3, symmetric: false, op: "add" as Part["op"], name: "" };
   const render = deferred(() => {
     clear(el);
     const p = store.project;
@@ -47,6 +47,11 @@ export function buildShapePanel(el: HTMLElement, readonly: boolean): void {
     const fs = h("fieldset", { class: "shape-fs", disabled: readonly });
     el.append(fs);
     if (readonly) fs.append(h("p", { class: "note" }, "位置合わせモードでは形状は読み取り専用です（変えるには「形状編集」へ）。"));
+    // 輪郭から押し出し（最初に使う操作なので先頭に置き、部品がまだないときは開いておく）
+    if (!readonly) {
+      if (!p.shape.parts.length && !extrudeState.touched) extrudeState.open = true;
+      fs.append(extrudeSection(p, extrudeState, render));
+    }
     // 部品一覧
     const kindSel = h("select", { id: "add-kind" }, (Object.keys(KIND_LABEL) as PartKind[]).map((k) => h("option", { value: k }, KIND_LABEL[k])));
     fs.append(
@@ -96,10 +101,7 @@ export function buildShapePanel(el: HTMLElement, readonly: boolean): void {
     const part = store.part();
     if (part) fs.append(partEditor(p, part));
     fs.append(measurementsSection(p));
-    if (!readonly) {
-      fs.append(extrudeSection(p, extrudeState, render));
-      fs.append(fixedTransformSection(p));
-    }
+    if (!readonly) fs.append(fixedTransformSection(p));
   });
   store.on((k) => {
     if (k === "load" || k === "project" || k === "ui" || k === "model") render();
@@ -500,12 +502,13 @@ export function extrudeFromContour(p: Project, img: ProjectImage, contourId: str
   return part;
 }
 
-function extrudeSection(p: Project, st: { open: boolean; contour: string; plane: string; offset: number; thickness: number; symmetric: boolean; op: Part["op"]; name: string }, rerender: () => void): HTMLElement {
+function extrudeSection(p: Project, st: { open: boolean; touched: boolean; contour: string; plane: string; offset: number; thickness: number; symmetric: boolean; op: Part["op"]; name: string }, rerender: () => void): HTMLElement {
   const img = store.image();
   const det = h("details", { class: "tool-sec", id: "extrude-sec", open: st.open });
   det.addEventListener("toggle", () => {
     if (det.open === st.open) return;
     st.open = det.open;
+    st.touched = true;
     store.ui.planePreview = det.open ? planeFor(p, st.plane, st.offset) : null;
     store.emit("model");
   });
@@ -523,6 +526,11 @@ function extrudeSection(p: Project, st: { open: boolean; contour: string; plane:
     st.contour = csel.value;
     store.setUi({ selContour: csel.value || null });
   });
+  if (!outers.length) {
+    det.append(h("p", { class: "note warn" }, `画像 ${img.id} に確定した外周がありません。「1 前処理」で「輪郭を作る」→ 外周を選んで「確定」してから使います。`));
+  } else if (!img.pose.T_cam_marker) {
+    det.append(h("p", { class: "note warn" }, `画像 ${img.id} には撮影姿勢がありません（マーカーの見える画像を選ぶか、「3 位置合わせ」で姿勢を付けてから使います）。`));
+  }
   const cur = outers.find((c) => c.id === st.contour);
   const holes = cur ? holesInside(img, cur) : [];
   const psel = h("select", { id: "extrude-plane" }, [["XY", "obj の XY 面"], ["YZ", "obj の YZ 面"], ["ZX", "obj の ZX 面"], ["marker", "マーカー面"]].map(([v, l]) => h("option", { value: v, selected: v === st.plane }, l)));
