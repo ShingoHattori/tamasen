@@ -43,8 +43,12 @@ ap.add_argument("outdir")
 ap.add_argument("--finger-step", help="wrist_gripper_in_end_link.step (end_link frame) for the fit check")
 ap.add_argument("--depth", type=float, default=44.0, help="jig thickness along the fingers (x); 44 so the 41 mm marker area + rim fits the -z face")
 ap.add_argument("--insert", type=float, default=None,
-                help="finger depth into the jig from the entry face (default depth - 0.5: the tip just inside the far face; "
-                     "the finger's shoulder, 33 wide and 13.7 thick, starts 44.3 mm from the tip)")
+                help="finger depth into the jig from the entry face (default depth + 1: the tip 1 mm out of the far face; "
+                     "requester 2026-10-15: the tip should reach the far end or stick out a little)")
+ap.add_argument("--rect", type=float, default=20.0,
+                help="entry part of each pocket: a plain rectangle this deep, big enough for the finger's shoulder "
+                     "(33.1 wide, 13.7 thick, from 44.3 mm behind the tip); the wedge follows behind it")
+ap.add_argument("--rect-fit", type=float, default=0.5, help="clearance of the entry rectangle around the shoulder (z per side)")
 ap.add_argument("--rod", type=float, nargs=2, default=[30.0, 20.0], metavar=("W", "H"), help="rod hole, y x z (30 along the closing axis; requester 2026-10-14)")
 # finger half width along z vs distance from the tip (01_Finger in wrist_gripper_in_end_link.step): a straight taper,
 # 5.80 mm at 15 mm from the tip growing 0.3155 mm per mm (13.38 at 39 mm). Only this taper along the insertion is
@@ -54,7 +58,7 @@ TAPER = (15.0, 5.80, 0.3155)            # dx0, half width at dx0, slope
 TIP_HALF = 4.60
 ap.add_argument("--finger-t", type=float, default=12.74, help="finger thickness along y")
 ap.add_argument("--fit", type=float, default=0.3, help="clearance around the finger at the tip end (z both sides, y outer side)")
-ap.add_argument("--fit-entry", type=float, default=0.8, help="z clearance per side at the entry face (grows linearly from --fit)")
+ap.add_argument("--fit-entry", type=float, default=0.3, help="z clearance per side of the wedge at its entry end (grows linearly from --fit)")
 ap.add_argument("--slack", type=float, default=1.0, help="extra room along y on the outer side: jaw opening for entry")
 ap.add_argument("--inner", type=float, default=6.0, help="wall between pocket and rod hole (the jaws press it)")
 ap.add_argument("--outer", type=float, default=4.0, help="outer wall of each pocket")
@@ -136,22 +140,41 @@ def frustum(x_top, w0, h0, c, yc):
 
 D = a.depth
 if a.insert is None:
-    a.insert = D - 0.5
-if a.insert > 44.3:
-    raise SystemExit(f"--insert {a.insert}: the finger's shoulder starts 44.3 mm from the tip")
+    a.insert = D + 1.0
+SHOULDER_DX, SHOULDER_HALF_Z, SHOULDER_T = 44.3, 16.56, 13.67      # finger shoulder (CAD)
+if a.insert - SHOULDER_DX > a.rect - 1.0:
+    raise SystemExit(f"--insert {a.insert}: the shoulder would go beyond the entry rectangle ({a.rect} mm)")
 rw, rh = a.rod
-pw = a.finger_t + a.fit + a.slack                         # along y
-ph = 2 * (lerp_half(a.insert) + a.fit_entry)                     # along z at the entry face (widest)
-Y = rw / 2 + a.inner + pw + a.outer                       # half width along y
+pw = a.finger_t + a.fit + a.slack                         # along y, wedge part
+pw_r = SHOULDER_T + a.fit + a.slack                       # along y, entry rectangle
+ph = 2 * (SHOULDER_HALF_Z + a.rect_fit)                   # along z, entry rectangle (widest)
+Y = rw / 2 + a.inner + pw_r + a.outer                     # half width along y
 zl, zh = -max(rh, ph) / 2 - a.wall_z[0], max(rh, ph) / 2 + a.wall_z[1]
 body = box(-D / 2, -Y, zl, D / 2, Y, zh)
 body = cut(body, box(-D / 2 - 1, -rw / 2, -rh / 2, D / 2 + 1, rw / 2, rh / 2))       # rod hole
-y_pocket = rw / 2 + a.inner + pw / 2                                                  # pocket centre |y|
+y_pocket = rw / 2 + a.inner + pw_r / 2                                                # entry rectangle centre |y|
 for s in (-1, 1):
-    yc = s * y_pocket
-    body = cut(body, finger_pocket(D, a.insert, yc, pw, a.fit, a.fit_entry))
+    ys = s * (rw / 2 + a.inner)                                   # inner wall face (the jaws close onto it)
+    # wedge (tip side) + entry rectangle, joined by a 45 deg transition; y measured outwards from the inner wall
+    body = cut(body, finger_pocket(D, a.insert, ys + s * pw / 2, pw, a.fit, a.fit_entry))
+    xb = D / 2 - a.rect                                           # start of the rectangle
+    hw0 = lerp_half(a.insert - a.rect) + a.fit_entry              # wedge half width where the rectangle starts
+    t = max((ph / 2 - hw0) / (1 - TAPER[2]), pw_r - pw)           # ~45 deg transition, starting on the wedge's slope
+    hw = lerp_half(a.insert - a.rect - t) + a.fit_entry           # wedge half width where the transition starts
+
+    def sec(x, w, h):
+        poly = BRepBuilderAPI_MakePolygon()
+        for y, z in ((0, -h), (w, -h), (w, h), (0, h)):
+            poly.Add(gp_Pnt(x, ys - s * 0.01 + s * y, z))
+        poly.Close()
+        return poly.Wire()
+    ts = BRepOffsetAPI_ThruSections(True, True)
+    for x, w, h in ((xb - t, pw, hw), (xb, pw_r, ph / 2), (D / 2 + 0.01, pw_r, ph / 2)):
+        ts.AddWire(sec(x, w + 0.01, h))
+    ts.Build()
+    body = cut(body, ts.Shape())
     if a.chamfer > 0:
-        body = cut(body, frustum(D / 2, pw, 2 * (lerp_half(a.insert - a.chamfer) + a.fit + (a.fit_entry - a.fit) * (D - a.chamfer) / D), a.chamfer, yc))
+        body = cut(body, frustum(D / 2, pw_r, ph, a.chamfer, ys + s * pw_r / 2))
 # screws: pilot holes along -z from the +z face into the rod hole, spread along x
 xs = [-D / 2 + D * (i + 1) / (a.screws + 1) for i in range(a.screws)]
 # tapered pilot (the tapping screw starts easily and bites harder towards the rod) + 90 deg entry countersink
@@ -177,11 +200,13 @@ info = {
     "units": "mm", "frame": "x through (entry face +x), y closing axis, z finger width; origin = jig centre",
     "size_mm": [D, 2 * Y, zh - zl], "x_range": [-D / 2, D / 2], "y_range": [-Y, Y], "z_range": [zl - rhgt, zh],
     "rod_hole_mm": [rw, rh], "pocket_centres_y_mm": [-y_pocket, y_pocket],
-    "finger_pockets_mm": {"y": round(pw, 2), "z_at_entry": round(ph, 2), "z_at_tip": round(2 * (lerp_half(0.0) + a.fit), 2), "finger_insert_mm": a.insert,
-                          "shape": "wedge following the finger taper along x (half width + fit per side), finger thickness + fit + slack along y",
+    "finger_pockets_mm": {"entry_rectangle": {"depth": a.rect, "y": round(pw_r, 2), "z": round(ph, 2)},
+                          "wedge": {"y": round(pw, 2), "z_at_tip_end": round(2 * (lerp_half(a.insert - D) + a.fit), 2)},
+                          "finger_insert_mm": a.insert, "tip_beyond_far_face_mm": round(a.insert - D, 2),
+                          "shape": "entry: plain rectangle (room for the finger's shoulder), 45 deg transition, then a wedge following the finger taper to the far face",
                           "fit_tip_end": a.fit, "fit_entry": a.fit_entry, "slack": a.slack},
     "grip_width_mm": grip_w,
-    "entry_gap_mm": {"min": grip_w, "max": round(grip_w + 2 * (pw - a.finger_t), 2),
+    "entry_gap_mm": {"min": grip_w, "max": round(grip_w + 2 * (pw - a.finger_t), 2),  # the wedge part (narrower than the rectangle)
                      "suggested": round(grip_w + 2 * a.slack * 0.6, 1),
                      "note": "jaw gap (inner faces) while entering: between the inner walls and the pocket's outer walls"},
     "screws": {"pilot_mm": {"entry": a.screw_pilot[0], "end": a.screw_pilot[1], "taper": "linear over the wall"},
