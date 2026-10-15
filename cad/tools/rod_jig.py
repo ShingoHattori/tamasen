@@ -4,8 +4,8 @@
 
   - rod hole (centre): rod_w x rod_h, through x; tapping-screw pilot holes from the +z face press the rod;
   - finger pockets (left / right): shaped like the B601 finger (01_Finger) so it sits snugly -- along z the
-    pocket follows the finger's taper (a wedge: ~9 mm wide 10 mm from the tip, ~27 mm at 39 mm, measured from
-    the CAD), plus `fit` per side; along y it is the finger thickness (12.7) + `fit` + `slack`, so the jaws enter
+    pocket follows the finger's straight taper (11.6 mm wide 15 mm from the tip, 26.8 mm at 39 mm, from the CAD)
+    plus `fit` per side, and keeps the tip width (9.2 mm) from there to the far face: one slope, no steps; along y it is the finger thickness (12.7) + `fit` + `slack`, so the jaws enter
     opened `slack` beyond the grip and then close onto the inner walls (the jig is gripped on the inner walls,
     width grip_w = rod_w + 2 inner); requester 2026-10-15: "爪がピッタリハマるように、三角形のような形状";
   - entry chamfers on the +x face guide the fingers in;
@@ -44,10 +44,12 @@ ap.add_argument("--finger-step", help="wrist_gripper_in_end_link.step (end_link 
 ap.add_argument("--depth", type=float, default=44.0, help="jig thickness along the fingers (x); 44 so the 41 mm marker area + rim fits the -z face")
 ap.add_argument("--insert", type=float, default=39.0, help="finger depth into the jig from the entry face (the finger widens and thickens beyond ~40 mm)")
 ap.add_argument("--rod", type=float, nargs=2, default=[30.0, 20.0], metavar=("W", "H"), help="rod hole, y x z (30 along the closing axis; requester 2026-10-14)")
-# finger half width along z vs distance from the tip (01_Finger in wrist_gripper_in_end_link.step, sections every
-# few mm; constant 12.74 mm thick from 15 mm on, the tip itself tapers)
-FINGER_HALF_Z = [(0.0, 0.6), (1.0, 1.38), (2.0, 1.70), (4.0, 2.33), (6.0, 2.96), (7.9, 3.6), (8.0, 4.60),
-                 (15.0, 5.80), (20.0, 7.38), (25.0, 8.96), (30.0, 10.54), (35.0, 12.12), (39.0, 13.38), (42.0, 14.33)]
+# finger half width along z vs distance from the tip (01_Finger in wrist_gripper_in_end_link.step): a straight taper,
+# 5.80 mm at 15 mm from the tip growing 0.3155 mm per mm (13.38 at 39 mm). Only this taper along the insertion is
+# followed (requester 2026-10-15); nearer the tip the finger is at most 4.60 mm, so the pocket keeps that width
+# from there to the far face -- one sloped face, no steps.
+TAPER = (15.0, 5.80, 0.3155)            # dx0, half width at dx0, slope
+TIP_HALF = 4.60
 ap.add_argument("--finger-t", type=float, default=12.74, help="finger thickness along y")
 ap.add_argument("--fit", type=float, default=0.3, help="clearance around the finger (z both sides, y outer side)")
 ap.add_argument("--slack", type=float, default=1.0, help="extra room along y on the outer side: jaw opening for entry")
@@ -93,20 +95,15 @@ def bbox(s):
 
 
 def lerp_half(dx):
-    pts = FINGER_HALF_Z
-    if dx <= pts[0][0]:
-        return pts[0][1]
-    for (x0, h0), (x1, h1) in zip(pts, pts[1:]):
-        if dx <= x1:
-            return h0 + (h1 - h0) * (dx - x0) / (x1 - x0)
-    return pts[-1][1]
+    return max(TAPER[1] + TAPER[2] * (dx - TAPER[0]), TIP_HALF)
 
 
 def finger_pocket(D, ins, yc, pw, fit, out_far=1.5):
     """Through-pocket along x following the finger taper: rectangles pw (y) x 2 (half_z(dx) + fit) (z), dx = distance
     from the finger tip, which sits at x = D/2 - ins when the jig is fully on (beyond it: the tip section, a slot)."""
     tip = D / 2 - ins
-    xs = [-D / 2 - out_far] + [tip + dx for dx, _ in FINGER_HALF_Z if -D / 2 < tip + dx < D / 2] + [D / 2 + 0.01]
+    kink = TAPER[0] + (TIP_HALF - TAPER[1]) / TAPER[2]           # where the taper meets the tip width
+    xs = [-D / 2 - out_far] + [tip + kink] * (-D / 2 < tip + kink < D / 2) + [D / 2 + 0.01]
     xs = sorted(set(round(x, 3) for x in xs))
     ts = BRepOffsetAPI_ThruSections(True, True)
     for x in xs:
