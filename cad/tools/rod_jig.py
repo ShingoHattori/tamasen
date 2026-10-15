@@ -48,7 +48,7 @@ ap.add_argument("--insert", type=float, default=None,
 ap.add_argument("--rect", type=float, default=20.0,
                 help="entry part of each pocket: a plain rectangle this deep, big enough for the finger's shoulder "
                      "(33.1 wide, 13.7 thick, from 44.3 mm behind the tip); the wedge follows behind it")
-ap.add_argument("--rect-fit", type=float, default=0.5, help="clearance of the entry rectangle around the shoulder (z per side)")
+ap.add_argument("--rect-fit", type=float, default=1.0, help="clearance of the entry rectangle around the shoulder (z per side)")
 ap.add_argument("--rod", type=float, nargs=2, default=[30.0, 20.0], metavar=("W", "H"), help="rod hole, y x z (30 along the closing axis; requester 2026-10-14)")
 # finger half width along z vs distance from the tip (01_Finger in wrist_gripper_in_end_link.step): a straight taper,
 # 5.80 mm at 15 mm from the tip growing 0.3155 mm per mm (13.38 at 39 mm). Only this taper along the insertion is
@@ -57,8 +57,8 @@ ap.add_argument("--rod", type=float, nargs=2, default=[30.0, 20.0], metavar=("W"
 TAPER = (15.0, 5.80, 0.3155)            # dx0, half width at dx0, slope
 TIP_HALF = 4.60
 ap.add_argument("--finger-t", type=float, default=12.74, help="finger thickness along y")
-ap.add_argument("--fit", type=float, default=0.3, help="clearance around the finger at the tip end (z both sides, y outer side)")
-ap.add_argument("--fit-entry", type=float, default=0.3, help="z clearance per side of the wedge at its entry end (grows linearly from --fit)")
+ap.add_argument("--fit", type=float, default=1.0, help="clearance around the finger at the tip end (z both sides, y outer side)")
+ap.add_argument("--fit-entry", type=float, default=1.0, help="z clearance per side of the wedge at its entry end (grows linearly from --fit)")
 ap.add_argument("--slack", type=float, default=1.0, help="extra room along y on the outer side: jaw opening for entry")
 ap.add_argument("--inner", type=float, default=6.0, help="wall between pocket and rod hole (the jaws press it)")
 ap.add_argument("--outer", type=float, default=4.0, help="outer wall of each pocket")
