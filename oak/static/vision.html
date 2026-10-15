@@ -85,6 +85,10 @@
    (4) 解く → 評価用姿勢（校正に使わない）の誤差を確認 → 採用。ID 1 の姿勢を end_link の姿勢とは見なさない（取り付け変換も同時に推定）。たわみ・関節零点誤差は補償しない（残差に出る）。</div>
   <div>セッション <input id="heSession" size="12"> <button id="genPoses">校正姿勢を生成</button><button id="genPosesWS" title="作業範囲から、ID 1 が見えると予測される姿勢を選ぶ（直近の hand-eye 推定を使う）">作業範囲で生成（見え方を予測）</button><button id="previewPoses">全姿勢をツインで巡回再生</button>
    <button id="heSolve">解く</button><button id="heAdopt">評価合格の結果を採用</button></div>
+  <div>自動: <button id="autoCalib" style="background:#2d4a6a;font-weight:bold">校正を自動で（姿勢生成 → 各姿勢へ移動・記録 → 解く）</button>
+   <span class="dim">作業範囲の校正姿勢（校正用 12・評価用 3）を生成し、各姿勢へ経路シミュレーション → 実行 → 静止 → サンプル記録を繰り返し、有効化時の姿勢へ戻ってから解く。
+    通らない経路・ID 1 が見えない姿勢は飛ばす。異常・「停止」で中止。採用は結果を見て確認。ブロックは作業範囲から退ける（経路はブロックを見ない）。このページを表示したままにする</span></div>
+  <div id="calibLog" class="dim" style="white-space:pre-line"></div>
   <div id="heMsg" style="font-size:15px;font-weight:bold;margin:4px 0"></div>
   <div id="heSamples"></div>
   <div><button id="heDelSel">選択したサンプルを削除</button><button id="heDelAll">このセッションのサンプルを全削除</button>

@@ -1388,7 +1388,7 @@ def main() -> int:
                 return self._json({"message": "経路のシミュレーションを再生中"})
             if path == "/api/calib_poses":
                 if body.get("mode") == "workspace":
-                    return self._json(sim.make_calib_poses_workspace())
+                    return self._json(sim.make_calib_poses_workspace(int(body.get("n", 8)), int(body.get("n_eval", 2))))
                 return self._json(sim.make_calib_poses())
             if path == "/api/preview_calib":
                 return self._json(sim.preview_calib())

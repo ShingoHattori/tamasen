@@ -552,10 +552,35 @@ def main() -> int:
             r = json.loads((d / "result.json").read_text()) if (d / "result.json").exists() else None
             if not r or not r.get("ok"):
                 return {"ok": False, "message": "評価に合格した結果がないため採用しない"}
+            # The fit works in motor angles: T_cam_base / T_ee_m1 belong with its joint offsets (or with none),
+            # so rebot/joint_offsets.yaml is rewritten to match (the arm service reads it at the next engage).
+            jo = r.get("joint_offsets") or {}
+            deg = [float(v) for v in jo.get("deg") or [0.0] * 6] if jo.get("used") else [0.0] * 6
+            names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+            if max(abs(v) for v in deg) > 10:
+                return {"ok": False, "message": f"推定した関節零点ずれが 10° を超える（{[round(v, 2) for v in deg]}）ため採用しない"}
+            yf = HERE.parent / "rebot" / "joint_offsets.yaml"
+            old = yf.read_text() if yf.exists() else ""
+            if old:
+                (yf.parent / f"joint_offsets_before_{session}.yaml").write_text(old)
+            sd = jo.get("sd_deg") or [0.0] * 6
+            yf.write_text(
+                "# 関節の零点補正（ソフトウェアのみ。モーターには書き込まない）。\n"
+                "#   モデルの関節角 = モーターの関節角 + offset\n"
+                "# rebot/arm_state.py が起動時と、読み取り専用からの「有効化」のたびに読み直す。|offset| <= 10 deg。\n"
+                f"# {time.strftime('%Y-%m-%d %H:%M')} hand-eye 校正 {session} の採用時に書き換えた（"
+                + ("同時推定した値。" + ", ".join(f"{n} {v:+.2f} ±{e:.2f}" for n, v, e in zip(names, deg, sd))
+                   + " deg。joint1・joint6 は camera↔base・マーカー取り付けと区別できず、推定値をそのまま組で使う"
+                   if jo.get("used") else "零点ずれを使わない解のため全て 0")
+                + "）。\n#   採用した T_cam_base はこの値と組。値を変えたら hand-eye も解き直す。前の内容は "
+                + f"joint_offsets_before_{session}.yaml。\n"
+                "offsets_deg:\n" + "".join(f"  {n}: {v:.3f}\n" for n, v in zip(names, deg)))
             act = dict(r, session=session, adopted_at=time.strftime("%Y-%m-%d %H:%M:%S"), status="calibrated",
-                       note="eye-to-hand: T_cam_base と T_ee_m1。たわみ・関節零点誤差は残差に含まれる。把持中心は別校正。")
+                       note="eye-to-hand: T_cam_base と T_ee_m1（関節零点ずれは rebot/joint_offsets.yaml と組）。たわみは残差に含まれる。把持中心は別校正。")
             (HERE / "calib" / "handeye_active.json").write_text(json.dumps(act, indent=1, ensure_ascii=False))
-            return {"ok": True, "message": f"採用した（{session}）。シミュレーターは観測ブロックを校正済み配置で置く"}
+            return {"ok": True, "message": f"採用した（{session}）。関節零点補正を {', '.join(f'{v:+.2f}' for v in deg)} deg に書き換えた"
+                                           "（アームは次の「有効化」で読み直す。保持中はトルクを切らずにそのまま使ってよいが、差の分だけ予測がずれる）。"
+                                           "シミュレーターは観測ブロックを校正済み配置で置く"}
         return {"ok": False, "message": f"unknown {cmd}"}
 
     if args.replay:

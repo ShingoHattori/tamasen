@@ -314,7 +314,8 @@ const AUTO_ALIGN_MM = 3, AUTO_ALIGN_MAX_MM = 30, AUTO_ALIGN_TRIES = 4;
 let autoRun = null;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const armNow = async () => (await fetch("/arm/state.json", { cache: "no-store" })).json();
-function autoLog(t) { $("autoLog").textContent += `${new Date().toLocaleTimeString()} ${t}\n`; }
+let autoLogEl = "autoLog";        // where the running sequence writes its log
+function autoLog(t) { $(autoLogEl).textContent += `${new Date().toLocaleTimeString()} ${t}\n`; }
 function autoCheck() { if (autoRun.abort) throw new Error("中止した"); }
 async function autoMove(target, label) {
   autoCheck();
@@ -414,6 +415,7 @@ $("autoGrasp").onclick = async () => {
     + "異常・位置合わせ失敗・つかみ損ねで止まります。アーム周辺とカメラスタンドを確認して GRASP と入力");
   if (t !== "GRASP") return;
   autoRun = { abort: false };
+  autoLogEl = "autoLog";
   $("autoLog").textContent = "";
   $("autoGrasp").disabled = true;
   try {
@@ -563,6 +565,68 @@ $("heAdopt").onclick = async () => { if (confirm("この校正結果を採用し
 $("gripCap").onclick = () => post("/api/handeye/grip", { frames: 30 });
 $("jigOn").onclick = () => post("/api/handeye/jig_mode", { on: true });
 $("jigOff").onclick = () => post("/api/handeye/jig_mode", { on: false });
+// Automatic eye-to-hand calibration (started by the user): workspace poses, then for each one a simulated
+// path -> execute -> settle -> capture; a refused path or a capture without ID 1 skips that pose. Back to the
+// engage pose, solve, and adopt only after the user confirms the held-out result.
+$("autoCalib").onclick = async () => {
+  if (autoRun) return;
+  const a = await armNow(), c = a.control || {};
+  if (c.state !== "holding" || c.fault) { $("calibLog").textContent = "アームが有効・保持中（異常なし）のときだけ開始できる"; return; }
+  const t = prompt("校正姿勢へ順に自動で移動してサンプルを記録します（各移動はシミュレーションで確認してから実行）。"
+    + "ブロックを作業範囲から退け、アーム周辺とカメラスタンドを確認して CALIB と入力");
+  if (t !== "CALIB") return;
+  autoRun = { abort: false };
+  autoLogEl = "calibLog";
+  $("calibLog").textContent = "";
+  $("autoCalib").disabled = $("autoGrasp").disabled = true;
+  const d = new Date(), pad = (v) => String(v).padStart(2, "0");
+  const session = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-auto${pad(d.getHours())}${pad(d.getMinutes())}`;
+  $("heSession").value = session;
+  try {
+    autoLog(`セッション ${session}。校正姿勢を生成中…`);
+    const g = await post("/sim/api/calib_poses", { mode: "workspace", n: 12, n_eval: 3 });
+    if (!g.ok) throw new Error("校正姿勢: " + (g.message || ""));
+    autoLog(g.message);
+    const cp = (await (await fetch("/sim/api/state", { cache: "no-store" })).json()).calib_poses;
+    const poses = cp.poses.filter(p => p.ok);
+    let nc = 0, ne = 0;
+    for (const p of poses) {
+      autoCheck();
+      const label = `姿勢 ${p.i}（${p.role === "eval" ? "評価用" : "校正用"}）`;
+      const chk = await post("/sim/api/check_path", { target: "calib:" + p.i });
+      checkedPath = chk;
+      if (!chk.ok) { autoLog(`${label}: 経路が通らないので飛ばす — ${chk.message || ""}`); continue; }
+      await autoExec(chk, label);
+      await sleep(1500);                                    // settle before recording
+      autoCheck();
+      let r = await post("/api/handeye/capture", { session, role: p.role, label: `pose ${p.i} ${p.label}` });
+      if (!r.ok && r.id == null && /動いた/.test(r.message || "")) {      // still settling: once more
+        await sleep(1500);
+        r = await post("/api/handeye/capture", { session, role: p.role, label: `pose ${p.i} ${p.label}` });
+      }
+      if (r.id != null) { p.role === "eval" ? ne++ : nc++; }
+      autoLog(`${label}: ${r.id != null ? (r.ok ? "記録" : "記録（注意）") : "記録できず、飛ばす"} — ${r.message || ""}`);
+      lastPoses = null; loadHE();
+    }
+    autoLog(`記録: 校正用 ${nc}、評価用 ${ne}`);
+    await autoMove("engage_pose", "有効化時の姿勢へ");
+    const s = await post("/api/handeye/solve", { session });
+    loadHE();
+    autoLog(`解いた: ${s.ok ? "評価合格" : "不合格"} — ${s.message || ""}`);
+    if (s.ok && confirm(`校正結果（${session}）: ${s.message}\n下の結果欄で評価用姿勢の誤差を確認しました。この結果を採用しますか？`)) {
+      const ad = await post("/api/handeye/adopt", { session });
+      autoLog(`採用: ${ad.message || ""}`);
+      loadHE();
+    } else {
+      autoLog("採用していない（結果欄を確認し、必要なら「評価合格の結果を採用」）");
+    }
+  } catch (e) {
+    autoLog("停止: " + e.message);
+  } finally {
+    autoRun = null;
+    $("autoCalib").disabled = $("autoGrasp").disabled = false;
+  }
+};
 let lastPoses = null;
 let recorded = {};      // pose index -> [sample ids]
 function renderPoses(cp) {

@@ -67,6 +67,8 @@ ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   # 手元で http:
   関節の零点補正（ソフトウェアのみ）: `rebot/joint_offsets.yaml`（モデル角 = モーター角 + offset）。2026-10-14 の hand-eye 校正で推定した値
   （joint2 −0.79、joint3 +1.01、joint4 −0.36、**joint5 −5.97 deg**。joint5 は定規の手合わせでも約 −7 deg を確認）。state.json の pos はモデル角、pos_motor が生の値。
   校正サンプルは記録時の offset を `joint_offsets_rad` に残し、handeye.py はモーター角に戻して解く。
+  hand-eye の採用（/api/handeye/adopt）は、解と組の関節零点ずれで `joint_offsets.yaml` を書き換える（前の内容は `joint_offsets_before_<session>.yaml`）。
+  「校正を自動で」ボタン: 作業範囲の校正姿勢（校正用 12・評価用 3 ＋中継）へ順に 経路シミュレーション → 実行 → 静止 → 記録、有効化時の姿勢へ戻って解き、採用は確認ダイアログで。
 - `sim/` — MuJoCo 3.15.0（`sim/.venv`、EGL でオフスクリーン描画）。公開モデル Borot-Arm_Mujoco `3f3e98d` をそのまま取り込み、`scene.py` で床・ブロック・凸包衝突・アクチュエータを追加。
   現実同期（物理なし）/ シミュレーション試行（接近・閉じる・持ち上げ）、把持候補の判定、実機経路の動的シミュレーション。`verify_sim.py` で検証。
   hand-eye 採用時は把持候補に傾き（0, ±20, ±35°）を加えて 120 通りにし、接近前・近接（把持の 3 cm 手前）で ID 1 がカメラから見える
