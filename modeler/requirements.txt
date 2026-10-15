@@ -1,0 +1,8 @@
+# modeler/.venv（Python 3.11、Mac / Linux 共通）
+#   uv venv --python 3.11 modeler/.venv && uv pip install --python modeler/.venv/bin/python -r modeler/requirements.txt
+numpy==2.4.6
+opencv-contrib-python==5.0.0.93
+manifold3d==3.2.1
+trimesh==5.1.1
+scipy==1.17.1
+pytest==8.4.2

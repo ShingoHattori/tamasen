@@ -1,0 +1,4 @@
+# 作業中のプロジェクト（画像・ラベル・書き出し）
+projects/
+# 合成サンプルの取り込み済みプロジェクト（make_samples.py で作り直せる。画像と truth.json は残す）
+samples/*/project/
