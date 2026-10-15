@@ -234,7 +234,7 @@ async function makeContours(img: ProjectImage): Promise<void> {
 
 async function reprocess(img: ProjectImage): Promise<void> {
   if (!store.pid) return;
-  const res = await busy("前処理のやり直し", () => api.preprocess(store.pid!, img.id, ["undistort", "quality", "markers", "labels", "edges", "contours"]));
+  const res = await busy("前処理のやり直し", () => api.preprocess(store.pid!, img.id, ["undistort", "quality", "markers", "mask", "edges", "contours"]));
   if (res === undefined) return;
   store.commit("前処理のやり直し", () => {
     mergeImage(img, res, ["quality", "markers", "contours", "has_labels"]);

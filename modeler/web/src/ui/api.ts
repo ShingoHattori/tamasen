@@ -88,7 +88,7 @@ export const api = {
   markerPose: (pid: string, iid: string, body: unknown) => req<unknown>("POST", `${I(pid, iid)}/marker_pose`, body),
   pnp: (pid: string, iid: string, body: unknown) => req<unknown>("POST", `${I(pid, iid)}/pnp`, body),
   depthPoints: (pid: string, iid: string, step = 4) => req<unknown>("GET", `${I(pid, iid)}/depth_points?step=${step}`),
-  capture: (pid: string) => req<unknown>("POST", `${P(pid)}/capture`, {}),
+  capture: (pid: string, role: "object" | "background" = "object") => req<unknown>("POST", `${P(pid)}/capture`, { role }),
   setCamera: (pid: string, body: FormData | Record<string, unknown>) => req<unknown>("POST", `${P(pid)}/camera`, body),
   exportModel: (pid: string, glb: ArrayBuffer, coords: string) => {
     const fd = new FormData();

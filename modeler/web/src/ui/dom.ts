@@ -24,7 +24,17 @@ export function h<K extends keyof HTMLElementTagNameMap>(tag: K, attrs?: Attrs |
     }
   }
   append(el, children);
+  if (tag === "details") rememberOpen(el as HTMLDetailsElement);
   return el;
+}
+
+// パネルは状態が変わるたびに作り直すので、<details> の開閉を見出しの文字列ごとに覚えておき、作り直しても保つ
+const openDetails = new Set<string>();
+function rememberOpen(d: HTMLDetailsElement): void {
+  const key = d.querySelector("summary")?.textContent ?? "";
+  if (!key) return;
+  if (openDetails.has(key)) d.open = true;
+  d.addEventListener("toggle", () => (d.open ? openDetails.add(key) : openDetails.delete(key)));
 }
 
 function append(el: Node, children: Child[]): void {

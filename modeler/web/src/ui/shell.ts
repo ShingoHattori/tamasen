@@ -308,8 +308,31 @@ export function buildSettings(el: HTMLElement): void {
       const v = parseFloat(msz.value);
       if (v > 0) store.commit("マーカー寸法", (pp) => (pp.marker.size_mm = v));
     });
-    const bg = h("select", { id: "background-image" }, h("option", { value: "" }, "（なし）"), p.images.filter((i) => i.role === "background").map((i) => h("option", { value: i.id, selected: p.background_image === i.id }, i.id)));
-    bg.addEventListener("change", () => store.commit("背景画像", (pp) => (pp.background_image = bg.value || null)));
+    // 背景画像: どの画像でも選べる（選んだ画像の役割を「背景のみ」にし、外した画像は「物体」に戻す）
+    const bg = h("select", { id: "background-image" }, h("option", { value: "" }, "（なし）"),
+      p.images.map((i) => h("option", { value: i.id, selected: p.background_image === i.id }, i.id + (i.role === "background" ? "（背景）" : ""))));
+    bg.addEventListener("change", () => store.commit("背景画像", (pp) => {
+      for (const im of pp.images) {
+        if (im.id === bg.value) im.role = "background";
+        else if (im.id === pp.background_image) im.role = "object";
+      }
+      pp.background_image = bg.value || null;
+    }));
+    const bgRedo = h("button", {
+      id: "btn-bg-reprocess",
+      onclick: async () => {
+        if (!store.pid || !store.project) return;
+        if (!store.project.background_image) { store.msg("背景画像を先に選んでください", "error"); return; }
+        if (!(await saveProject())) return;   // サーバーは保存済みの background_image を使う
+        const ids = store.project.images.filter((i) => i.role === "object").map((i) => i.id);
+        for (const [k, id] of ids.entries()) {
+          const r = await busy(`前処理のやり直し ${k + 1}/${ids.length}`, () => api.preprocess(store.pid!, id, ["undistort", "quality", "markers", "mask", "edges", "contours"]));
+          if (r === undefined) return;
+          store.bumpFiles(id);
+        }
+        await reloadAfterServerChange(`背景差分で ${ids.length} 枚の前処理をやり直しました（人が直したラベルはそのまま）`);
+      },
+    }, "背景差分で全画像をやり直す");
     const autos = h("input", { type: "number", class: "num", value: String(p.settings.autosave_s), min: "3", step: "1" });
     autos.addEventListener("change", () => store.commit("自動保存間隔", (pp) => (pp.settings.autosave_s = Math.max(3, parseInt(autos.value) || 20))));
     const mass = h("input", { type: "number", class: "num", value: p.attributes.mass_g ?? "", step: "0.1", placeholder: "g" });
@@ -327,7 +350,7 @@ export function buildSettings(el: HTMLElement): void {
           {
             id: "btn-capture",
             onclick: async () => {
-              const r = await busy("OAK から撮影", () => api.capture(store.pid!));
+              const r = await busy("OAK から撮影", () => api.capture(store.pid!, role.value as "object" | "background"));
               if (r) await reloadAfterServerChange("OAK から 1 枚取り込みました");
             },
           },
@@ -340,7 +363,7 @@ export function buildSettings(el: HTMLElement): void {
           h("span", null, "辞書"), dict,
           h("span", null, "ID"), mid,
           h("span", null, "一辺 mm"), msz,
-          h("span", null, "背景画像"), bg,
+          h("span", null, "背景画像"), h("div", { class: "row" }, bg, bgRedo),
           h("span", null, "自動保存 s"), autos,
           h("span", null, "質量 g"), mass,
           h("span", null, "材質"), mat,
