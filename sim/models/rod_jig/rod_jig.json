@@ -1,0 +1,259 @@
+{
+ "units": "mm",
+ "frame": "x through (entry face +x), y closing axis, z finger width; origin = jig centre",
+ "size_mm": [
+  44.0,
+  81.34,
+  48.12
+ ],
+ "x_range": [
+  -22.0,
+  22.0
+ ],
+ "y_range": [
+  -40.67,
+  40.67
+ ],
+ "z_range": [
+  -23.36,
+  25.56
+ ],
+ "rod_hole_mm": [
+  30.0,
+  20.0
+ ],
+ "pocket_centres_y_mm": [
+  -28.835,
+  28.835
+ ],
+ "finger_pockets_mm": {
+  "entry_rectangle": {
+   "depth": 20.0,
+   "y": 15.67,
+   "z": 35.12
+  },
+  "wedge": {
+   "y": 14.74,
+   "z_at_tip_end": 11.2
+  },
+  "finger_insert_mm": 45.0,
+  "tip_beyond_far_face_mm": 1.0,
+  "shape": "entry: plain rectangle (room for the finger's shoulder), 45 deg transition, then a wedge following the finger taper to the far face",
+  "fit_tip_end": 1.0,
+  "fit_entry": 1.0,
+  "slack": 1.0
+ },
+ "grip_width_mm": 42.0,
+ "entry_gap_mm": {
+  "min": 42.0,
+  "max": 46.0,
+  "suggested": 43.2,
+  "note": "jaw gap (inner faces) while entering: between the inner walls and the pocket's outer walls"
+ },
+ "screws": {
+  "pilot_mm": {
+   "entry": 2.7,
+   "end": 2.4,
+   "taper": "linear over the wall"
+  },
+  "entry_countersink_mm": {
+   "diameter": 5.0,
+   "angle_deg": 90
+  },
+  "x_mm": [
+   -7.333333333333334,
+   7.333333333333332
+  ],
+  "axis": "-z from the +z face",
+  "length_into_wall_mm": 15.559999999999999,
+  "screw": "countersunk 3 mm tapping screw, 3 x 16 to 3 x 20 (wall 14 mm): the tip presses the rod"
+ },
+ "marker": {
+  "face": "-z",
+  "centre_mm": [
+   0,
+   0,
+   -23.36
+  ],
+  "black_square_mm": 30.0,
+  "sticker_area_mm": 41.0,
+  "rim_mm": {
+   "width": 1.2,
+   "height": 0.8
+  },
+  "normal": [
+   0,
+   0,
+   -1
+  ]
+ },
+ "volume_cm3": 110.6,
+ "finger_check": {
+  "entry": {
+   "gap_mm": 43.2,
+   "overlap_mm3": 0.0,
+   "min_distance_mm": [
+    0.57,
+    0.57
+   ]
+  },
+  "overlap_where_closed_on_walls": [
+   [
+    -45.0,
+    18.5,
+    -20.1,
+    0.5,
+    21.0,
+    20.1
+   ],
+   [
+    -45.0,
+    -21.0,
+    -20.1,
+    0.5,
+    -18.5,
+    20.1
+   ]
+  ],
+  "closed_on_walls": {
+   "gap_mm": 42.0,
+   "overlap_mm3": 24.52,
+   "min_distance_mm": [
+    0.0,
+    0.0
+   ]
+  },
+  "walls_plus_0.4": {
+   "gap_mm": 42.4,
+   "overlap_mm3": 0.0,
+   "min_distance_mm": [
+    0.17,
+    0.17
+   ]
+  },
+  "insertion_path": {
+   "gap_mm": 43.2,
+   "steps": [
+    {
+     "depth_mm": 2,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.87
+    },
+    {
+     "depth_mm": 4,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 6,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 8,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 10,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 12,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 14,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 16,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 18,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 20,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 22,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 24,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 26,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 28,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 30,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.58
+    },
+    {
+     "depth_mm": 32,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.57
+    },
+    {
+     "depth_mm": 34,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.57
+    },
+    {
+     "depth_mm": 36,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.57
+    },
+    {
+     "depth_mm": 38,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.57
+    },
+    {
+     "depth_mm": 40,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.57
+    },
+    {
+     "depth_mm": 42,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.57
+    },
+    {
+     "depth_mm": 44,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.57
+    },
+    {
+     "depth_mm": 45.0,
+     "overlap_mm3": 0.0,
+     "min_distance_mm": 0.57
+    }
+   ],
+   "worst_min_distance_mm": 0.57,
+   "any_overlap": false
+  },
+  "insert_depth_mm": 45.0,
+  "note": "fingers of 01_Finger (CAD), jig entry face towards the palm"
+ }
+}
