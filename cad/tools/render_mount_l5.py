@@ -12,14 +12,20 @@ T_l5_end = np.linalg.inv(T(b5)) @ T(ids0.end_body)
 info = json.load(open(f"{OUT}/marker_mount_l5.json"))
 bd = spec.body("link5")
 q = np.zeros(4); mujoco.mju_mat2Quat(q, T_l5_end[:3, :3].ravel())
-for part, rgba in (("A_base", [0.95, 0.55, 0.15, 1]), ("B_markers", [0.25, 0.6, 1.0, 1])):
-    spec.add_mesh(name=part, file=f"{OUT}/marker_mount_l5_{part}.stl", scale=[1e-3] * 3)
+import os
+parts = ((("A_base", [0.95, 0.55, 0.15, 1]), ("B_markers", [0.25, 0.6, 1.0, 1]))
+         if os.path.exists(f"{OUT}/marker_mount_l5_A_base.stl") else (("", [0.25, 0.6, 1.0, 1]),))   # two pieces / one piece
+for part, rgba in parts:
+    spec.add_mesh(name=part or "one", file=f"{OUT}/marker_mount_l5{'_' + part if part else ''}.stl", scale=[1e-3] * 3)
+    part = part or "one"
     bd.add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=part, pos=T_l5_end[:3, 3], quat=q, rgba=rgba, group=2, contype=0, conaffinity=0)
 for mk in info["markers"]:
     P = T_l5_end @ np.array(mk["T_wrist_marker"]) @ np.diag([1, 1, 1, 1]); P = P.copy()
     Tm = np.array(mk["T_wrist_marker"]); Tm[:3, 3] /= 1000; P = T_l5_end @ Tm
     qm = np.zeros(4); mujoco.mju_mat2Quat(qm, P[:3, :3].ravel())
-    bd.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.015, 0.015, 0.0004], pos=P[:3, 3] + P[:3, 2] * 0.0005, quat=qm, rgba=[0.05, 0.05, 0.05, 1], group=2, contype=0, conaffinity=0)
+    hs = info.get("sticker_area_mm", 34.0) / 2000; hm = info.get("marker_size_mm", 30.0) / 2000
+    bd.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[hs, hs, 0.0002], pos=P[:3, 3] + P[:3, 2] * 0.0002, quat=qm, rgba=[0.97, 0.97, 0.97, 1], group=2, contype=0, conaffinity=0)
+    bd.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[hm, hm, 0.0004], pos=P[:3, 3] + P[:3, 2] * 0.0005, quat=qm, rgba=[0.05, 0.05, 0.05, 1], group=2, contype=0, conaffinity=0)
     bd.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.006, 0.006, 0.0004], pos=P[:3, 3] + P[:3, 2] * 0.0008 + P[:3, 0] * 0.004, quat=qm, rgba=[1, 1, 1, 1], group=2, contype=0, conaffinity=0)
 he = json.load(open("../oak/calib/handeye_active.json")); Xi = np.linalg.inv(np.array(he["T_cam_base"]))
 K = np.array(json.load(urllib.request.urlopen("http://127.0.0.1:8090/state.json"))["intrinsics"]["K"])

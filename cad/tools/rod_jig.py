@@ -3,10 +3,11 @@
     [wall][finger pocket][inner wall][ rod hole ][inner wall][finger pocket][wall]      <- y (closing axis)
 
   - rod hole (centre): rod_w x rod_h, through x; tapping-screw pilot holes from the +z face press the rod;
-  - finger pockets (left / right): the B601 fingers (01_Finger, 12.7 mm thick, 3 -> 30 mm wide over the first
-    45 mm) go in up to the full jig depth; the pocket is wider than the finger along y, so the jaws enter with a
-    few mm of position error and then close onto the inner walls (the jig is gripped on the inner walls, width
-    grip_w = rod_w + 2 inner);
+  - finger pockets (left / right): shaped like the B601 finger (01_Finger) so it sits snugly -- along z the
+    pocket follows the finger's taper (a wedge: ~9 mm wide 10 mm from the tip, ~27 mm at 39 mm, measured from
+    the CAD), plus `fit` per side; along y it is the finger thickness (12.7) + `fit` + `slack`, so the jaws enter
+    opened `slack` beyond the grip and then close onto the inner walls (the jig is gripped on the inner walls,
+    width grip_w = rod_w + 2 inner); requester 2026-10-15: "爪がピッタリハマるように、三角形のような形状";
   - entry chamfers on the +x face guide the fingers in;
   - marker area on the -z face: a raised rim around a square for the printed ArUco sticker.
 
@@ -40,10 +41,16 @@ from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 ap = argparse.ArgumentParser()
 ap.add_argument("outdir")
 ap.add_argument("--finger-step", help="wrist_gripper_in_end_link.step (end_link frame) for the fit check")
-ap.add_argument("--depth", type=float, default=40.0, help="jig thickness along the fingers (x)")
+ap.add_argument("--depth", type=float, default=44.0, help="jig thickness along the fingers (x); 44 so the 41 mm marker area + rim fits the -z face")
+ap.add_argument("--insert", type=float, default=39.0, help="finger depth into the jig from the entry face (the finger widens and thickens beyond ~40 mm)")
 ap.add_argument("--rod", type=float, nargs=2, default=[30.0, 20.0], metavar=("W", "H"), help="rod hole, y x z (30 along the closing axis; requester 2026-10-14)")
-ap.add_argument("--pocket", type=float, nargs=2, default=[20.0, 32.0], metavar=("W", "H"),
-                help="finger pocket, y x z (finger: 12.7 thick; 27 wide at 40 mm, 30 at 45 mm from the tip)")
+# finger half width along z vs distance from the tip (01_Finger in wrist_gripper_in_end_link.step, sections every
+# few mm; constant 12.74 mm thick from 15 mm on, the tip itself tapers)
+FINGER_HALF_Z = [(0.0, 0.6), (1.0, 1.38), (2.0, 1.70), (4.0, 2.33), (6.0, 2.96), (7.9, 3.6), (8.0, 4.60),
+                 (15.0, 5.80), (20.0, 7.38), (25.0, 8.96), (30.0, 10.54), (35.0, 12.12), (39.0, 13.38), (42.0, 14.33)]
+ap.add_argument("--finger-t", type=float, default=12.74, help="finger thickness along y")
+ap.add_argument("--fit", type=float, default=0.3, help="clearance around the finger (z both sides, y outer side)")
+ap.add_argument("--slack", type=float, default=1.0, help="extra room along y on the outer side: jaw opening for entry")
 ap.add_argument("--inner", type=float, default=6.0, help="wall between pocket and rod hole (the jaws press it)")
 ap.add_argument("--outer", type=float, default=4.0, help="outer wall of each pocket")
 ap.add_argument("--wall-z", type=float, nargs=2, default=[5.0, 8.0], metavar=("MINUS", "PLUS"),
@@ -54,7 +61,8 @@ ap.add_argument("--screw-pilot", type=float, nargs=2, default=[2.7, 2.4], metava
 ap.add_argument("--screw-csk", type=float, default=5.0, help="90 deg entry countersink diameter on the +z face")
 ap.add_argument("--screws", type=int, default=2)
 ap.add_argument("--marker", type=float, default=30.0, help="ArUco black square, mm")
-ap.add_argument("--marker-margin", type=float, default=2.0, help="white margin of the sticker inside the rim")
+ap.add_argument("--marker-margin", type=float, default=5.5,
+                help="white margin inside the rim: area 30 + 2 x 5.5 = 41 mm holds the 40 mm sticker (requester 2026-10-15: 40 mm incl. margin)")
 ap.add_argument("--rim", type=float, nargs=2, default=[1.2, 0.8], metavar=("WIDTH", "HEIGHT"))
 a = ap.parse_args()
 out = Path(a.outdir); out.mkdir(parents=True, exist_ok=True)
@@ -84,6 +92,34 @@ def bbox(s):
     return [p.X(), p.Y(), p.Z(), q.X(), q.Y(), q.Z()]
 
 
+def lerp_half(dx):
+    pts = FINGER_HALF_Z
+    if dx <= pts[0][0]:
+        return pts[0][1]
+    for (x0, h0), (x1, h1) in zip(pts, pts[1:]):
+        if dx <= x1:
+            return h0 + (h1 - h0) * (dx - x0) / (x1 - x0)
+    return pts[-1][1]
+
+
+def finger_pocket(D, ins, yc, pw, fit, out_far=1.5):
+    """Through-pocket along x following the finger taper: rectangles pw (y) x 2 (half_z(dx) + fit) (z), dx = distance
+    from the finger tip, which sits at x = D/2 - ins when the jig is fully on (beyond it: the tip section, a slot)."""
+    tip = D / 2 - ins
+    xs = [-D / 2 - out_far] + [tip + dx for dx, _ in FINGER_HALF_Z if -D / 2 < tip + dx < D / 2] + [D / 2 + 0.01]
+    xs = sorted(set(round(x, 3) for x in xs))
+    ts = BRepOffsetAPI_ThruSections(True, True)
+    for x in xs:
+        h = lerp_half(x - tip) + fit
+        poly = BRepBuilderAPI_MakePolygon()
+        for y, z in ((-pw / 2, -h), (pw / 2, -h), (pw / 2, h), (-pw / 2, h)):
+            poly.Add(gp_Pnt(x, yc + y, z))
+        poly.Close()
+        ts.AddWire(poly.Wire())
+    ts.Build()
+    return ts.Shape()
+
+
 def frustum(x_top, w0, h0, c, yc):
     """Pocket entry funnel: rectangle w0 x h0 at x_top - c widening by c on every side at x_top."""
     def rect(x, w, h):
@@ -100,7 +136,8 @@ def frustum(x_top, w0, h0, c, yc):
 
 D = a.depth
 rw, rh = a.rod
-pw, ph = a.pocket
+pw = a.finger_t + a.fit + a.slack                         # along y
+ph = 2 * (lerp_half(a.insert) + a.fit)                     # along z at the entry face (widest)
 Y = rw / 2 + a.inner + pw + a.outer                       # half width along y
 zl, zh = -max(rh, ph) / 2 - a.wall_z[0], max(rh, ph) / 2 + a.wall_z[1]
 body = box(-D / 2, -Y, zl, D / 2, Y, zh)
@@ -108,9 +145,9 @@ body = cut(body, box(-D / 2 - 1, -rw / 2, -rh / 2, D / 2 + 1, rw / 2, rh / 2))  
 y_pocket = rw / 2 + a.inner + pw / 2                                                  # pocket centre |y|
 for s in (-1, 1):
     yc = s * y_pocket
-    body = cut(body, box(-D / 2 - 1, yc - pw / 2, -ph / 2, D / 2 + 1, yc + pw / 2, ph / 2))
+    body = cut(body, finger_pocket(D, a.insert, yc, pw, a.fit))
     if a.chamfer > 0:
-        body = cut(body, frustum(D / 2, pw, ph, a.chamfer, yc))
+        body = cut(body, frustum(D / 2, pw, 2 * (lerp_half(a.insert - a.chamfer) + a.fit), a.chamfer, yc))
 # screws: pilot holes along -z from the +z face into the rod hole, spread along x
 xs = [-D / 2 + D * (i + 1) / (a.screws + 1) for i in range(a.screws)]
 # tapered pilot (the tapping screw starts easily and bites harder towards the rod) + 90 deg entry countersink
@@ -135,11 +172,14 @@ grip_w = rw + 2 * a.inner
 info = {
     "units": "mm", "frame": "x through (entry face +x), y closing axis, z finger width; origin = jig centre",
     "size_mm": [D, 2 * Y, zh - zl], "x_range": [-D / 2, D / 2], "y_range": [-Y, Y], "z_range": [zl - rhgt, zh],
-    "rod_hole_mm": [rw, rh], "finger_pockets_mm": [pw, ph], "pocket_centres_y_mm": [-y_pocket, y_pocket],
+    "rod_hole_mm": [rw, rh], "pocket_centres_y_mm": [-y_pocket, y_pocket],
+    "finger_pockets_mm": {"y": round(pw, 2), "z_at_entry": round(ph, 2), "z_at_tip": round(2 * (lerp_half(0.0) + a.fit), 2), "finger_insert_mm": a.insert,
+                          "shape": "wedge following the finger taper along x (half width + fit per side), finger thickness + fit + slack along y",
+                          "fit": a.fit, "slack": a.slack},
     "grip_width_mm": grip_w,
-    "entry_gap_mm": {"min": grip_w, "max": 2 * (y_pocket + pw / 2) - 2 * 12.7,
-                     "suggested": round(2 * (rw / 2 + a.inner) + (pw - 12.7), 1),
-                     "note": "jaw gap (inner faces) while entering: inner faces between the inner walls and outer walls minus the 12.7 mm finger"},
+    "entry_gap_mm": {"min": grip_w, "max": round(grip_w + 2 * (pw - a.finger_t), 2),
+                     "suggested": round(grip_w + 2 * a.slack * 0.6, 1),
+                     "note": "jaw gap (inner faces) while entering: between the inner walls and the pocket's outer walls"},
     "screws": {"pilot_mm": {"entry": a.screw_pilot[0], "end": a.screw_pilot[1], "taper": "linear over the wall"},
                "entry_countersink_mm": {"diameter": a.screw_csk, "angle_deg": 90}, "x_mm": xs, "axis": "-z from the +z face", "length_into_wall_mm": zh - rh / 2,
                "screw": "countersunk 3 mm tapping screw, 3 x 16 to 3 x 20 (wall 14 mm): the tip presses the rod"},
@@ -155,7 +195,7 @@ sw = StlAPI_Writer(); sw.ASCIIMode = False; sw.Write(body, str(out / "rod_jig.st
 if a.finger_step:
     # fingers from the gripper STEP (end_link frame, closed: inner faces at y = 0). Put the jig on them, entry
     # face (jig +x) towards the palm: jig x = -end_link x (180 deg about z; the jig is symmetric in y), inserted
-    # to depth D - 1 (tips 1 mm out of the far face).
+    # to depth `insert` (entry face at end_link x = -insert, the finger tips near x = 0).
     r = STEPControl_Reader(); r.ReadFile(a.finger_step); r.TransferRoots(); sh = r.OneShape()
     ex, fingers = TopExp_Explorer(sh, TopAbs_SOLID), []
     while ex.More():
@@ -163,7 +203,7 @@ if a.finger_step:
         if b and b[3] > -3 and -70 < b[0] < -40:
             fingers.append((ex.Current(), 1 if b[4] > 1 else -1))
         ex.Next()
-    jig_x = -D / 2 + 1.0                       # jig centre in end_link x (far face at x = +1, entry face at 1 - D)
+    jig_x = D / 2 - a.insert                   # jig centre in end_link x (entry face at x = -insert)
     T = gp_Trsf(); T.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), math.pi)
     T2 = gp_Trsf(); T2.SetTranslation(gp_Vec(jig_x, 0, 0))
     jig_e = BRepBuilderAPI_Transform(BRepBuilderAPI_Transform(body, T, True).Shape(), T2, True).Shape()
@@ -188,7 +228,7 @@ if a.finger_step:
                 both = ff if both is None else fuse(both, ff)
             BRepMesh_IncrementalMesh(both, 1.0, False, 0.5, True)
             sw = StlAPI_Writer(); sw.ASCIIMode = False; sw.Write(both, str(out / "fingers_closed_in_jig_frame.stl"))
-    info["finger_check"] = dict(res, insert_depth_mm=D - 1.0, note="fingers of 01_Finger (CAD), jig entry face towards the palm")
+    info["finger_check"] = dict(res, insert_depth_mm=a.insert, note="fingers of 01_Finger (CAD), jig entry face towards the palm")
 
 (out / "rod_jig.json").write_text(json.dumps(info, indent=1, ensure_ascii=False))
 print(json.dumps(info, indent=1, ensure_ascii=False))

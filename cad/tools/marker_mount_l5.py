@@ -30,7 +30,7 @@ One-marker version: --face 45,-135,0,16.75
 
 usage: marker_mount_l5.py wrist_gripper_in_end_link.step outdir --face 45,-90 --face 45,180
 """
-import argparse, json, math
+import argparse, time, json, math
 from pathlib import Path
 import numpy as np
 from OCP.gp import gp_Pnt, gp_Dir, gp_Ax1, gp_Ax2, gp_Trsf, gp_Vec
@@ -230,7 +230,7 @@ if a.two_piece:
 # a corner cut off by the bottom cut / a bore edge, or buried under a neighbouring wedge, fails here
 def sticker_check(solid, fc):
     half_s = (a.marker + 2 * a.margin) / 2
-    bad_cut, bad_buried, n_ = 0, 0, 0
+    bad_cut, bad_buried, n_, miss = 0, 0, 0, []
     for u in np.linspace(-half_s + 0.3, half_s - 0.3, 15):
         for v in np.linspace(-half_s + 0.3, half_s - 0.3, 15):
             p = fc["centre"] + u * fc["x_axis"] + v * fc["y_axis"]
@@ -239,11 +239,14 @@ def sticker_check(solid, fc):
             n_ += 1
             bad_buried += above == TopAbs_IN
             bad_cut += below != TopAbs_IN
-    return {"points": n_, "buried": int(bad_buried), "missing": int(bad_cut)}
+            if below != TopAbs_IN:
+                miss.append([round(u, 1), round(v, 1)])
+    return {"points": n_, "buried": int(bad_buried), "missing": int(bad_cut), "missing_uv_mm": miss}
 check_solid = both if not a.two_piece else B
 for fc in faces:
     fc["sticker"] = sticker_check(check_solid, fc)
-    print(f"sticker area face {faces.index(fc) + 1}: {fc['sticker']} (missing includes the screw bores)")
+    print(f"sticker area face {faces.index(fc) + 1}: { {k: v for k, v in fc['sticker'].items() if k != 'missing_uv_mm'} } (missing includes the screw bores)")
+    print("  missing at (u, v) mm:", fc["sticker"]["missing_uv_mm"])
 mk = []
 for k, fc in enumerate(faces):
     R = np.array([fc["x_axis"], fc["y_axis"], fc["normal"]]).T
@@ -276,11 +279,32 @@ r = STEPCAFControl_Reader(); r.SetNameMode(True); assert r.ReadFile(a.step) == I
 st = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
 labs = Sequence_TDF_Label(); st.GetFreeShapes(labs)
 rows = []
+# cheap lower bound first (the exact distance over 36 joint-6 angles per part was ~10 min): parts on link6 / the
+# gripper sweep a solid of revolution about the joint-6 axis (end_link x), so their distance to the mount is at least
+# the gap along x between the boxes or the radial gap; Link5 parts: the box gap. Parts farther than FAR_MM are skipped.
+FAR_MM = 3.0
+bm_ = Bnd_Box(); BRepBndLib.Add_s(both, bm_, False)
+mx0, my0, mz0 = bm_.CornerMin().X(), bm_.CornerMin().Y(), bm_.CornerMin().Z()
+mx1, my1, mz1 = bm_.CornerMax().X(), bm_.CornerMax().Y(), bm_.CornerMax().Z()
+m_rmin = math.hypot(max(my0, -my1, 0.0), max(mz0, -mz1, 0.0))          # mount box nearest the axis
+n_far = 0
+t_int = time.time()
 for i in range(1, labs.Length() + 1):
     lab = labs.Value(i); nm = TDataStd_Name(); lab.FindAttribute(TDataStd_Name.GetID_s(), nm)
     name = nm.Get().ToExtString(); shp = st.GetShape_s(lab)
     bb_ = Bnd_Box(); BRepBndLib.Add_s(shp, bb_, False)
     if "KM3-9" in name and bb_.CornerMin().X() < X_PLATE + 0.1 and any(abs(bb_.CornerMin().Y() + 3 - y) < 1 for y, _ in SCREWS):
+        continue
+    px0, py0, pz0 = bb_.CornerMin().X(), bb_.CornerMin().Y(), bb_.CornerMin().Z()
+    px1, py1, pz1 = bb_.CornerMax().X(), bb_.CornerMax().Y(), bb_.CornerMax().Z()
+    gx = max(mx0 - px1, px0 - mx1, 0.0)
+    if name.startswith("Link5/"):
+        lb = math.sqrt(gx ** 2 + max(my0 - py1, py0 - my1, 0.0) ** 2 + max(mz0 - pz1, pz0 - mz1, 0.0) ** 2)
+    else:
+        p_rmax = math.hypot(max(abs(py0), abs(py1)), max(abs(pz0), abs(pz1)))
+        lb = max(gx, m_rmin - p_rmax)
+    if lb > FAR_MM:
+        n_far += 1
         continue
     angles = [0] if name.startswith("Link5/") else range(-180, 180, 10)
     dmin, ov = 1e9, 0.0
@@ -292,6 +316,6 @@ for i in range(1, labs.Length() + 1):
             ov = max(ov, vol(BRepAlgoAPI_Common(both, s_).Shape()))
     rows.append((dmin, name, ov))
 rows.sort()
-print("closest parts (mm; link6 / gripper swept over joint 6):")
+print(f"closest parts (mm; link6 / gripper swept over joint 6; {n_far} parts more than {FAR_MM} mm away skipped by their boxes; {time.time() - t_int:.0f} s):")
 for dmin, name, ov in rows[:8]:
     print(f"  {dmin:7.3f}  {name}" + (f"   OVERLAP {ov:.3f} mm3" if ov > 1e-6 else ""))
