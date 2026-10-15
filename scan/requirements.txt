@@ -1,0 +1,9 @@
+# scan/.venv: Python 3.11（Mac / Linux 共通）
+#   uv venv --python 3.11 scan/.venv && uv pip install --python scan/.venv/bin/python -r scan/requirements.txt
+numpy==2.4.6
+opencv-contrib-python==5.0.0.93
+open3d==0.20.0
+scikit-image==0.26.0
+scipy==1.17.1
+trimesh==5.1.1
+mujoco==3.15.0

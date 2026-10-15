@@ -18,3 +18,9 @@ oak/calib/grip/
 # reBot-DevArm (upstream CAD, ~0.9 GB; see cad/README.md) and generated CAD outputs
 /reBot-DevArm
 cad/out/
+scan/captures/
+scan/output/
+scan/.venv/
+scan/ios/build/
+scan/ios/TamasenScan.xcodeproj/
+scan/photogrammetry/objcap
