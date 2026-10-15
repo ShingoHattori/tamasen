@@ -257,6 +257,20 @@ if a.finger_step:
                 both = ff if both is None else fuse(both, ff)
             BRepMesh_IncrementalMesh(both, 1.0, False, 0.5, True)
             sw = StlAPI_Writer(); sw.ASCIIMode = False; sw.Write(both, str(out / "fingers_closed_in_jig_frame.stl"))
+    # the way in: fingers at the entry gap, slid in 2 mm at a time up to the full depth (the jig stays put)
+    path = []
+    for depth in [d_ for d_ in range(2, int(a.insert), 2)] + [a.insert]:
+        T3 = gp_Trsf(); T3.SetTranslation(gp_Vec(depth - a.insert, 0, 0))     # finger backed out (towards the palm, -x) by insert - depth
+        pen, dmin = 0.0, 1e9
+        for f, s_ in fingers:
+            Tf = gp_Trsf(); Tf.SetTranslation(gp_Vec(0, s_ * info["entry_gap_mm"]["suggested"] / 2, 0))
+            ff = BRepBuilderAPI_Transform(BRepBuilderAPI_Transform(f, Tf, True).Shape(), T3, True).Shape()
+            pen += volume(BRepAlgoAPI_Common(ff, jig_e).Shape())
+            dd = BRepExtrema_DistShapeShape(ff, jig_e); dd.Perform(); dmin = min(dmin, dd.Value())
+        path.append({"depth_mm": depth, "overlap_mm3": round(pen, 3), "min_distance_mm": round(dmin, 2)})
+    res["insertion_path"] = {"gap_mm": info["entry_gap_mm"]["suggested"], "steps": path,
+                             "worst_min_distance_mm": min(p_["min_distance_mm"] for p_ in path),
+                             "any_overlap": any(p_["overlap_mm3"] > 0.01 for p_ in path)}
     info["finger_check"] = dict(res, insert_depth_mm=a.insert, note="fingers of 01_Finger (CAD), jig entry face towards the palm")
 
 (out / "rod_jig.json").write_text(json.dumps(info, indent=1, ensure_ascii=False))
