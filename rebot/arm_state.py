@@ -71,6 +71,7 @@ LAG_KI_GAIN = 3.0           # integral gain multiplier while the plan clock is f
 # Thresholds in rebot/mit_tuning.yaml "contact:" (read at engage). Joints whose plan is within RES_LIMIT_MARGIN
 # of a joint limit are skipped (the folded rest pose leans on the end stops).
 CONTACT_DEFAULTS = {
+    "enabled": True,     # false: no contact stop at all (the deviation stop still applies)
     # rise of r above its recent minimum (a minimum below the model, e.g. leaning on an end stop, counts as 0).
     # Free motion on the real arm reached 0.6 / 2.0 / 1.5 / 0.2 / 0.1 / 0.2 N m (stick-slip of joint2/3).
     "rise_nm": [1.2, 3.0, 3.0, 0.6, 0.5, 0.5],
@@ -522,6 +523,11 @@ class ArmService:
             for k, v in (raw.get("contact") or {}).items():
                 if k not in CONTACT_DEFAULTS:
                     return t, f"contact.{k} は不明な項目"
+                if isinstance(CONTACT_DEFAULTS[k], bool):
+                    if not isinstance(v, bool):
+                        return t, f"contact.{k} は true / false"
+                    t["contact"][k] = v
+                    continue
                 if isinstance(CONTACT_DEFAULTS[k], list):
                     v = [float(x) for x in v]
                     if len(v) != 6 or min(v) <= 0:
@@ -792,6 +798,8 @@ class ArmService:
 
     def _contact_check(self, mv, qp, qm, vdir) -> str | None:
         """Resistance that keeps growing against the planned motion (ContactMonitor). Fault text on contact."""
+        if not self.tuning["contact"].get("enabled", True):
+            return None
         by = {r["name"]: r for r in self.last_rows}
         tq = np.array([by.get(n, {}).get("torq") or 0.0 for n in ARM])
         ff = np.array([self.ff.get(n, {}).get("tau_ff", 0.0) + self.ff.get(n, {}).get("fric", 0.0) for n in ARM])
