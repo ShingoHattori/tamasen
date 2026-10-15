@@ -103,7 +103,9 @@ function buildExtrude(p: Part): Manifold {
   const sc = new Scope();
   try {
     const cs = sc.add(profileSection(p.params.outer, p.params.holes, "押し出し", sc));
-    return cs.extrude(t, 0, 0, [1, 1], !!p.params.symmetric);
+    const m = cs.extrude(t, 0, 0, [1, 1], !!p.params.symmetric);
+    // 裏側へ: 平面（z=0）から −z 方向に押し出す（輪郭を描いた面が物体の表面で、物体がその奥にあるとき）
+    return !p.params.symmetric && p.params.direction === "back" ? m.translate([0, 0, -t]) : m;
   } finally {
     sc.release();
   }

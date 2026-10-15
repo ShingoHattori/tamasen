@@ -116,7 +116,7 @@ exports/<timestamp>/model.glb, model.json
 | `box` | `size: [x,y,z]` | 中心が原点 |
 | `cylinder` | `radius, height, segments` | 軸 = +z、z ∈ [-h/2, h/2] |
 | `frustum` | `radius_bottom, radius_top, height, segments` | 同上（底面 z=-h/2） |
-| `extrude` | `outer: [[x,y],...]`, `holes: [[[x,y],...], ...]`, `thickness`, `symmetric: bool` | 輪郭は部品の xy 平面、押し出しは +z（symmetric なら ±t/2）。穴は保持される |
+| `extrude` | `outer: [[x,y],...]`, `holes: [[[x,y],...], ...]`, `thickness`, `symmetric: bool`, `direction: front|back` | 輪郭は部品の xy 平面、押し出しは front なら z ∈ [0, t]、back なら [−t, 0]（面の裏側＝物体の中へ。マーカー面に描いたとき）、symmetric なら ±t/2。穴は保持される |
 | `revolve` | `profile: [[r,z],...]`（閉じた断面、r ≥ 0）, `angle_deg: 360`, `segments` | z 軸まわりに回す。容器は肉厚のある断面（外側→口→内側）で描けば空洞と口が残る |
 | `sheet` | `path: [[x,z],...]`（中心線、部品の xz 平面の折れ線）, `thickness`, `width`, `bend_radius`（0 で角）, `sheet_holes: [{ "s": 弧長位置, "y": 幅方向, "shape": "circle|slot|poly", "d"/"w,l"/"pts" }]` | 中心線を y 方向に `width` だけ押し出した板。区間ごとの折れ曲がり（ヘラの柄と刃）。穴は板厚方向に貫通 |
 

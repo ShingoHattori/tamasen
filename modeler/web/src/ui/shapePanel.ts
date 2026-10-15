@@ -39,7 +39,7 @@ function editPart(label: string, part: Part, fn: (pt: Part) => void): void {
 }
 
 export function buildShapePanel(el: HTMLElement, readonly: boolean): void {
-  const extrudeState = { open: false, touched: false, contour: "", plane: "XY", offset: 0, thickness: 3, symmetric: false, op: "add" as Part["op"], name: "" };
+  const extrudeState = { open: false, touched: false, contour: "", plane: "marker", offset: 0, thickness: 3, symmetric: false, direction: "back" as "front" | "back", op: "add" as Part["op"], name: "" };
   const render = deferred(() => {
     clear(el);
     const p = store.project;
@@ -134,9 +134,13 @@ function partEditor(p: Project, part: Part): HTMLElement {
     sc.append(h("span", null, label, locked ? lockIcon("実測値でロック中") : null), numInput(getParam(part, param), (v) => editParam(part.id, param, v), { step: param === "segments" ? 1 : 0.1, readonly: locked, title: locked ? "実測寸法でロックされています" : "", cls: `param-${param.replace(".", "-")}` }));
   }
   if (part.kind === "extrude") {
-    const sym = h("input", { type: "checkbox", checked: !!part.params.symmetric });
-    sym.addEventListener("change", () => editPart("対称押し出し", part, (x) => (x.params.symmetric = sym.checked)));
-    sc.append(h("span", null, "両側に押し出す"), sym);
+    const cur = part.params.symmetric ? "sym" : part.params.direction === "back" ? "back" : "front";
+    const dir = dirSelect(cur, "part-direction");
+    dir.addEventListener("change", () => editPart("押し出し方向", part, (x) => {
+      x.params.symmetric = dir.value === "sym";
+      x.params.direction = dir.value === "back" ? "back" : "front";
+    }));
+    sc.append(h("span", null, "押し出し方向"), dir);
   }
   box.append(sc);
   // 点表
@@ -463,7 +467,7 @@ export function holesInside(img: ProjectImage, outer: Contour): Contour[] {
 }
 
 /** 画像の輪郭を作図平面へ逆投影し、押し出し部品を作る。失敗なら理由（文字列）。 */
-export function extrudeFromContour(p: Project, img: ProjectImage, contourId: string, plane: PlaneSpec, thickness: number, symmetric: boolean, op: Part["op"], name: string): Part | string {
+export function extrudeFromContour(p: Project, img: ProjectImage, contourId: string, plane: PlaneSpec, thickness: number, symmetric: boolean, op: Part["op"], name: string, direction: "front" | "back" = "front"): Part | string {
   if (!img.pose.T_cam_marker) return "この画像には姿勢がありません。先に位置合わせかマーカーで姿勢を決めてください";
   const cam = p.cameras[img.camera];
   if (!cam?.K_und?.[0]) return "カメラの内部パラメータがありません";
@@ -495,14 +499,14 @@ export function extrudeFromContour(p: Project, img: ProjectImage, contourId: str
   const part = defaultPart("extrude", id);
   part.name = name || `押し出し ${id}`;
   part.op = op;
-  part.params = { ...part.params, outer: o, holes, thickness, symmetric };
+  part.params = { ...part.params, outer: o, holes, thickness, symmetric, direction };
   // 部品座標 = 作図平面（x, y, 法線）
   const M: Mat4 = [x[0], y[0], n[0], plane.origin[0], x[1], y[1], n[1], plane.origin[1], x[2], y[2], n[2], plane.origin[2], 0, 0, 0, 1];
   part.transform = transformFromMat4(M);
   return part;
 }
 
-function extrudeSection(p: Project, st: { open: boolean; touched: boolean; contour: string; plane: string; offset: number; thickness: number; symmetric: boolean; op: Part["op"]; name: string }, rerender: () => void): HTMLElement {
+function extrudeSection(p: Project, st: { open: boolean; touched: boolean; contour: string; plane: string; offset: number; thickness: number; symmetric: boolean; direction: "front" | "back"; op: Part["op"]; name: string }, rerender: () => void): HTMLElement {
   const img = store.image();
   const det = h("details", { class: "tool-sec", id: "extrude-sec", open: st.open });
   det.addEventListener("toggle", () => {
@@ -549,8 +553,11 @@ function extrudeSection(p: Project, st: { open: boolean; touched: boolean; conto
   });
   const th = h("input", { type: "number", class: "num", value: String(st.thickness), step: "0.1", min: "0.01", id: "extrude-thickness" });
   th.addEventListener("change", () => (st.thickness = parseFloat(th.value) || st.thickness));
-  const sym = h("input", { type: "checkbox", checked: st.symmetric });
-  sym.addEventListener("change", () => (st.symmetric = sym.checked));
+  const sym = dirSelect(st.symmetric ? "sym" : st.direction, "extrude-direction");
+  sym.addEventListener("change", () => {
+    st.symmetric = sym.value === "sym";
+    st.direction = sym.value === "back" ? "back" : "front";
+  });
   const op = h("select", null, h("option", { value: "add", selected: st.op === "add" }, "追加"), h("option", { value: "subtract", selected: st.op === "subtract" }, "切削"));
   op.addEventListener("change", () => (st.op = op.value as Part["op"]));
   const nm = h("input", { type: "text", value: st.name, placeholder: "部品名" });
@@ -565,7 +572,7 @@ function extrudeSection(p: Project, st: { open: boolean; touched: boolean; conto
       h("span", null, "作図平面"), psel,
       h("span", null, "オフセット mm"), off,
       h("span", null, "厚さ mm"), th,
-      h("span", null, "両側に押し出す"), sym,
+      h("span", null, "押し出し方向"), sym,
       h("span", null, "合成"), op,
       h("span", null, "名前"), nm,
     ),
@@ -575,7 +582,7 @@ function extrudeSection(p: Project, st: { open: boolean; touched: boolean; conto
       disabled: !hasPose || !cur,
       onclick: () => {
         const plane = planeFor(p, st.plane, st.offset);
-        const r = extrudeFromContour(p, img, st.contour, plane, st.thickness, st.symmetric, st.op, st.name);
+        const r = extrudeFromContour(p, img, st.contour, plane, st.thickness, st.symmetric, st.op, st.name, st.direction);
         if (typeof r === "string") {
           store.msg(r, "error");
           return;
@@ -638,4 +645,12 @@ async function editFixedTransform(): Promise<void> {
   if (r !== "yes") return;
   store.commit("固定変換の編集", (pp) => (pp.T_marker_obj = mat4FromRt(vals.r, vals.t)));
   store.msg("固定変換を変更しました（全画像の重ね合わせに反映）", "ok");
+}
+
+/** 押し出し方向の選択（表側 = 平面の法線の向き、裏側 = 逆向き、両側 = 対称）。マーカー面に描いたときは裏側が物体の中。 */
+function dirSelect(cur: string, id: string): HTMLSelectElement {
+  return h("select", { id },
+    h("option", { value: "back", selected: cur === "back" }, "裏側へ（−法線、面の奥＝物体の中）"),
+    h("option", { value: "front", selected: cur === "front" }, "表側へ（＋法線、カメラ側）"),
+    h("option", { value: "sym", selected: cur === "sym" }, "両側（対称）"));
 }

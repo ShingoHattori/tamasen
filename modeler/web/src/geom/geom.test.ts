@@ -55,6 +55,18 @@ describe("形状", () => {
     r.geometry!.dispose();
   });
 
+  it("押し出し方向: 表側は z ∈ [0, t]、裏側は [−t, 0]、両側は [−t/2, t/2]", () => {
+    const base = plateParts[0];
+    for (const [dir, sym, lo, hi] of [["front", false, 0, 3], ["back", false, -3, 0], ["front", true, -1.5, 1.5]] as const) {
+      const part: Part = { ...base, params: { ...base.params, direction: dir, symmetric: sym } };
+      const r = buildModel([part]);
+      expect(r.errors).toEqual([]);
+      expect(r.stats!.bbox_min[2]).toBeCloseTo(lo, 6);
+      expect(r.stats!.bbox_max[2]).toBeCloseTo(hi, 6);
+      r.geometry!.dispose();
+    }
+  });
+
   it("輪郭の向き（時計回り）を自動で直す・自己交差は拒否", () => {
     const cw = part("a", "extrude", { outer: [[-60, 30], [60, 30], [60, -30], [-60, -30]], holes: [[...hole1].reverse()], thickness: 3 });
     const r = buildModel([cw]);

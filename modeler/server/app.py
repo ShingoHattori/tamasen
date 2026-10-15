@@ -218,6 +218,21 @@ class App:
         notes.insert(0, f"カメラ {key} を設定し（{cam['source']}）、{len(ims)} 枚の歪み補正をやり直した")
         return notes
 
+    def auto_marker_pose(self, p: dict, im: dict) -> dict | None:
+        """基準マーカーが写っていて、姿勢がロックされておらず手動・対応点で決めたものでもなければ、マーカーから姿勢を求める。
+        求めた pose を返す（im は変えない）。求めないときは None。"""
+        pose = im.get("pose") or {}
+        if im.get("role") != "object" or pose.get("locked") or pose.get("source") in ("manual", "pnp"):
+            return None
+        mk = self._ref_marker(p, im)
+        cam = (p.get("cameras") or {}).get(im.get("camera"))
+        if not mk or not cam:
+            return None
+        r = pp.marker_pose(mk["corners_und"], pp.mat3(cam["K_und"]), float(p["marker"]["size_mm"]))
+        note = ("カメラ校正なし（焦点距離は仮）。" if cam.get("source") == "none" else "") + r["note"]
+        return {"T_cam_marker": r["solutions"][0]["T_cam_marker"], "source": "marker", "locked": False,
+                "quality": {"reproj_px": r["reproj_px"], "ambiguity": r["ambiguity"], "note": note}}
+
     @staticmethod
     def _ref_marker(p: dict, im: dict, marker_id: int | None = None) -> dict | None:
         mid = int(p["marker"]["id"] if marker_id is None else marker_id)
@@ -253,6 +268,12 @@ class App:
             if not added:
                 raise
             notes.append(f"{len(files) - len(added)} 枚は取り込めなかった")
+
+        pc = dict(p, cameras=dict(p.get("cameras", {}), **cams))
+        for im in added:
+            ps = self.auto_marker_pose(pc, im)
+            if ps:
+                im["pose"] = ps
 
         def fn(q):
             for k, c in cams.items():
@@ -591,6 +612,13 @@ def make_handler(app: App, allow: list):
             def fn(q, im2):
                 for k in keys:
                     im2[k] = copy.deepcopy(new[k])
+                if "markers" in keys:   # マーカーを検出し直したら、ロックされていないマーカー由来の姿勢も解き直す
+                    ps = app.auto_marker_pose(q, im2)
+                    if ps:
+                        im2["pose"] = ps
+                    elif (im2.get("pose") or {}).get("source") == "marker" and not im2["pose"].get("locked") \
+                            and not app._ref_marker(q, im2):
+                        im2["pose"] = {"T_cam_marker": None, "source": "none", "locked": False, "quality": {}}
                 return im2
             out = st.mutate_image(pid, iid, fn)
             return self._json({"ok": True, "image": decorate_image(st, pid, out)})

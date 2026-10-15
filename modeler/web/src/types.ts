@@ -51,6 +51,7 @@ export interface PartParams {
   holes?: Vec2[][];
   thickness?: number;
   symmetric?: boolean;
+  direction?: "front" | "back"; // symmetric でないとき: front = 部品の +z へ（既定）、back = −z へ（面の裏側、物体の中へ）
   // revolve
   profile?: Vec2[]; // (r, z)
   angle_deg?: number;

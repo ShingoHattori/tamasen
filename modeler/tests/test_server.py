@@ -148,7 +148,12 @@ def test_marker_detection_and_pose(server, plate, truth):
         mk = [m for m in im["markers"] if m["id"] == truth["marker"]["id"]]
         if not t["marker_visible"]:
             assert not mk
+            assert im["pose"]["source"] == "none" and im["pose"]["T_cam_marker"] is None
             continue
+        # 取り込んだだけでマーカーから姿勢が付いている
+        assert im["pose"]["source"] == "marker" and im["pose"]["T_cam_marker"] is not None
+        Ta = np.asarray(im["pose"]["T_cam_marker"]).reshape(4, 4)
+        assert rot_deg(Ta, np.asarray(t["T_cam_marker"]).reshape(4, 4)) < 1.0
         assert mk, f"{t['file']}: マーカー未検出"
         err = np.abs(np.asarray(mk[0]["corners_und"]) - np.asarray(t["corners_und"])).max()
         assert err < 1.5, f"{t['file']}: 四隅の誤差 {err:.2f} px"
