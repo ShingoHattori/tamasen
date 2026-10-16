@@ -61,8 +61,9 @@ _slices_cache = {}
 def make_model(jig_T, support_h=0.0, mass=0.137, friction=0.35, finger_mode="cad", finger_friction=0.5, view=None,
                extra=None):
     s = scene.load_settings()
+    s["jig"] = dict(s.get("jig", {}), enabled=False)
     if "slices" not in _slices_cache:
-        m0, _ = scene.load_model(s)
+        m0, _ = scene.load_model(s)  # jig disabled above
         _slices_cache["slices"] = rj.cad_finger_slices(m0, mujoco.MjData(m0), scene.Ids(m0))
     if "inertia" not in _slices_cache:
         _slices_cache["inertia"] = rj.jig_inertia(1.0)
@@ -89,7 +90,7 @@ _gap0 = {}
 def gap0() -> float:
     """Jaw gap at finger q = 0, from the unmodified model (scene._gap_model needs its front/mid hulls)."""
     if "v" not in _gap0:
-        m0, _ = scene.load_model(scene.load_settings())
+        m0, _ = scene.load_model(dict(scene.load_settings(), jig={"enabled": False}))
         _gap0["v"] = scene._gap_model(m0).gap0
     return _gap0["v"]
 
@@ -432,6 +433,7 @@ PRE_OUT_MM = 30.0          # fingertips this far outside the entry face at the p
 def _placement_job(args):
     H, tilt, grid, view_d = args
     os.environ.setdefault("OMP_NUM_THREADS", "1")
+    mem_cap(2.0)
     view = {k: np.array(v) if isinstance(v, list) else v for k, v in view_d.items()}
     rows = []
     m = d = ids = None
@@ -949,6 +951,7 @@ _W = {}
 
 def _winit(spec):
     os.nice(5)
+    mem_cap(2.0)
     view = {k: np.array(v) if isinstance(v, list) else v for k, v in spec["view"].items()}
     Tj = np.array(spec["Tj"])
     m, d, ids, _ = make_model(Tj, spec["H"], view=view, finger_mode=spec["fingers"], **spec["phys"])
@@ -1144,6 +1147,121 @@ def cmd_report(a):
         print(f2)
 
 
+
+# ------------------------------------------------------------------------------------------------ live pose
+def mem_cap(gb=2.5):
+    """Hard address-space cap for this process (robot1 runs live services; an OOM froze vision once)."""
+    import resource
+    lim = int(gb * 1024 ** 3)
+    resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+
+
+def T_marker_jig_from_toml():
+    import tomllib
+    mk = tomllib.loads((HERE.parent / "oak" / "markers.toml").read_text())["marker"]["13"]
+    T = np.eye(4)
+    T[:3, :3] = np.array(mk["jig_rotation_in_marker"], float)
+    T[:3, 3] = np.array(mk["jig_origin_in_marker_mm"], float) * 1e-3
+    return T
+
+
+def live_jig_pose(n=10, alt=False):
+    """T_base_jig from the running vision service (GET /state.json, read only), averaged over n reads."""
+    import urllib.request
+    he = json.loads((HERE.parent / "oak" / "calib" / "handeye_active.json").read_text())
+    Tbc = np.array(he["T_base_cam"])
+    Tmj = T_marker_jig_from_toml()
+    Ts, st = [], []
+    for _ in range(n):
+        with urllib.request.urlopen("http://127.0.0.1:8090/state.json", timeout=2) as r:
+            vs = json.loads(r.read())
+        mk = next((x for x in vs["markers"] if x["id"] == 13), None)
+        if mk and mk.get("T_cam_marker"):
+            Ts.append(Tbc @ np.array(mk["T_cam_marker_alt" if alt else "T_cam_marker"]) @ Tmj)
+            st.append(mk["status"])
+        time.sleep(0.15)
+    if not Ts:
+        raise SystemExit("ID 13 not seen")
+    T = Ts[len(Ts) // 2].copy()
+    T[:3, 3] = np.mean([t[:3, 3] for t in Ts], axis=0)
+    spread = float(np.max([np.linalg.norm(t[:3, 3] - T[:3, 3]) for t in Ts]) * 1000)
+    return T, st, spread
+
+
+def cmd_live(a):
+    view = get_view()
+    T, st, spread = live_jig_pose()
+    R = T[:3, :3]
+    tilt = math.degrees(math.acos(np.clip(-R[2, 2], -1, 1)))         # jig z should point down
+    yaw = math.degrees(math.atan2(R[1, 0], R[0, 0]))
+    # height of the resting (+z) face centre and of its lowest corner above the arm base plane (table)
+    face_c = T[:3, :3] @ np.array([0, 0, rj.ZH * 1e-3]) + T[:3, 3]
+    corners = [T[:3, :3] @ np.array([x, y, rj.ZH]) * 1e-3 + T[:3, 3] for x in (-22, 22) for y in (-rj.Y, rj.Y)]
+    x_in = R[:, 0]
+    rad = np.array([T[0, 3], T[1, 3]]) / math.hypot(T[0, 3], T[1, 3])
+    appr = -x_in[:2] / np.linalg.norm(x_in[:2])
+    delta = math.degrees(math.atan2(rad[0] * appr[1] - rad[1] * appr[0], rad @ appr))
+    info = {"status": st, "pos_spread_mm": round(spread, 1), "jig_centre_base_mm": (T[:3, 3] * 1000).round(1).tolist(),
+            "resting_face_centre_z_mm": round(face_c[2] * 1000, 1), "resting_face_corner_z_mm": [round(c[2] * 1000, 1) for c in corners],
+            "tilt_from_flat_deg": round(tilt, 1), "entry_face_yaw_deg": round(yaw, 1),
+            "approach_vs_radial_deg": round(delta, 1), "T_base_jig": T.round(5).tolist()}
+    print(json.dumps(info, indent=1))
+    px, py = float(T[0, 3]), float(T[1, 3])
+    rows = []
+    # (1) as placed (yaw measured), stand heights / tilts; (2) other yaws at the same spot
+    dls = [float(x) for x in a.deltas.split(",")] if a.live_grid else [-120, -90, -60, -30, 0, 30, 60, 90, 120]
+    Hs = [float(x) for x in a.heights.split(",")] if a.live_grid else [0.0, 0.015, 0.025, 0.035, 0.05, 0.065]
+    Ts = [float(x) for x in a.tilts.split(",")] if a.live_grid else [0, 15, 25, 35]
+    for dl in sorted({round(delta)} | set(dls)):
+        for H in Hs:
+            for t in Ts:
+                if H * 1000 < (rj.D / 2 + 1) * math.sin(math.radians(t)):
+                    continue
+                Tj = jig_pose_for(px, py, dl, H, t)
+                m, d, ids, _ = make_model(Tj, H, view=view)
+                Tg = Tj @ np.linalg.inv(rj.T_end_jig(rj.INSERT))
+                sols = ik_multi(m, d, ids, Tg)
+                best = None
+                for q, _, _ in sols[:4]:
+                    pl = make_plan(m, d, ids, Tj, q)
+                    if pl is None:
+                        continue
+                    rep = plan_report(m, d, ids, pl, view, START_Q)
+                    sc = (plan_ok(rep, a.clear), rep["frac_both"], rep["clear_mm"]["floor"])
+                    if best is None or sc > best[0]:
+                        best = (sc, rep)
+                r = {"delta": dl, "as_placed": dl == round(delta), "H_mm": H * 1000, "tilt": t, "ik": len(sols)}
+                if best:
+                    rep = best[1]
+                    r.update(ok=best[0][0], floor=rep["clear_mm"]["floor"], support=rep["clear_mm"]["support"],
+                             obst=rep["clear_mm"]["obstacle"], both=round(rep["frac_both"], 2), step=round(rep["max_step_rad"], 3),
+                             transit=rep["transit_min_mm"])
+                else:
+                    # flat / no full plan: report the best static floor clearance at the full insertion
+                    fl = [clearances(m, d, ids, q, rj.ENTRY_GAP * 1e-3)["floor"] for q, _, _ in sols[:4]]
+                    r.update(ok=False, floor=max(fl) if fl else None)
+                rows.append(r)
+    (OUT / f"live_{a.tag}.json").write_text(json.dumps({"pose": info, "rows": rows}, indent=0))
+    print("delta  placed  H_mm tilt  ik  ok  floor_mm  both  step")
+    for r in rows:
+        if r["as_placed"] or r["ok"]:
+            print(f"{r['delta']:+5.0f}  {'*' if r['as_placed'] else ' '}   {r['H_mm']:4.0f} {r['tilt']:4.0f} {r['ik']:3d}  {int(r['ok'])}  "
+                  f"{r.get('floor')!s:>7}  {r.get('both', '-')!s:>4}  {r.get('step', '-')}")
+
+
+def cmd_export(a):
+    """sim/models/rod_jig/sim_data.json for the production scene (sim/.venv has no trimesh): CAD finger slices in
+    the finger body frames (m) and the jig's COM / inertia per kg from rod_jig.stl."""
+    m0, _ = scene.load_model(dict(scene.load_settings(), jig={"enabled": False}))
+    sl = rj.cad_finger_slices(m0, mujoco.MjData(m0), scene.Ids(m0))
+    data = {"note": "generated by sim/check_rod_jig.py export from fingers_closed_in_jig_frame.stl and rod_jig.stl",
+            "finger_slices": {k: [np.round(v, 7).tolist() for v in sl[k]["pieces"]] for k in ("left", "right")},
+            "inertia_per_kg": {k: v for k, v in rj.jig_inertia(1.0).items() if k in ("com_mm", "full")},
+            "volume_cm3": round(rj.jig_inertia(1.0)["volume_cm3"], 2)}
+    rj.SIM_DATA.write_text(json.dumps(data))
+    print(rj.SIM_DATA, {k: len(v) for k, v in data["finger_slices"].items()}, data["inertia_per_kg"])
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd")
@@ -1167,6 +1285,7 @@ if __name__ == "__main__":
     ap.add_argument("--n-vc", type=int, default=60)
     ap.add_argument("--scales", default="0.25,0.5,0.75,1.0,1.5")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--live-grid", action="store_true", help="live: use --heights/--tilts/--deltas")
     ap.add_argument("--axes", default=None, help="sweep: comma list of y,z,x,yaw,pitch,roll")
     ap.add_argument("--slack", type=float, default=None)
     ap.add_argument("--chamfer", type=float, default=None)
@@ -1179,5 +1298,7 @@ if __name__ == "__main__":
     print("jig variant:", a.variant, flush=True)
     os.nice(10)
     OUT.mkdir(parents=True, exist_ok=True)
-    {"geom": cmd_geom, "placement": cmd_placement, "plan": cmd_plan, "trial": cmd_trial, "mc": cmd_mc,
+    if a.cmd != "render" and not a.render:
+        mem_cap(3.0)
+    {"export": cmd_export, "live": cmd_live, "geom": cmd_geom, "placement": cmd_placement, "plan": cmd_plan, "trial": cmd_trial, "mc": cmd_mc,
      "sweep": cmd_sweep, "report": cmd_report}[a.cmd](a)

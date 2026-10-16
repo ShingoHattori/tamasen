@@ -205,12 +205,25 @@ def cad_finger_slices(m, d, ids, slice_mm=2.5):
     return out
 
 
-def build_xml(s: dict, opts: dict) -> str:
-    """scene.build_xml + the jig (free body), an optional support, the OAK camera, optional CAD finger slices.
+SIM_DATA = JIG_DIR / "sim_data.json"        # precomputed by check_rod_jig.py export: CAD finger slices, unit inertia
+PARK = (3.0, -3.0)                            # where the jig and its support wait when not in use (world x, y)
 
-    opts: jig_T (4x4 world), support (dict(h, size_xy, yaw) or None), mass_kg, friction, finger_mode
-    ('model' | 'cad'), finger_friction, finger_slices (from cad_finger_slices), cam (T_base_cam, fovy)."""
-    root = ET.fromstring(scene.build_xml(s))
+
+def load_sim_data() -> dict:
+    """CAD finger slices (finger body frames, m) and the jig's inertia per kg, precomputed so that sim/.venv
+    (no trimesh) can build the scene."""
+    import json
+    return json.loads(SIM_DATA.read_text())
+
+
+def add_jig(root: ET.Element, opts: dict) -> None:
+    """Add the jig (free body: 46 convex collision pieces, visual mesh, marker, a bounding box for distance checks),
+    its support (static box + stop lip, geoms named obst_* so the path checks treat them as obstacles), an optional
+    OAK camera and optional CAD finger slices, to a scene built by scene.build_xml.
+
+    opts: jig_T (4x4 world), support (support_for() dict or None = parked), mass_kg, friction, inertia
+    ({com_mm, full} for mass_kg), finger_mode ('model' | 'cad'), finger_friction, finger_slices
+    ({'left': [verts], 'right': [verts]} in the finger body frames, m), cam (T_base_cam, fovy), solref."""
     asset, wb = root.find("asset"), root.find("worldbody")
     opt = root.find("option")
     if opt is None:
@@ -218,23 +231,20 @@ def build_xml(s: dict, opts: dict) -> str:
     fl = opt.find("flag")
     if fl is None:
         fl = ET.SubElement(opt, "flag")
-    fl.set("multiccd", "enable")
+    if opts.get("multiccd", True):
+        fl.set("multiccd", "enable")         # several contacts per convex pair (flat faces sliding on each other)
     sz = root.find("size")
     if sz is None:
         sz = ET.SubElement(root, "size")
-    sz.set("memory", "64M")             # several contacts per convex pair (flat faces sliding on each other)
+    sz.set("memory", "64M")
     if opts.get("noslip"):
         opt.set("noslip_iterations", str(opts["noslip"]))
-    # park the block far away
-    for b in wb.findall("body"):
-        if b.get("name") == "block":
-            b.set("pos", "3 3 0.0155")
     fr = opts.get("friction", 0.35)
     # --- jig body
     T = opts["jig_T"]
     jb = ET.SubElement(wb, "body", name="jig", pos=_fmt(T[:3, 3]), quat=_fmt(_quat(T[:3, :3])))
     ET.SubElement(jb, "freejoint", name="jig_free")
-    I = opts["inertia"]                                       # dict(com mm, diag kg m^2 principal, quat)
+    I = opts["inertia"]
     ET.SubElement(jb, "inertial", pos=_fmt(np.array(I["com_mm"]) * 1e-3), mass=str(opts["mass_kg"]),
                   fullinertia=_fmt(I["full"]))
     ET.SubElement(asset, "mesh", name="jig_visual_mesh", file=str((JIG_DIR / "rod_jig.stl").resolve()), scale="0.001 0.001 0.001")
@@ -245,6 +255,10 @@ def build_xml(s: dict, opts: dict) -> str:
         ET.SubElement(jb, "geom", name=f"jig_{name}", type="mesh", mesh=f"jigc_{name}", group="0", contype="1",
                       conaffinity="1", condim="3", priority="1", friction=f"{fr} 0.005 0.0001", mass="0",
                       solref=opts.get("solref", "0.002 1"), solimp="0.95 0.99 0.0005", rgba="0.85 0.55 0.2 0.0")
+    # outer box for distance checks of a held jig (never collides, not drawn)
+    zc = (ZH + MARKER_Z) / 2 * 1e-3
+    ET.SubElement(jb, "geom", name="jig_bbox", type="box", group="6", contype="0", conaffinity="0", mass="0",
+                  pos=f"0 0 {zc:.5f}", size=_fmt(np.array([D / 2, Y, (ZH - MARKER_Z) / 2]) * 1e-3), rgba="1 1 1 0")
     # marker: white area + black square (visual), site at the centre (x = jig x, y = -jig y, z out = -jig z)
     h = MARKER / 2 * 1e-3
     zf = MARKER_Z * 1e-3
@@ -255,21 +269,19 @@ def build_xml(s: dict, opts: dict) -> str:
                   pos=f"0 0 {zf - 0.0001}", size=f"{h:.5f} {h:.5f} 0.0001", rgba="0.02 0.02 0.02 1")
     ET.SubElement(jb, "site", name="jig_marker", pos=f"0 0 {zf}", quat=_fmt(_quat(np.diag([1.0, -1.0, -1.0]))),
                   size="0.004", rgba="0 1 1 1", group="1")
-    # --- support (static box under the jig)
-    sp = opts.get("support")
-    if sp and sp["h"] > 0:
-        R = sp.get("R", np.eye(3))
-        b = ET.SubElement(wb, "body", name="jig_support", pos=_fmt(sp["pos"]), quat=_fmt(_quat(R)))
-        ET.SubElement(b, "geom", name="jig_support", type="box", size=_fmt(np.array(sp["half"])), contype="1",
-                      conaffinity="1", group="0", rgba="0.55 0.6 0.65 1", condim="3")
-        if sp.get("lip"):
-            # stop at the low (far-face, jig -x) end of a tilted support: 3 mm thick, up to 8 mm above the support top
-            # (jig z 25.56 -> 17.56), clear of the pocket exits (|z| <= 5.6 at the far face)
-            hz = sp["half"][2]
-            lp = np.array([-(D / 2 + 1.5) * 1e-3, 0, -hz - 4e-3])          # in the support frame (z = jig z)
-            ET.SubElement(b, "geom", name="jig_support_lip", type="box", pos=_fmt(lp),
-                          size=_fmt([1.5e-3, sp["half"][1], 4e-3]), contype="1", conaffinity="1", group="0",
-                          rgba="0.45 0.5 0.55 1", condim="3")
+    # --- support (static box under the jig, always present; parked when there is none)
+    sp = opts.get("support") or {"h": 0.0, "pos": np.array([PARK[0], PARK[1], -0.5]), "R": np.eye(3),
+                                  "half": np.array([D / 2 + 1.0, Y + 1.0, 10.0]) * 1e-3, "lip": False}
+    b = ET.SubElement(wb, "body", name="jig_support", pos=_fmt(sp["pos"]), quat=_fmt(_quat(sp.get("R", np.eye(3)))))
+    ET.SubElement(b, "geom", name="obst_jig_support", type="box", size=_fmt(np.array(sp["half"])), contype="1",
+                  conaffinity="1", group="0", rgba="0.55 0.6 0.65 1", condim="3")
+    # stop at the low (far-face, jig -x) end of a tilted support: 3 mm thick, up to 8 mm above the support top
+    # (jig z 25.56 -> 17.56), clear of the pocket exits (|z| <= 5.6 at the far face); hidden under the support if flat
+    hz = sp["half"][2]
+    lp = np.array([-(D / 2 + 1.5) * 1e-3, 0, -hz - 4e-3]) if sp.get("lip") else np.array([0, 0, 0])
+    ET.SubElement(b, "geom", name="obst_jig_support_lip", type="box", pos=_fmt(lp),
+                  size=_fmt([1.5e-3, sp["half"][1], 4e-3]), contype="1", conaffinity="1", group="0",
+                  rgba="0.45 0.5 0.55 1", condim="3")
     # --- OAK camera (MuJoCo camera looks along -z, y up = OpenCV frame rotated 180 deg about x)
     cam = opts.get("cam")
     if cam is not None:
@@ -293,12 +305,40 @@ def build_xml(s: dict, opts: dict) -> str:
                     if any(k in g.get("name", "") for k in ("_front_collision", "_mid_collision", "_rear_collision")):
                         tmpl = dict(g.attrib)
                         body.remove(g)
-                for i, v in enumerate(sl[side]["pieces"]):
-                    ET.SubElement(asset, "mesh", name=f"cadf_{side}_{i}", vertex=_fmt(v))
-                    a = {k: tmpl[k] for k in ("contype", "conaffinity", "condim", "friction", "solref", "solimp") if k in tmpl}
+                pieces = sl[side]["pieces"] if isinstance(sl[side], dict) else sl[side]
+                for i, v in enumerate(pieces):
+                    ET.SubElement(asset, "mesh", name=f"cadf_{side}_{i}", vertex=_fmt(np.asarray(v)))
+                    a = {k: tmpl[k] for k in ("contype", "conaffinity", "condim", "friction", "solref", "solimp", "margin") if k in tmpl}
                     ET.SubElement(body, "geom", name=f"finger_{side}_cad{i}_collision", type="mesh", mesh=f"cadf_{side}_{i}",
                                   group="3", mass="0.0005", rgba="0.95 0.45 0.10 0.55", **a)
+
+
+def build_xml(s: dict, opts: dict) -> str:
+    """check_rod_jig.py: scene.build_xml (block parked, without the scene.toml jig) + add_jig(opts)."""
+    s2 = dict(s, jig=dict(s.get("jig", {}), enabled=False))
+    root = ET.fromstring(scene.build_xml(s2))
+    for b in root.find("worldbody").findall("body"):
+        if b.get("name") == "block":
+            b.set("pos", "3 3 0.0155")
+    add_jig(root, opts)
     return ET.tostring(root, encoding="unicode")
+
+
+def place_support(m, sp: dict | None) -> None:
+    """Move / resize the (static) support at run time; None parks it. Kinematics must be recomputed after."""
+    bid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "jig_support")
+    g = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "obst_jig_support")
+    gl = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "obst_jig_support_lip")
+    if bid < 0:
+        return
+    if sp is None:
+        sp = {"pos": np.array([PARK[0], PARK[1], -0.5]), "R": np.eye(3), "half": np.array([D / 2 + 1.0, Y + 1.0, 10.0]) * 1e-3, "lip": False}
+    m.body_pos[bid] = sp["pos"]
+    m.body_quat[bid] = _quat(sp["R"])
+    m.geom_size[g] = sp["half"]
+    m.geom_rbound[g] = float(np.linalg.norm(sp["half"]))
+    hz = sp["half"][2]
+    m.geom_pos[gl] = np.array([-(D / 2 + 1.5) * 1e-3, 0, -hz - 4e-3]) if sp.get("lip") else np.zeros(3)
 
 
 def jig_inertia(mass_kg: float) -> dict:
@@ -312,14 +352,20 @@ def jig_inertia(mass_kg: float) -> dict:
 
 
 class JigIds(scene.Ids):
+    """scene.Ids (which finds the jig lookups itself when the jig is in the model) + the OAK camera."""
+
     def __init__(self, m):
         super().__init__(m)
-        j = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "jig_free")
-        self.jig_q, self.jig_d = m.jnt_qposadr[j], m.jnt_dofadr[j]
-        self.jig_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "jig")
-        self.jig_geoms = {g for g in range(m.ngeom) if m.geom_bodyid[g] == self.jig_body and m.geom_contype[g]}
-        self.jig_marker = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "jig_marker")
-        sb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "jig_support")
-        self.support_body = sb
-        self.support_geoms = {g for g in range(m.ngeom) if sb >= 0 and m.geom_bodyid[g] == sb}
         self.cam = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, "oak")
+
+
+def scene_opts(s: dict) -> dict:
+    """add_jig options for the production scene (scene.toml [jig]); the jig starts parked."""
+    jg = s["jig"]
+    data = load_sim_data()
+    mass = float(jg["mass_kg"])
+    I = data["inertia_per_kg"]
+    return {"jig_T": T_world_jig(PARK[0], PARK[1], 0.0), "support": None, "mass_kg": mass,
+            "friction": float(jg["friction"]), "inertia": {"com_mm": I["com_mm"], "full": (np.array(I["full"]) * mass).tolist()},
+            "finger_mode": jg.get("finger_collision", "model"), "finger_slices": data["finger_slices"],
+            "finger_friction": None, "cam": None, "multiccd": bool(jg.get("multiccd", False))}

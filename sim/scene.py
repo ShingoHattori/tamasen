@@ -55,6 +55,16 @@ def load_settings(path: Path = HERE / "scene.toml") -> dict:
     oak = tomllib.loads((ROOT / "oak" / "markers.toml").read_text())
     s["block"]["size_m"] = (np.array(oak["block"]["size_mm"], float) * 1e-3).tolist()
     s["block"]["size_status"] = oak["block"].get("size_status", "unset")
+    jg = s.get("jig")
+    if jg is not None:                       # rod jig: marker mounting from oak/markers.toml [marker.<id>]
+        mk = oak.get("marker", {}).get(str(jg.get("marker_id", 13)), {})
+        if "jig_rotation_in_marker" in mk:
+            T = np.eye(4)
+            T[:3, :3] = np.array(mk["jig_rotation_in_marker"], float)
+            T[:3, 3] = np.array(mk["jig_origin_in_marker_mm"], float) * 1e-3
+            jg["T_marker_jig"] = T.tolist()
+            jg["mount_status"] = mk.get("mount_status", "unset")
+            jg["marker_size_m"] = float(mk.get("size_mm", 30.0)) * 1e-3
     return s
 
 
@@ -246,6 +256,11 @@ def build_xml(s: dict) -> str:
     fl = s["jaw"]["force_limit_n"]
     ET.SubElement(act, "position", name="act_gripper", joint="finger_left", kp="400", kv="10",
                   forcerange=f"{-fl} {fl}", ctrlrange="0 0.05")
+    # rod jig (scene.toml [jig], sim/rod_jig_scene.py): free body parked away from the table until a jig is
+    # observed / placed; its support is a static box moved at run time (geoms obst_*: path checks see it)
+    if s.get("jig", {}).get("enabled"):
+        import rod_jig_scene
+        rod_jig_scene.add_jig(root, rod_jig_scene.scene_opts(s))
     vis = root.find("visual")
     g = vis.find("global")
     if g is None:
@@ -291,6 +306,18 @@ class Ids:
                                if (mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith("obst_")]
         self.arm_bodies = {mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, n) for n in LINK_BODIES + ["end_link"]} \
             | self.finger_left | self.finger_right
+        # rod jig (only when the scene has one; see rod_jig_scene.add_jig)
+        jj = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, "jig_free")
+        self.has_jig = jj >= 0
+        self.jig_q = m.jnt_qposadr[jj] if jj >= 0 else None
+        self.jig_d = m.jnt_dofadr[jj] if jj >= 0 else None
+        self.jig_body = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "jig")
+        self.jig_geoms = {g for g in range(m.ngeom) if jj >= 0 and m.geom_bodyid[g] == self.jig_body and m.geom_contype[g]}
+        self.jig_bbox = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "jig_bbox")
+        self.jig_marker = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "jig_marker")
+        sb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "jig_support")
+        self.support_body = sb
+        self.support_geoms = {g for g in range(m.ngeom) if sb >= 0 and m.geom_bodyid[g] == sb}
 
 
 def gap_from_finger(q_left: float, m: mujoco.MjModel, d: mujoco.MjData, ids: Ids) -> float:
@@ -313,7 +340,7 @@ def _gap_model(m: mujoco.MjModel):
     ys = {"left": [], "right": []}
     for g in range(m.ngeom):
         n = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
-        if n.startswith("finger_") and any(k in n for k in ("_front_", "_mid_")) and n.endswith("_collision"):
+        if n.startswith("finger_") and any(k in n for k in ("_front_", "_mid_", "_cad")) and n.endswith("_collision"):
             mid = m.geom_dataid[g]
             vadr, vnum = m.mesh_vertadr[mid], m.mesh_vertnum[mid]
             V = m.mesh_vert[vadr:vadr + vnum]

@@ -20,6 +20,38 @@ status = "built"        # 2026-10-14 取り付け済み（30 mm 版の ID 1）�
 mesh = "models/marker_mount/marker_mount.stl"   # end_link 座標・mm（cad/tools/marker_mount.py の粗い出力）
 spec = "models/marker_mount/marker_mount.json"  # 衝突の箱・マーカー中心と軸（同じスクリプトの出力）
 
+# 棒材治具 rod_jig（cad/tools/rod_jig.py、衝突形状は sim/rod_jig_scene.py が CAD の寸法から作る 46 個の凸片）。
+# 位置は ID 13（oak/markers.toml [marker.13] の取り付け）から。平置き・台に置く・傾けた台に置く、を下の値で指定する。
+[jig]
+enabled = false                   # 2026-10-16: 統合が途中（sim_server 未対応）。true にすると本番 sim のシーンに治具が入る
+marker_id = 13
+mass_kg = 0.137
+mass_status = "sample"            # 中実 PLA（1.24 g/cm3 × 110.6 cm3）。充填率・棒材は未反映、未計量
+friction = 0.35
+friction_status = "sample"
+# 指の衝突形状: "model" = 公開モデルの凸包（ポケットの入る部分で実物より最大 2.5 mm 太い）、
+# "cad" = CAD の指を 2.5 mm ごとに切った凸片（実物どおり。ブロック把持の物理も変わるので既定は model）
+finger_collision = "model"
+multiccd = false                  # true: 凸片どうしの面接触を複数点で解く（治具の試行が安定。ブロックの物理も変わる）
+# 置き方（治具の下面 = +z 面の中心の高さ〔机から〕と、入口面を持ち上げる傾き）。0 / 0 = 机に平置き。
+# 平置きでは指・掌が机に当たる（掌が指の中心線から 34 mm 下まである）。水平に差すなら台 >= 30〜35 mm、
+# または 15 mm の台を 15〜25° 傾ける（sim/check_rod_jig.py live、2026-10-16）。画面からも一時的に変えられる
+support_height_m = 0.107
+support_tilt_deg = 0.0
+support_status = "sample"         # 2026-10-16 依頼者が台に載せた。ID 13 と hand-eye から下面 ≈ 107 mm・傾き 4°（sim/output/rod_jig/live_v3stand.json、未実測）
+height_tolerance_m = 0.02         # ID 13 の観測（PnP）の高さが、この置き方から これ以上ずれていたら計画しない
+entry_gap_m = 0.044               # 差し込む間の顎の隙間（内壁との すき間 1.0 mm ずつ。CAD の推奨 43.2 は内側 0.6 mm）
+grip_width_m = 0.042              # 挟む幅（内壁の外側どうし）
+insert_depth_m = 0.045            # 差し込み深さ（指先が奥の面から 1 mm 出る）
+pre_out_m = 0.040                 # 接近前: 指先が入口面の 40 mm 手前
+near_out_m = 0.010                # 近接: 10 mm 手前（ここから差し込み。一段ごとに視覚補正）
+lift_m = 0.05
+step_mm = 5                       # 近接・差し込みの一段（自動シーケンス）
+
+[jig.mock]                        # 模擬配置（観測を使わない）: 入口面の向き yaw（台座 x から）
+position_m = [0.0, -0.30]
+yaw_rad = 1.047
+
 [block]
 mass_kg = 0.10
 mass_status = "sample"            # 未計量

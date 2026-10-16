@@ -68,6 +68,9 @@ class Candidate:
     vis: dict = field(default_factory=dict)          # predicted ID 1 visibility per pose
     correction: dict | None = None
     open_gap_m: float = 0.0                          # jaw gap while approaching (scene.toml [jaw] approach_gap_m)
+    kind: str = "block"                              # "block" | "jig" (plan_jig)
+    step_mm: float | None = None                     # step of the automatic approach (jig: scene.toml [jig] step_mm)
+    q_path: list | None = None                       # jig: IK every 1 mm from near to grasp (simulation trial only)
 
     def json(self) -> dict:
         return {"name": self.name, "width_m": self.width_m, "ok": self.ok, "reasons": self.reasons,
@@ -76,7 +79,8 @@ class Candidate:
                 "q_grasp": None if self.q_grasp is None else self.q_grasp.tolist(),
                 "q_lift": None if self.q_lift is None else self.q_lift.tolist(),
                 "q_near": None if self.q_near is None else self.q_near.tolist(),
-                "tilt_deg": self.tilt_deg, "vis": self.vis, "correction": self.correction, "open_gap_m": self.open_gap_m}
+                "tilt_deg": self.tilt_deg, "vis": self.vis, "correction": self.correction, "open_gap_m": self.open_gap_m,
+                "kind": self.kind, "step_mm": self.step_mm}
 
 
 def _axis_rot(axis, ang):
@@ -376,5 +380,230 @@ def plan(m, settings: dict, T_base_obj: np.ndarray, q_start: np.ndarray, view: d
             c.reasons.append("条件を満たす")
         if note:
             c.reasons.append(note)          # information only (after the ok decision)
+    out.sort(key=lambda c: (not c.ok, c.score))
+    return out
+
+
+# ============================================================================================ rod jig
+# Grasp of the rod jig (cad/tools/rod_jig.py): the fingers go into its two pockets straight along -x_jig, the jaws
+# close onto the inner walls. Unlike the block there is no choice of faces: end_link x = -x_jig, y = y_jig,
+# z = -z_jig (ID 1, on end_link +z, faces up when the jig's marker does). Candidates differ by IK branch only.
+#   pre   fingertips pre_out_m before the entry face        near  near_out_m before it (the insertion starts)
+#   grasp fingers insert_depth_m deep (tips 1 mm out of the far face)   lift  lift_m straight up
+# Checks: IK and joint limits; the table (PLAN_FLOOR_CLEARANCE) and the support / obstacles at every pose and every
+# 5 mm of the insertion; no joint jump > JIG_STEP_JUMP between 1 mm insertion steps; fingers vs the jig walls
+# (the model's finger hulls are up to 2.5 mm fatter than the real finger: JIG_PEN_TOL); the palm / links >= 3 mm
+# from the jig; ID 1 and the jig marker (ID 13) visible at pre and near (both are measured before the insertion).
+JIG_STEP_JUMP = 0.05            # rad between 1 mm insertion steps
+JIG_SUPPORT_CLEAR = 0.003       # m, arm / jaw geoms from the support (the fingers pass ~10 mm over it)
+JIG_PEN_TOL = {"model": 0.0026, "cad": 0.0003}
+
+
+def _ray_block(m, d, a, cam, exclude_body):
+    """First geom between a and the camera (None if clear). The camera_head obstacle box is ignored: it contains the
+    camera, so every ray to it ends there (marker_view skips only the last RAY_CAM_SKIP_M, which oblique rays to
+    the table exceed)."""
+    cb = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "obst_camera_head")
+    gid = np.zeros(1, np.int32)
+    dist = mujoco.mj_ray(m, d, a, cam - a, RAY_GROUPS, 1, exclude_body, gid)
+    if 0 <= dist < 1 - 0.02 / np.linalg.norm(cam - a) and int(gid[0]) != cb:
+        return mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, int(gid[0])) or f"geom{int(gid[0])}"
+    return None
+
+
+def _square_view(m, d, P_cam, B_base, size, view, exclude_body):
+    """A square marker (pose P in the camera, B in base): facing angle, image margin, side, 5 occlusion rays."""
+    import cv2
+    to_cam = -P_cam[:3, 3] / np.linalg.norm(P_cam[:3, 3])
+    facing = float(np.degrees(np.arccos(np.clip(P_cam[:3, 2] @ to_cam, -1, 1))))
+    h = size / 2
+    C = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]])
+    uv, _ = cv2.projectPoints((P_cam[:3, :3] @ C.T).T + P_cam[:3, 3], np.zeros(3), np.zeros(3), view["K"], view["dist"])
+    uv = uv.reshape(-1, 2)
+    side = float(np.mean(np.linalg.norm(uv - np.roll(uv, 1, axis=0), axis=1)))
+    W, H = view["image"]
+    inside = bool(uv[:, 0].min() > VIS_MARGIN_PX and uv[:, 1].min() > VIS_MARGIN_PX
+                  and uv[:, 0].max() < W - VIS_MARGIN_PX and uv[:, 1].max() < H - VIS_MARGIN_PX)
+    cam = np.linalg.inv(view["X"])[:3, 3]
+    blocked, hits = 0, set()
+    for p_ in [np.zeros(3)] + [c * 0.7 for c in C]:
+        hit = _ray_block(m, d, (B_base @ np.r_[p_, 1.0])[:3] + B_base[:3, 2] * 0.003, cam, exclude_body)
+        if hit:
+            blocked += 1
+            hits.add(hit)
+    ok = facing <= VIS_MAX_DEG and inside and side >= VIS_MIN_SIDE_PX and P_cam[2, 3] > 0 and blocked == 0
+    return {"ok": bool(ok), "facing_deg": round(facing, 1), "side_px": round(side, 1), "uv": np.round(uv.mean(0)).tolist(),
+            "blocked": blocked, "hit": sorted(hits)}
+
+
+def jig_views(m, d, ids, q, view: dict) -> tuple[dict, dict]:
+    """(ID 1, jig marker) predicted views at joint angles q (jig placed in d)."""
+    d.qpos[ids.arm_qadr] = q
+    mujoco.mj_kinematics(m, d)
+    F = np.eye(4)
+    F[:3, :3], F[:3, 3] = d.xmat[ids.end_body].reshape(3, 3), d.xpos[ids.end_body]
+    B1 = F @ view["Y"]
+    v1 = _square_view(m, d, view["X"] @ B1, B1, view["size"], view, ids.end_body)
+    Bj = np.eye(4)
+    Bj[:3, :3], Bj[:3, 3] = d.site_xmat[ids.jig_marker].reshape(3, 3), d.site_xpos[ids.jig_marker]
+    vj = _square_view(m, d, view["X"] @ Bj, Bj, view.get("jig_size", 0.03), view, ids.jig_body)
+    return v1, vj
+
+
+def place_jig(d, ids, T) -> None:
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, np.asarray(T, float)[:3, :3].ravel())
+    d.qpos[ids.jig_q:ids.jig_q + 3], d.qpos[ids.jig_q + 3:ids.jig_q + 7] = T[:3, 3], quat
+
+
+def _arm_geoms(m, ids):
+    base = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+    return [g for g in range(m.ngeom) if m.geom_bodyid[g] in ids.arm_bodies and m.geom_bodyid[g] != base
+            and (m.geom_contype[g] | m.geom_conaffinity[g])]
+
+
+def jig_pose_checks(m, d, ids, q, gap, ag, pen_tol) -> dict:
+    """Clearances at one pose (jaws at gap, jig placed in d): table, obstacles (incl. the support), self contact,
+    fingers into the jig walls, palm / links to the jig."""
+    d.qpos[ids.arm_qadr] = q
+    half = float(np.clip((gap - scene._gap_model(m).gap0) / 2, *ids.fl_range))
+    d.qpos[ids.fl_q], d.qpos[ids.fr_q] = half, -half
+    mujoco.mj_forward(m, d)
+    fing = ids.finger_left | ids.finger_right
+    floor = min(mujoco.mj_geomDistance(m, d, g, ids.floor_geom, 0.2, None) for g in ag)
+    obst = min([mujoco.mj_geomDistance(m, d, g, o, 0.2, None) for g in ag for o in ids.obstacle_geoms] or [math.inf])
+    pen, palm, self_ = 0.0, math.inf, 0.0
+    for c in d.contact[:d.ncon]:
+        b1, b2 = m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2]
+        if ids.jig_body in (b1, b2):
+            other = b2 if b1 == ids.jig_body else b1
+            if other in fing:
+                pen = max(pen, -c.dist)
+        elif b1 in ids.arm_bodies and b2 in ids.arm_bodies:
+            self_ = max(self_, -c.dist)
+    jg = [g for g in ag if m.geom_bodyid[g] not in fing]
+    palm = min(mujoco.mj_geomDistance(m, d, g, j, 0.05, None) for g in jg for j in ids.jig_geoms)
+    return {"floor": floor, "obst": obst, "pen": pen, "palm": palm, "self": self_}
+
+
+def plan_jig(m, settings: dict, T_base_jig: np.ndarray, q_start: np.ndarray, view: dict | None = None) -> list[Candidate]:
+    import rod_jig_scene as rj
+    d = mujoco.MjData(m)
+    ids = scene.Ids(m)
+    jg = settings["jig"]
+    place_jig(d, ids, T_base_jig)
+    insert = float(jg["insert_depth_m"]) * 1000
+    gap_in, grip = float(jg["entry_gap_m"]), float(jg["grip_width_m"])
+    pen_tol = JIG_PEN_TOL.get(jg.get("finger_collision", "model"), 0.0026)
+    ag = _arm_geoms(m, ids)
+
+    def T_end(depth_mm):                                     # end_link at insertion depth (mm; < 0: tips outside)
+        T = np.eye(4)
+        T[:3, :3] = np.diag([-1.0, 1.0, -1.0])
+        T[:3, 3] = [(rj.D / 2 - rj.INSERT + (insert - depth_mm)) * 1e-3, 0, 0]
+        return T_base_jig @ np.linalg.inv(T)
+    site = m.site_pos[ids.grip_site].copy()
+    grip_pt = lambda T: T[:3, 3] + T[:3, :3] @ site
+    R_end = T_end(insert)[:3, :3]
+    approach = R_end[:, 0].copy()
+    pre_d, near_d = -float(jg["pre_out_m"]) * 1000, -float(jg["near_out_m"]) * 1000
+    tg = {"pre": grip_pt(T_end(pre_d)), "near": grip_pt(T_end(near_d)), "grasp": grip_pt(T_end(insert))}
+    tg["lift"] = tg["grasp"] + np.array([0, 0, float(jg["lift_m"])])
+    # IK branches at the full insertion
+    rng = np.random.default_rng(7)
+    seeds = [q_start, np.array([0, -0.9, -1.4, 0, 0, 0]), np.array([0, -1.6, -1.2, 0.5, 0, 0]), np.array([0, -1.2, -1.0, 0, 0.8, 0])] + \
+        [rng.uniform(ids.arm_range[:, 0], ids.arm_range[:, 1]) for _ in range(12)]
+    sols = []
+    for sd in seeds:
+        q, pe, re = solve_ik(m, d, ids, tg["grasp"], R_end, np.asarray(sd, float))
+        if pe < IK_POS_TOL and re < IK_ROT_TOL and not any(np.max(np.abs(q - s_)) < 0.05 for s_ in sols):
+            sols.append(q)
+    out = []
+    if not sols:
+        c = Candidate("治具: 入口面から差し込み", 1, approach, R_end, grip + 0.01, kind="jig", step_mm=float(jg["step_mm"]))
+        c.reasons.append("差し込み姿勢の IK 解なし（届かない）")
+        return [c]
+    lo, hi = ids.arm_range[:, 0], ids.arm_range[:, 1]
+    for i, qg in enumerate(sols[:4]):
+        c = Candidate(f"治具: 入口面から差し込み（IK 解 {i + 1}）", 1, approach, R_end, grip + 0.01, kind="jig",
+                      step_mm=float(jg["step_mm"]), open_gap_m=gap_in)
+        c.grasp_point = tg["grasp"]
+        c.targets = {k: v.tolist() for k, v in tg.items()}
+        # insertion path every 1 mm, solved backwards from the full insertion (stays on this branch)
+        path, q, jump, bad = [], qg, 0.0, None
+        for dep in np.arange(insert, near_d - 0.5, -1.0):
+            q2, pe, re = solve_ik(m, d, ids, grip_pt(T_end(dep)), R_end, q, iters=80)
+            if pe > IK_POS_TOL or re > IK_ROT_TOL:
+                bad = f"差し込みの途中（深さ {dep:.0f} mm）で IK 解なし"
+                break
+            jump = max(jump, float(np.max(np.abs(q2 - q))))
+            path.append(q2)
+            q = q2
+        if bad:
+            c.reasons.append(bad)
+            out.append(c)
+            continue
+        path = path[::-1]                                   # near .. grasp
+        c.q_path = [p_.tolist() for p_ in path]
+        c.q_grasp, c.q_near = path[-1], path[0]
+        c.q_pre, pe1, re1 = solve_ik(m, d, ids, tg["pre"], R_end, c.q_near)
+        c.q_lift, pe2, re2 = solve_ik(m, d, ids, tg["lift"], R_end, c.q_grasp)
+        if max(pe1, pe2) > IK_POS_TOL or max(re1, re2) > IK_ROT_TOL:
+            c.reasons.append(f"接近前 / 持ち上げの IK 解なし（残差 {max(pe1, pe2) * 1000:.1f} mm）")
+        if jump > JIG_STEP_JUMP:
+            c.reasons.append(f"差し込み中に関節が跳ぶ（1 mm で {jump:.3f} rad）")
+        for label, q in (("接近前", c.q_pre), ("近接", c.q_near), ("把持", c.q_grasp), ("持ち上げ", c.q_lift)):
+            at_lim = [scene.ARM_JOINTS[k] for k in range(6) if q[k] - lo[k] < 1e-3 or hi[k] - q[k] < 1e-3]
+            if at_lim:
+                c.reasons.append(f"{label}: 関節制限に当たっている（{', '.join(at_lim)}）")
+        # clearances: poses + every 5 mm of the insertion (jaws at the entry gap; closed on the walls at the grasp)
+        worst = {"floor": math.inf, "obst": math.inf, "pen": 0.0, "palm": math.inf, "self": 0.0}
+        seq = [(c.q_pre, gap_in), (c.q_near, gap_in)] + [(p_, gap_in) for p_ in path[::5]] + [(c.q_grasp, gap_in), (c.q_grasp, grip + 0.0004)]
+        for q, g in seq:
+            r = jig_pose_checks(m, d, ids, q, g, ag, pen_tol)
+            for k in ("floor", "obst", "palm"):
+                worst[k] = min(worst[k], r[k])
+            for k in ("pen", "self"):
+                worst[k] = max(worst[k], r[k])
+        # lift: the jig comes along (held), so only the table / obstacles for the arm
+        r = jig_pose_checks(m, d, ids, c.q_lift, grip, ag, pen_tol)
+        worst["floor"] = min(worst["floor"], r["floor"])
+        worst["obst"] = min(worst["obst"], r["obst"])
+        c.vis["clear_mm"] = {k: round(v * 1000, 1) for k, v in worst.items()}
+        if worst["floor"] < PLAN_FLOOR_CLEARANCE - 1e-3:
+            c.reasons.append(f"机とのすき間 {worst['floor'] * 1000:.1f} mm（{PLAN_FLOOR_CLEARANCE * 1000:.0f} mm 未満）。"
+                             "治具を台に載せる / 台を傾ける（scene.toml [jig] support_height_m / support_tilt_deg）")
+        if worst["obst"] < JIG_SUPPORT_CLEAR:
+            c.reasons.append(f"台・障害物とのすき間 {worst['obst'] * 1000:.1f} mm（{JIG_SUPPORT_CLEAR * 1000:.0f} mm 未満）")
+        if worst["pen"] > pen_tol:
+            c.reasons.append(f"指が治具の壁に食い込む（{worst['pen'] * 1000:.1f} mm）")
+        if worst["palm"] < 0.003:
+            c.reasons.append(f"掌・リンクが治具に近い（{worst['palm'] * 1000:.1f} mm）")
+        if worst["self"] > SELF_PEN_TOL:
+            c.reasons.append(f"自己衝突（{worst['self'] * 1000:.1f} mm）")
+        if view:
+            path_v = []
+            for k, q in [("pre", c.q_pre), ("near", c.q_near)] + [(f"d{i}", p_) for i, p_ in enumerate(path) if i % 10 == 0] + [("grasp", c.q_grasp)]:
+                v1, vj = jig_views(m, d, ids, q, view)
+                path_v.append({"at": k, "id1": v1, "jig": vj})
+            n = len(path_v)
+            c.vis.update({"pre": path_v[0]["id1"], "near": path_v[1]["id1"], "grasp": path_v[-1]["id1"],
+                          "jig_pre": path_v[0]["jig"], "jig_near": path_v[1]["jig"],
+                          "path": {"n": n, "visible": sum(v["id1"]["ok"] for v in path_v),
+                                   "jig_visible": sum(v["jig"]["ok"] for v in path_v),
+                                   "both_visible": sum(v["id1"]["ok"] and v["jig"]["ok"] for v in path_v),
+                                   "facing_mean_deg": round(float(np.mean([v["id1"]["facing_deg"] for v in path_v])), 1)}})
+            miss = [k for k in ("pre", "near") if not c.vis[k]["ok"]] + [f"治具マーカー@{k}" for k in ("pre", "near") if not c.vis["jig_" + k]["ok"]]
+            if miss:
+                c.reasons.append("接近前・近接で見えないマーカーがある（" + "、".join(miss) + "）")
+        c.ok = not c.reasons
+        pv = c.vis.get("path")
+        c.score = float(np.abs(c.q_grasp - q_start).sum() + (3.0 * (pv["n"] - pv["both_visible"]) / pv["n"] + 0.01 * pv["facing_mean_deg"] if pv else 0.0))
+        if c.ok:
+            c.reasons.append("条件を満たす")
+            if pv:
+                c.reasons.append(f"ID 1 と治具マーカーが両方見える点 {pv['both_visible']}/{pv['n']}、"
+                                 f"机とのすき間 最小 {c.vis['clear_mm']['floor']:.0f} mm")
+        out.append(c)
     out.sort(key=lambda c: (not c.ok, c.score))
     return out
