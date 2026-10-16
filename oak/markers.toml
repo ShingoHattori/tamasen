@@ -139,7 +139,7 @@ jig_to_grip_status = "measured"
 [marker.13]
 role = "rod_jig"
 size_mm = 30.0
-size_status = "sample"
+size_status = "measured"   # 依頼者確認 2026-10-16: 黒い正方形 30 mm、余白込み 40 mm
 mount_status = "measured"
 mount_evidence = "2026-10-16 依頼者の説明＋ raw.png への治具外形の重ね合わせ（入口面が手前の長辺に一致）"
 jig_rotation_in_marker = [[0, -1, 0], [-1, 0, 0], [0, 0, -1]]
