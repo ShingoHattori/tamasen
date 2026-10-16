@@ -1,7 +1,18 @@
-# tamasen — 作業コンテキスト（2026-10-13 時点の引き継ぎ）
+# tamasen — 作業コンテキスト（2026-10-16 更新）
 
-reBot Arm B601-DM と OAK カメラで、ArUco マーカー付きの直方体ブロックとグリッパーを認識し、
-最終的に把持するためのリポジトリ。以後の作業は **robot1** 上で行う。
+reBot Arm B601-DM と OAK カメラで、ArUco マーカー付きの物体（直方体ブロック、rod_jig など）とグリッパーを認識し、
+把持するためのリポジトリ。**2026-10-16 から Claude Code も robot1 の上で動かす**（`~/tamasen` で `claude`）。
+Mac は Xcode（iPad アプリ `scan/ios`）と Apple Object Capture（`scan/photogrammetry/objcap`）にだけ使う。
+
+## 作業の進め方（依頼者の指示）
+- 返答・報告は日本語で短く。時間をかけない・余計なことをしない・最短で結果を出す。並列にできるものは sub agent / background job に回す。
+- 区切りごとに main へコミットしてよい（**push はしない**）。コミットの末尾に `Co-Authored-By: Claude <noreply@anthropic.com>` 系の行。
+- 依頼者が現地でアームを触れる時間は限られる。実機で試す前にシミュレーションと UI を済ませておき、現地では押すだけにする。
+- **robot1 では vision（OAK）・arm（50 Hz 制御）・sim が常に動いている。重い計算で巻き込まない**:
+  `nice`、`OMP_NUM_THREADS` などを小さく、並列 4〜6、1 プロセスのメモリ上限（`prlimit --as` など）。負荷平均 < 8 を目安。
+  2026-10-15 12:16 UTC、検証スクリプトがメモリ 15 GB を使い OOM → OAK が X_LINK_ERROR で止まり、vision が 13 時間映像を止めたままになった。
+  重い処理の後は `curl -s 127.0.0.1:8090/state.json` の `fps` と `t`（古くないか）を確かめる。止まっていたら（アームのトルクが切れているのを確認して）`./run.sh restart vision`。
+- ssh 越しの `pkill -f` / `pgrep -f` は自分のコマンド行にも一致するので使わない（pid ファイルを使う）。
 
 ## マシン
 
@@ -10,7 +21,7 @@ reBot Arm B601-DM と OAK カメラで、ArUco マーカー付きの直方体ブ
 | 接続 | `ssh win10.hpcs-sb1124.sec.llhi.org`（user `cely`、192.168.32.20 / DHCP） | — |
 | OS | Ubuntu Server 24.04.3、kernel 6.8.0-147-generic | macOS |
 | GPU | RTX 2080 SUPER、`nvidia-driver-595-open`（ubuntu-drivers 推奨版、ビルド済み署名モジュール、DKMS なし）。CUDA Toolkit は未導入 | — |
-| アーム | USB-CAN が `/dev/ttyACM0`（HDSC CDC `2e88:4603`、本体ポートに直結） | — |
+| アーム | USB-CAN（HDSC CDC `2e88:4603`）。2026-10-15 時点で `/dev/ttyACM1` | — |
 | カメラ | OAK-D-Lite `1844301091A70A1300`（ハブ経由 USB3、30 fps。起動前に `03e7:2485` の USB2 で見えるのは正常） | — |
 
 - robot1 はデュアルブート（Windows あり）。起動順と GRUB の既定は Ubuntu。Secure Boot は無効。
@@ -41,11 +52,28 @@ reBot Arm B601-DM と OAK カメラで、ArUco マーカー付きの直方体ブ
 
 ## 起動・停止（robot1）
 ```
-./run.sh start            # vision(8090) + arm 読み取り専用(8091) + sim(8092)。すべて 127.0.0.1
+./run.sh start            # vision(8090) + arm 読み取り専用(8091) + sim(8092)
 ./run.sh stop | status | restart vision | log sim
-ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   # 手元で http://127.0.0.1:8090/
 ```
-実機操作を有効にするときは **依頼者が** `ARM_ARGS="--port /dev/ttyACM0 --allow-motion" ./run.sh restart arm`。
+実機操作を有効にするときは **依頼者が** `ARM_ARGS="--port /dev/ttyACM1 --allow-motion" ./run.sh restart arm`。
+
+| ポート | サービス |
+|---|---|
+| 8090 | vision（`--host 0.0.0.0 --allow-from 127.0.0.1/32,192.168.32.0/24,172.16.0.0/12`）。`/state.json`、`/raw.png`、`/arm/…`・`/sim/…` を中継 |
+| 8091 | arm（`/dev/ttyACM1`、motion 許可は依頼者が起動したときだけ） |
+| 8092 | sim |
+| 8096 | modeler（`modeler/`、pid は `run/modeler.pid`、ログ `run/modeler.log`） |
+| 8093 | 2026-10-13 から残っている試験用 fake arm（`--fake`）。使っていない |
+| 8097–8099 | 試験用 fake arm / test sim / test vision（replay）。`/tmp/autotest_up.sh`・`/tmp/autotest_down.sh` |
+
+## そのほかのディレクトリ（2026-10-15〜16 に追加）
+- `scan/` — iPad（TamasenScan アプリ、`scan/ios`、xcodegen、Mac でビルド）で物体をスキャンし、マーカー座標の 3D モデルにする試み（`scan/README.md`）。
+  手持ちで回す方式（TrueDepth）と、置いて iPad を動かす方式（LiDAR+ARKit → Object Capture → robot1 の GPU でマーカー検出と visual hull）。寸法はまだ数 mm 大きい。
+- `modeler/` — 写真に人が形を合わせて 3D モデルを作るローカル Web アプリ（`modeler/README.md`、`DESIGN.md`）。robot1:8096 で稼働。合成サンプルのみ検証済み、実画像はテスト箱（ID 2）で途中まで。
+- `cad/tools/rod_jig.py` → `cad/out/rod_jig/`（棒をつかむ治具。git 管理外）。`sim/models/rod_jig/` にコピー、`sim/rod_jig_scene.py`・`sim/check_rod_jig.py` で把持のシミュレーション。
+  治具のマーカーは **ID 13**（黒 30 mm、余白込み 40 mm）、`oak/markers.toml [marker.13]` に貼った向き（`T_marker_jig`）を登録済み。
+  結果: 差し込み直前（各段）の視覚補正で約 1 mm に詰めれば成功 93〜98 %、補正なしは 20〜42 %。平置きは手のひらが床に当たる → 台が要る（2026-10-16 依頼者が台に載せた）。
+  進行中: vision → sim の同期、planner への治具把持（段階的差し込み＋視覚補正、マーカーが隠れない順位、床すき間）、UI から箱と同様に実行。
 
 ## 構成（2026-10-13 時点、commit は git log 参照）
 - `oak/vision.py` — RGB のみ（ステレオ深度は使わない）。1280×960 で検出、ブラウザへは 960 幅の縮小 MJPEG。
@@ -61,7 +89,7 @@ ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   # 手元で http:
   衝突停止（`ContactMonitor`）: 抵抗 = モーター実測トルク − 重力 ff − 摩擦 ff を計画の進む向きに測った値。大きさではなく「増え続けている」ことで止める
   （直近 1.5 s の最小値〔0 未満は 0〕からの増加が rise_nm を超えてまだ増加中、または進んだ量に比例して増えている）。値は `mit_tuning.yaml contact:`。
   絶対値の上限は 08:08 に休止姿勢からの持ち上げ（ストッパーが支えていた重さをモーターが引き受けた）で誤停止したためやめた。
-  **2026-10-15 依頼者の指示で無効（`mit_tuning.yaml contact.enabled: false`）**。校正の自動巡回中に joint1 で誤停止したため。逸脱停止は有効のまま。
+  **2026-10-15 依頼者の指示で無効（`mit_tuning.yaml contact.enabled: false`、arm 再起動済み）**。校正の自動巡回中に joint1 で誤停止したため。逸脱停止は有効のまま。
   止まったら今の位置で保持して fault（要確認解除）。可動端 3° 以内の関節は除外。`rebot/contact_replay.py` で記録を再生・模擬接触を試せる。
   fake には壁の注入（`/api/test/inject {"wall": {joint: モーター角}}`）がある。トレースに各関節の抵抗 `res` を記録。
   移動ごとの 50 Hz 記録（計画・実測・速度・トルク・指令）が `run/arm_trace_last.jsonl` に残る。
@@ -90,6 +118,8 @@ ssh -N -L 8090:127.0.0.1:8090 win10.hpcs-sb1124.sec.llhi.org   # 手元で http:
 - 実機関節: 7 軸とも読み取り専用で応答（状態 0x0 = 無効）。MuJoCo の end_link と SDK の Pinocchio FK が実関節角で一致（< 1e-6 mm）。
 
 ## 未確定・次の段階
+0. （2026-10-16）hand-eye の再校正が未採用（2026-10-15 にカメラが約 35 mm ずれた疑い。「校正を自動で」は衝突停止で 2 回途中停止、今は衝突停止を無効化済み）。
+   link5 のマーカー台 `cad/out/marker_mount_l5_1m_z` の ArUco ID は未定（vision・sim への登録も未着手）。
 1. ID 2 カードの物理的固定と厚み測定 → 「基準を登録」。
 2. 済: カメラ⇔アーム台座（`oak/calib/handeye_active.json`。sim はこれを使い、`scene.toml [placement]` は未使用のまま）。
 3. 済: ID 1 → 把持中心（`markers.toml [marker.1.grip]`）。
