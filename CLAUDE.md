@@ -75,12 +75,12 @@ Mac は Xcode（iPad アプリ `scan/ios`）と Apple Object Capture（`scan/pho
   結果: 差し込み直前（各段）の視覚補正で約 1 mm に詰めれば成功 93〜98 %、補正なしは 20〜42 %。平置きは手のひらが床に当たる → 台が要る（2026-10-16 依頼者が台に載せた）。
   台の上（2026-10-16）: 下面 ≈ 107 mm・傾き 4°・入口面は台座 x から約 90°。台の高さ 60〜120 mm のどれでも経路あり（床すき間 ≥ 47 mm、ID 1 と ID 13 が全行程で見える）。
   **引き継ぎ（2026-10-16、Mac 側セッションから）** — UI から箱と同様に治具をつかむための統合は途中:
-  - 済: （ が既定。true で本番 sim のシーンに治具と台が入る。置き方 support_height_m / tilt、差し込み開き 44 mm、深さ 45 mm、一段 5 mm）、
-    （[jig] の読み込み、markers.toml [marker.13] の T_marker_jig、 など）、（治具 46 凸片・台・CAD 指）、
-     の  /  /  / （未試験。平置きは床すき間で拒否、台なら通る想定）、（検証。）。
-    箱の  は変更前後で同じ結果（standing_block の滑り 0.026→0.029 mm のみ）。
-  - 未:  に治具の同期（vision の ID 13 → T_base_jig）・治具の計画・自動シーケンス（接近前 → 近接 → 一段ごとに視覚補正しながら差し込み → 閉じる → 持ち上げ）・UI のボタン、
-    fake arm 8097 / test sim 8098 / test vision 8099（）での通し試験、本番 sim の再起動（[jig] enabled = true）。
+  - 済: `scene.toml [jig]`（`enabled = false` が既定。true で本番 sim のシーンに治具と台が入る。置き方 `support_height_m` / `support_tilt_deg`、差し込み開き 44 mm、深さ 45 mm、一段 5 mm）、
+    `scene.py`（[jig] の読み込み、`oak/markers.toml [marker.13]` の `T_marker_jig`、`Ids.has_jig` など）、`rod_jig_scene.py`（治具 46 凸片・台・CAD 指）、
+    `planner.py` の `plan_jig` / `jig_views` / `place_jig` / `jig_pose_checks`（未試験。平置きは床すき間で拒否、台なら通る想定）、`check_rod_jig.py`（検証。`--help`）。
+    箱の `verify_sim.py` は変更前後で同じ結果（standing_block の滑り 0.026→0.029 mm のみ）。
+  - 未: `sim_server.py` に治具の同期（vision の ID 13 → `T_base_jig`）・治具の計画・自動シーケンス（接近前 → 近接 → 一段ごとに視覚補正しながら差し込み → 閉じる → 持ち上げ）・UI のボタン、
+    fake arm 8097 / test sim 8098 / test vision 8099（`/tmp/autotest_up.sh`、`/tmp/autotest_down.sh`）での通し試験、本番 sim の再起動（`[jig] enabled = true`）。
   - 方針: 位置合わせは各段で常にかけてよい（依頼者）。治具が動かなければ押し込みの許容は上がるはず → 差し込みの最後は力（接触）で止める、開きは 44〜46 mm で調整可。
 
 ## 構成（2026-10-13 時点、commit は git log 参照）
